@@ -22,6 +22,44 @@ fi
 
 cd "$(dirname "$0")/.."
 
+# Rust may have been installed without touching the shell profile, in which case
+# cargo is present but not on PATH. Find it before doing anything else.
+if ! command -v cargo >/dev/null 2>&1 && [[ -f "$HOME/.cargo/env" ]]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
+fi
+
+# Every prerequisite up front. The first version of this script edited Cargo.toml
+# and *then* discovered cargo was missing, which left the tree dirty and the next
+# run blocked by its own cleanliness check. Check first, mutate second.
+missing=()
+for tool in cargo git node npm docker curl; do
+  command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+done
+if (( ${#missing[@]} )); then
+  echo "missing: ${missing[*]}" >&2
+  [[ " ${missing[*]} " == *" cargo "* ]] && \
+    echo "  cargo: install Rust, or add \$HOME/.cargo/bin to PATH" >&2
+  [[ " ${missing[*]} " == *" docker "* ]] && \
+    echo "  docker: start Docker Desktop" >&2
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "the docker daemon is not running; start Docker Desktop" >&2
+  exit 1
+fi
+
+# Belt and braces: if anything below fails after the version is edited, put it
+# back. A half-applied release should leave nothing behind to clean up by hand.
+bumped=""
+restore() {
+  if [[ -n "$bumped" ]]; then
+    git checkout -- Cargo.toml Cargo.lock 2>/dev/null || true
+    echo "reverted the version bump" >&2
+  fi
+}
+trap restore EXIT
+
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "working tree is dirty; commit or stash first" >&2
   git status --short >&2
@@ -33,6 +71,7 @@ if git rev-parse "v$V" >/dev/null 2>&1; then
 fi
 
 echo "==> setting workspace version to $V"
+bumped=1
 perl -0pi -e "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/m" Cargo.toml
 grep -m1 '^version = ' Cargo.toml
 
@@ -62,6 +101,7 @@ echo "==> committing and tagging"
 git add -A
 git commit -q -m "$V"
 git tag -a "v$V" -m "v$V"
+bumped=""   # committed: nothing left to revert
 
 cat <<MSG
 
