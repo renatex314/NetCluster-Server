@@ -330,3 +330,77 @@ fn cluster_of_agrees_with_the_viewport_query() {
     }
     assert_eq!(nc.cluster_of(999_999, 5), None);
 }
+
+/// Registration is the question "is this device known", and it must track every
+/// mutation exactly. `contains` is the cheap answer; before it existed the only
+/// way to ask was `representative(id, z)`, which conflates "absent" with "not a
+/// center at z" and walks the parent chain to answer a hash lookup.
+#[test]
+fn contains_tracks_registration_through_every_mutation() {
+    let mut nc = NetCluster::new(Options {
+        categories: 4,
+        ..Default::default()
+    });
+    assert!(!nc.contains(1), "empty index");
+    assert_eq!(nc.category_of(1), None);
+    assert_eq!(nc.position_of(1), None);
+
+    nc.insert_with_category(1, -46.6333, -23.5505, 2);
+    nc.insert_with_category(2, 2.35, 48.85, 0);
+    assert!(nc.contains(1) && nc.contains(2));
+    assert!(!nc.contains(3), "an id never inserted");
+    assert_eq!(nc.category_of(1), Some(2));
+
+    let (lng, lat) = nc.position_of(1).unwrap();
+    assert!((lng - -46.6333).abs() < 1e-6 && (lat - -23.5505).abs() < 1e-6);
+
+    // moving must not change registration, and must move the reported position
+    nc.move_to(1, -46.70, -23.60);
+    assert!(nc.contains(1));
+    assert_eq!(
+        nc.category_of(1),
+        Some(2),
+        "a move must not lose the category"
+    );
+    assert!((nc.position_of(1).unwrap().0 - -46.70).abs() < 1e-6);
+
+    // removing must, and the slot is recycled -- a stale slot must not answer yes
+    assert!(nc.remove(1));
+    assert!(!nc.contains(1));
+    assert_eq!(nc.category_of(1), None);
+    assert!(!nc.remove(1), "removing twice");
+    nc.insert_with_category(3, 0.0, 0.0, 1);
+    assert!(
+        !nc.contains(1),
+        "a recycled slot must not resurrect the old id"
+    );
+    assert!(nc.contains(3));
+    assert_eq!(nc.category_of(3), Some(1));
+
+    // and it agrees with len() across churn
+    for i in 100..400u64 {
+        nc.insert_with_category(
+            i,
+            (i % 90) as f64 - 45.0,
+            (i % 70) as f64 - 35.0,
+            (i % 4) as u32,
+        );
+    }
+    for i in 100..250u64 {
+        nc.remove(i);
+    }
+    let live = (100..400u64).filter(|&i| nc.contains(i)).count();
+    assert_eq!(live, 150);
+    assert_eq!(nc.len(), live + 2, "contains disagrees with len");
+    nc.verify().unwrap();
+}
+
+/// With categories disabled the accessor still answers, rather than returning
+/// None and making callers guess whether the device is missing.
+#[test]
+fn category_of_without_categories_reports_zero_not_missing() {
+    let mut nc = NetCluster::new(Options::default());
+    nc.insert(7, 1.0, 1.0);
+    assert_eq!(nc.category_of(7), Some(0));
+    assert_eq!(nc.category_of(8), None);
+}

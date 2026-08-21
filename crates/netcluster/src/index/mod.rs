@@ -1415,8 +1415,27 @@ impl NetCluster {
         Some(s)
     }
 
+    /// Is a point with this id currently in the index?
     pub fn contains(&self, id: u64) -> bool {
         self.ids.contains_key(&id)
+    }
+
+    /// The category a point was inserted under, or `None` if it is not in the
+    /// index. Always `Some(0)` when categories are disabled.
+    pub fn category_of(&self, id: u64) -> Option<u32> {
+        let s = *self.ids.get(&id)?;
+        Some(if self.categories > 0 {
+            self.cat[s as usize]
+        } else {
+            0
+        })
+    }
+
+    /// Position of a point as longitude/latitude, or `None` if it is not in the
+    /// index.
+    pub fn position_of(&self, id: u64) -> Option<(f64, f64)> {
+        let (x, y) = self.position(id)?;
+        Some(unproject(x as f64, y as f64))
     }
 
     /// Position of a point in fixed-point world coordinates.
