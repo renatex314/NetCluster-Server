@@ -29,6 +29,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # --locked fails when Cargo.lock disagrees with the manifests. A version
+      # bump that forgets to commit the refreshed lockfile is otherwise invisible
+      # until someone builds from a clean checkout.
+      - name: Lockfile is current
+        run: cargo build --release --locked --bin netcluster-server
+
       - name: Formatting
         run: cargo fmt --all --check
 

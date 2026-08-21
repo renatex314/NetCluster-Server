@@ -17,7 +17,12 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.4"
-netcluster = { path = "../netcluster", version = "0.1.0" }
+# No version requirement on purpose. Both crates take their version from
+# [workspace.package], so pinning one here means two places have to agree on
+# every release -- and the first bump that forgot broke the build. This server
+# is shipped as a container, not published to crates.io, so the path alone is
+# all cargo needs.
+netcluster = { path = "../netcluster" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
