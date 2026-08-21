@@ -112,6 +112,21 @@ Turn `NETCLUSTER_AUTO_CREATE` **off** in production: with it on, a typo in a
 collection name silently creates an empty collection instead of returning 404, and
 you debug an empty map instead of reading an error.
 
+## CLI
+
+```bash
+npm install -g netcluster-client     # or: npx netcluster-client <command>
+
+netcluster create fleet --categories idle,enroute,delivering --ttl 300
+netcluster seed fleet --count 50000
+netcluster clusters fleet --zoom 6
+netcluster watch
+```
+
+Manages collections, loads and inspects devices, runs queries, forces snapshots
+and verifies invariants. `--json` on any command for scripting; exit codes mean
+0 fine, 1 failed, 2 wrong usage. Full list in [`clients/node/`](clients/node/).
+
 ## Node client
 
 ```bash

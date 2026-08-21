@@ -1,13 +1,47 @@
 # netcluster-client
 
-Node client for [netcluster-server]: report moving positions, read clustered
-vector tiles.
+Node client **and CLI** for [netcluster-server]: report moving positions, read
+clustered vector tiles.
 
 Zero dependencies. Node 18+.
 
 ```bash
-npm install netcluster-client
+npm install netcluster-client      # library + the `netcluster` command
+npx netcluster-client health       # or use the CLI without installing
 ```
+
+## CLI
+
+```bash
+netcluster create fleet --categories idle,enroute,delivering --ttl 300
+netcluster seed fleet --count 50000          # a simulated fleet, for demos and load tests
+netcluster clusters fleet --zoom 6           # what the map would draw
+netcluster where fleet v42 --zoom 10         # which marker holds this device
+netcluster watch                             # live devices, ingest rate, memory, snapshot age
+```
+
+```
+SERVER       health, collections, watch
+COLLECTIONS  create, drop, stats, verify, snapshot
+DEVICES      report, import, seed, get, has, rm
+QUERIES      clusters, where, children, leaves, tile
+```
+
+Points at `http://localhost:8080` unless you set `--url` or `NETCLUSTER_URL`.
+
+Every command takes `--json`, so it composes:
+
+```bash
+netcluster stats fleet --json | jq .devices
+netcluster has fleet v42 && echo "still reporting"      # exit 0 present, 1 absent
+cat positions.ndjson | netcluster import fleet -
+```
+
+Exit codes are meant for scripts: **0** fine, **1** the request failed or the
+answer was no, **2** you typed it wrong. `drop` refuses a populated collection
+unless you pass `--yes`.
+
+`netcluster help`, or `netcluster <command> --help`.
 
 ```js
 import { NetClusterClient } from 'netcluster-client';

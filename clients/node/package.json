@@ -1,7 +1,7 @@
 {
   "name": "netcluster-client",
   "version": "0.1.0",
-  "description": "Node client for netcluster-server: report moving positions, read clustered vector tiles.",
+  "description": "Node client and CLI for netcluster-server: report moving positions, read clustered vector tiles.",
   "type": "module",
   "main": "./index.js",
   "types": "./index.d.ts",
@@ -15,6 +15,7 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "cli.js",
     "README.md",
     "LICENSE"
   ],
@@ -31,7 +32,8 @@
     "realtime",
     "fleet-tracking",
     "netcluster",
-    "supercluster"
+    "supercluster",
+    "cli"
   ],
   "repository": {
     "type": "git",
@@ -45,8 +47,13 @@
   "license": "MIT",
   "dependencies": {},
   "scripts": {
-    "test": "node test.mjs",
+    "test": "node test.mjs && node test-cli.mjs",
     "example": "node example.mjs",
-    "example:fleet": "node example-fleet.mjs"
+    "example:fleet": "node example-fleet.mjs",
+    "cli": "node cli.js",
+    "test:cli": "node test-cli.mjs"
+  },
+  "bin": {
+    "netcluster": "./cli.js"
   }
 }
