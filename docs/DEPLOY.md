@@ -107,8 +107,16 @@ process so one collection fits inside it.
 ## Docker
 
 ```bash
-docker build -t netcluster-server .
-docker run --rm -p 8080:8080 netcluster-server
+docker run --rm -p 8080:8080 renatex314/netcluster-server:0.1.0
+```
+
+Published for **linux/amd64 and linux/arm64**. That matters more than it sounds:
+building on an Apple Silicon machine and pushing produces an arm64-only image,
+which dies with `exec format error` on the amd64 hosts most clouds actually run.
+If you build your own, use buildx:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/netcluster-server:v1 --push .
 ```
 
 **9.6 MB to pull, 37 MB on disk**, of which the binary is 1.3 MB — the rest is the

@@ -3,8 +3,10 @@
 # The server, with the demo page at http://localhost:8080/
 services:
   netcluster:
+    # Builds from source. To run the published image without building, drop the
+    # `build` line: docker compose pull && docker compose up
     build: .
-    image: netcluster-server:local
+    image: renatex314/netcluster-server:latest
     ports:
       - "8080:8080"
     environment:

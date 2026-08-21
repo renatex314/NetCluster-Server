@@ -72,6 +72,12 @@ the Redis version a wide query blocked every other client for its full duration
 ## Run
 
 ```bash
+docker run -p 8080:8080 renatex314/netcluster-server
+```
+
+or from source:
+
+```bash
 docker compose up                   # or: cargo run --release -p netcluster-server
 ```
 
@@ -80,9 +86,13 @@ Then open <http://localhost:8080/> for a live demo: a simulated fleet of up to
 `.mvt` endpoint.
 
 The image is 9.6 MB to pull (37 MB on disk) — a distroless base with no shell and
-no package manager, and a 1.3 MB binary. It runs as non-root under a read-only
-root filesystem. The container health check is a flag on the binary (`--health`),
-which is why it needs no curl.
+no package manager, and a 1.3 MB binary. It is published for **linux/amd64 and
+linux/arm64**, runs as non-root under a read-only root filesystem, and its health
+check is a flag on the binary (`--health`), which is why it needs no curl.
+
+[![docker](https://img.shields.io/docker/v/renatex314/netcluster-server?label=docker&sort=semver)](https://hub.docker.com/r/renatex314/netcluster-server)
+[![image size](https://img.shields.io/docker/image-size/renatex314/netcluster-server/latest)](https://hub.docker.com/r/renatex314/netcluster-server)
+[![npm](https://img.shields.io/npm/v/netcluster-client?label=netcluster-client)](https://www.npmjs.com/package/netcluster-client)
 
 ```
 NETCLUSTER_ADDR             0.0.0.0:8080   listen address

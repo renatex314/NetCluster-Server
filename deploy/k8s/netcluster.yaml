@@ -49,9 +49,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: server
-          # Replace with your own registry. Nothing publishes this image yet:
-          #   docker build -t <registry>/netcluster-server:v1 . && docker push ...
-          image: ghcr.io/renatex314/netcluster-server:latest
+          # Pinned deliberately. With :latest, a pod rescheduled six months from
+          # now silently picks up a different build than its neighbours, and you
+          # get a cluster running two versions without a deploy.
+          image: renatex314/netcluster-server:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
