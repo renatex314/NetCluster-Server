@@ -1,0 +1,215 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>netcluster-server</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  :root { color-scheme: dark; --bg:#0b0d10; --panel:#151a21; --line:#242c37; --fg:#e6edf3; --dim:#8b97a6; --hot:#ff9f45; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+              font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  #map { position:absolute; inset:0; }
+  #panel { position:absolute; top:12px; left:12px; width:280px; z-index:2;
+           background:color-mix(in srgb, var(--panel) 92%, transparent); border:1px solid var(--line);
+           border-radius:10px; padding:14px 16px; backdrop-filter:blur(8px); }
+  h1 { font-size:14px; margin:0 0 2px; letter-spacing:.02em; }
+  .sub { color:var(--dim); font-size:11px; margin-bottom:12px; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:3px 0; }
+  .row b { font-weight:600; font-variant-numeric:tabular-nums; }
+  .hot { color:var(--hot); }
+  button { width:100%; margin-top:12px; padding:8px; background:#1e2733; color:var(--fg);
+           border:1px solid var(--line); border-radius:6px; font:inherit; cursor:pointer; }
+  button:hover { background:#25313f; }
+  select { width:100%; margin-top:8px; padding:6px; background:#1e2733; color:var(--fg);
+           border:1px solid var(--line); border-radius:6px; font:inherit; }
+  #info { position:absolute; bottom:12px; left:12px; z-index:2; color:var(--dim); font-size:11px;
+          background:color-mix(in srgb, var(--panel) 92%, transparent); border:1px solid var(--line);
+          border-radius:8px; padding:8px 12px; max-width:420px; }
+</style>
+
+<div id="map"></div>
+<div id="panel">
+  <h1>netcluster-server</h1>
+  <div class="sub">clustered vector tiles, no rebuild</div>
+  <div class="row"><span>devices</span><b id="s-dev">0</b></div>
+  <div class="row"><span>reports sent</span><b id="s-sent">0</b></div>
+  <div class="row"><span>reports/s</span><b id="s-rate" class="hot">0</b></div>
+  <div class="row"><span>tile fetch</span><b id="s-tile">–</b></div>
+  <div class="row"><span>index memory</span><b id="s-mem">–</b></div>
+  <div class="row"><span>fast-path moves</span><b id="s-fast">–</b></div>
+  <select id="fleet">
+    <option value="2000">2,000 vehicles</option>
+    <option value="10000" selected>10,000 vehicles</option>
+    <option value="50000">50,000 vehicles</option>
+    <option value="200000">200,000 vehicles</option>
+  </select>
+  <button id="go">start</button>
+</div>
+<div id="info">Every vehicle moves continuously and the index is never rebuilt. Click a cluster to see what is inside it.</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const COLLECTION = 'demo';
+const API = location.origin + '/v1/collections/' + COLLECTION;
+const $ = id => document.getElementById(id);
+
+// Brazilian cities, roughly weighted by how many vehicles would actually be there.
+const HUBS = [
+  [-46.633, -23.550, 30], [-43.173, -22.907, 16], [-47.882, -15.794, 8],
+  [-38.523, -3.732,  7], [-34.877, -8.047,  6], [-51.230, -30.033, 6],
+  [-49.273, -25.428, 5], [-35.735, -9.666,  4], [-60.025, -3.101,  4],
+  [-48.504, -1.455,  4], [-38.501, -12.971, 6], [-44.038, -19.921, 8],
+];
+const TOTAL_W = HUBS.reduce((a, h) => a + h[2], 0);
+function hub() {
+  let r = Math.random() * TOTAL_W;
+  for (const h of HUBS) { if ((r -= h[2]) <= 0) return h; }
+  return HUBS[0];
+}
+
+let fleet = [], sent = 0, running = false, timer = null, lastTick = 0, rateAcc = 0;
+
+function makeFleet(n) {
+  fleet = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const h = hub();
+    const a = Math.random() * Math.PI * 2;
+    fleet[i] = {
+      id: 'v' + i,
+      lng: h[0] + (Math.random() - 0.5) * 0.55,
+      lat: h[1] + (Math.random() - 0.5) * 0.55,
+      hx: Math.cos(a) * 0.00035, hy: Math.sin(a) * 0.00035,
+    };
+  }
+}
+
+// Vehicles creep and occasionally turn -- the realistic case, and the one the
+// index's fast path exists for.
+function step() {
+  for (const v of fleet) {
+    if (Math.random() < 0.02) {
+      const a = Math.random() * Math.PI * 2;
+      v.hx = Math.cos(a) * 0.00035; v.hy = Math.sin(a) * 0.00035;
+    }
+    v.lng += v.hx; v.lat += v.hy;
+  }
+}
+
+async function push() {
+  if (!running) return;
+  step();
+  const body = fleet.map(v => ({ id: v.id, lng: +v.lng.toFixed(6), lat: +v.lat.toFixed(6) }));
+  const t0 = performance.now();
+  try {
+    const r = await fetch(API + '/positions', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    sent += body.length; rateAcc += body.length;
+    $('s-dev').textContent = (j.devices ?? 0).toLocaleString();
+    $('s-sent').textContent = sent.toLocaleString();
+  } catch (e) { /* server restarting; the next tick retries */ }
+  const dt = performance.now() - t0;
+  if (running) timer = setTimeout(push, Math.max(120, 500 - dt));
+}
+
+setInterval(() => {
+  $('s-rate').textContent = Math.round(rateAcc).toLocaleString();
+  rateAcc = 0;
+}, 1000);
+
+async function poll() {
+  try {
+    const s = await (await fetch(API)).json();
+    $('s-mem').textContent = (s.memory_bytes / 1e6).toFixed(0) + ' MB';
+    $('s-fast').textContent = s.moves_fast_pct.toFixed(1) + '%';
+  } catch (e) {}
+}
+setInterval(poll, 2000);
+
+const map = new maplibregl.Map({
+  container: 'map',
+  center: [-46.63, -23.55], zoom: 4,
+  attributionControl: false,
+  style: {
+    version: 8,
+    sources: {
+      fleet: {
+        type: 'vector',
+        tiles: [API + '/tiles/{z}/{x}/{y}.mvt'],
+        minzoom: 0, maxzoom: 16,
+      },
+    },
+    layers: [
+      { id: 'bg', type: 'background', paint: { 'background-color': '#0b0d10' } },
+      {
+        id: 'points', type: 'circle', source: 'fleet', 'source-layer': 'clusters',
+        filter: ['!=', ['get', 'cluster'], true],
+        paint: { 'circle-radius': 3, 'circle-color': '#ffce7a', 'circle-opacity': 0.9 },
+      },
+      {
+        id: 'clusters', type: 'circle', source: 'fleet', 'source-layer': 'clusters',
+        filter: ['==', ['get', 'cluster'], true],
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['sqrt', ['get', 'point_count']], 1, 6, 10, 16, 50, 30, 250, 52],
+          'circle-color': ['interpolate', ['linear'], ['log10', ['get', 'point_count']],
+                            0, '#ffce7a', 1, '#ff9f45', 2, '#f4633a', 3.5, '#c62f5a'],
+          'circle-opacity': 0.82,
+          'circle-stroke-width': 1,
+          'circle-stroke-color': 'rgba(255,255,255,0.35)',
+        },
+      },
+    ],
+  },
+});
+map.addControl(new maplibregl.NavigationControl(), 'bottom-right');
+
+// Tiles must be re-fetched as vehicles move; a fresh query string is the simplest
+// way to defeat both the browser cache and MapLibre's own.
+let tileT0 = 0;
+function refresh() {
+  const src = map.getSource('fleet');
+  if (!src) return;
+  tileT0 = performance.now();
+  src.setTiles([API + '/tiles/{z}/{x}/{y}.mvt?t=' + Date.now()]);
+}
+map.on('sourcedata', e => {
+  if (e.sourceId === 'fleet' && e.isSourceLoaded && tileT0) {
+    $('s-tile').textContent = Math.round(performance.now() - tileT0) + ' ms';
+    tileT0 = 0;
+  }
+});
+setInterval(() => { if (running) refresh(); }, 1000);
+
+map.on('click', 'clusters', async e => {
+  const p = e.features[0].properties;
+  const cid = e.features[0].id;
+  try {
+    const r = await (await fetch(API + '/clusters/' + cid + '/children')).json();
+    if (r.expansion_zoom != null) {
+      map.easeTo({ center: e.lngLat, zoom: r.expansion_zoom, duration: 500 });
+    }
+    $('info').textContent = `cluster of ${Number(p.point_count).toLocaleString()} vehicles ` +
+                            `-> splits into ${r.features?.length ?? 0} at zoom ${r.expansion_zoom}`;
+  } catch (err) {
+    $('info').textContent = 'that cluster is already gone -- handles are invalidated by movement';
+  }
+});
+map.on('mouseenter', 'clusters', () => map.getCanvas().style.cursor = 'pointer');
+map.on('mouseleave', 'clusters', () => map.getCanvas().style.cursor = '');
+
+$('go').onclick = async () => {
+  if (running) {
+    running = false; clearTimeout(timer); $('go').textContent = 'start'; return;
+  }
+  const n = +$('fleet').value;
+  $('go').textContent = 'building fleet...';
+  await new Promise(r => setTimeout(r, 10));
+  makeFleet(n);
+  await fetch(API, { method: 'PUT', headers: { 'content-type': 'application/json' },
+                     body: JSON.stringify({ ttl_seconds: 60 }) }).catch(() => {});
+  running = true; $('go').textContent = 'stop';
+  push(); refresh(); poll();
+};
+</script>
