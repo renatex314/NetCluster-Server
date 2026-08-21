@@ -117,8 +117,17 @@ const tile = await fleet.getTile(12, 1517, 2323);   // Uint8Array of MVT
 
 Zero dependencies, TypeScript declarations bundled, and it knows the replication
 rules below — writes fan out to every replica, reads go to one, and
-`client.forViewer(sessionId)` pins a viewer so markers do not flicker. Full
-documentation in [`clients/node/`](clients/node/).
+`client.forViewer(sessionId)` pins a viewer so markers do not flicker.
+
+```bash
+cd clients/node
+npm run example         # a guided tour of every function, then exits
+npm run example:fleet   # 20,000 vehicles reporting continuously
+```
+
+`example.mjs` ends by asserting it called **every** public method on the client,
+and `npm test` runs it — so a method added and not demonstrated fails the build.
+Full documentation in [`clients/node/`](clients/node/).
 
 ## API
 

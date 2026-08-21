@@ -3,7 +3,7 @@
 //
 //   cargo build --release --bin netcluster-server
 //   node test.mjs
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -193,6 +193,25 @@ await test('a 4xx is not retried', async () => {
   });
   await assert.rejects(() => counting.getClusters('fleet', { zoom: 4, cat: 'nope' }));
   assert.equal(calls, 1, `retried a 400 ${calls} times`);
+});
+
+// The example's last section asserts it called every public method. Running it
+// here is what keeps that assertion meaningful: add a method to the client and
+// forget to demonstrate it, and this fails.
+await test('example.mjs exercises every public method', async () => {
+  const { status, stdout, stderr } = spawnSync(
+    process.execPath,
+    [join(HERE, 'example.mjs')],
+    { env: { ...process.env, NETCLUSTER_URL: URL }, encoding: 'utf8' }
+  );
+  const out = stdout + stderr;
+  if (status !== 0) {
+    const tail = out.trim().split('\n').slice(-6).join('\n       ');
+    throw new Error(`example.mjs exited ${status}\n       ${tail}`);
+  }
+  const m = out.match(/(\d+) of (\d+) public methods exercised/);
+  assert.ok(m, 'example.mjs printed no coverage line');
+  assert.equal(m[1], m[2], `example.mjs covered ${m[1]} of ${m[2]} methods`);
 });
 
 server.kill();

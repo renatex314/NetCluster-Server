@@ -148,6 +148,21 @@ behind a timeout. Network errors and 5xx are retried `retries` times (default 1)
 
 TypeScript declarations are bundled; there is no `@types` package to install.
 
+## Examples
+
+```bash
+docker compose up          # from the repo root, or: cargo run --release -p netcluster-server
+
+npm run example            # a guided tour of every function, then exits
+npm run example:fleet      # 20,000 vehicles reporting continuously
+```
+
+`example.mjs` walks the whole API in order — collections, reporting, querying,
+filtering, expansion, leaves, tiles, the reporter, replica pinning, errors — and
+ends by asserting it called **every** public method on `NetClusterClient` and
+`Reporter`. `npm test` runs it, so a method added to the client and not
+demonstrated fails the build.
+
 ## Test
 
 ```bash
