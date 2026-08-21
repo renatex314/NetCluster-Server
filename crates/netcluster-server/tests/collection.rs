@@ -573,3 +573,53 @@ fn the_demo_batches_within_the_request_limit() {
         "the demo should surface ingest failures"
     );
 }
+
+/// The demo's marker size is not a free choice, and the label needs a glyph source.
+///
+/// Cluster centres are at least `radius` CSS pixels apart -- the server clusters at
+/// `radius` screen pixels against a 512-unit extent, and MapLibre renders vector
+/// sources at 512 px tiles -- so a circle wider than `radius` overlaps its
+/// neighbour. Getting this wrong is what turned zooming out into a pile of
+/// overlapping discs.
+///
+/// Static checks. For a full validation of the style against the MapLibre spec,
+/// capture it with a stubbed `maplibregl.Map` and run it through
+/// `@maplibre/maplibre-gl-style-spec`'s `validateStyleMin`.
+#[test]
+fn the_demo_sizes_markers_below_the_cluster_separation() {
+    let html = include_str!("../demo/index.html");
+
+    // MapLibre draws no text at all without this, and fails silently when it is
+    // missing -- the layer simply renders nothing.
+    assert!(
+        html.contains("glyphs:"),
+        "a symbol layer needs a glyph source or its labels never appear"
+    );
+    assert!(
+        html.contains("'cluster-count'"),
+        "the demo should label clusters with their count"
+    );
+    assert!(
+        html.contains("'text-field': ['get', 'point_count_abbreviated']"),
+        "the label should read the abbreviated count the server already emits"
+    );
+
+    // The ceiling must stay under half the default clustering radius of 40 px.
+    let max_r: f64 = html
+        .split("let MAX_R = ")
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.trim().parse().ok())
+        .expect("the demo should define MAX_R");
+    assert!(
+        max_r * 2.0 < 40.0,
+        "a {max_r} px radius is {} px across, wider than the 40 px separation between \
+         cluster centres -- markers will overlap when zoomed out",
+        max_r * 2.0
+    );
+    assert!(
+        html.contains("s.radius / 2"),
+        "the demo should derive its marker size from the server's radius rather than \
+         hard-coding a number that can drift away from it"
+    );
+}

@@ -156,16 +156,54 @@ setInterval(() => {
   rateAcc = 0;
 }, 1000);
 
+let sizedFromServer = false;
 async function poll() {
   try {
     const s = await (await fetch(API)).json();
     $('s-mem').textContent = (s.memory_bytes / 1e6).toFixed(0) + ' MB';
     $('s-fast').textContent = s.moves_fast_pct.toFixed(1) + '%';
+    // Size the markers from the geometry the server is actually using, rather
+    // than a number hard-coded here that could drift away from it.
+    if (!sizedFromServer && s.radius && map.getLayer('clusters')) {
+      MAX_R = Math.max(MIN_R + 2, s.radius / 2 - 3);
+      map.setPaintProperty('clusters', 'circle-radius', radiusExpr(MAX_R));
+      map.setLayoutProperty('cluster-count', 'text-size', textExpr(MAX_R));
+      sizedFromServer = true;
+    }
   } catch (e) { /* stats are cosmetic; ingest reports its own failures */ }
 }
 setInterval(poll, 2000);
 
 infoDefault = $('info').textContent;
+
+// Marker size is not a free choice. The server clusters at `radius` screen pixels
+// (40 by default) against a 512-unit tile extent, and MapLibre renders vector
+// sources at 512 px tiles -- so cluster centres are at least `radius` CSS pixels
+// apart on screen. A circle of radius `radius/2` therefore just touches its
+// neighbour, and anything larger overlaps. That is why zooming out used to turn
+// into a pile of overlapping discs: the old scale went up to 52 px radius against
+// a 40 px separation.
+//
+// So the size range is deliberately narrow and the *number* carries the magnitude.
+let MAX_R = 17;
+const MIN_R = 9;
+
+// log10 of the count, so 10 and 100 and 1000 are evenly spaced rather than the
+// first cluster eating the whole scale.
+const radiusExpr = (maxR) => [
+  'interpolate', ['linear'], ['log10', ['max', ['get', 'point_count'], 1]],
+  0, MIN_R,
+  1, MIN_R + (maxR - MIN_R) * 0.35,
+  2, MIN_R + (maxR - MIN_R) * 0.6,
+  3, MIN_R + (maxR - MIN_R) * 0.8,
+  5.5, maxR,
+];
+const textExpr = (maxR) => [
+  'interpolate', ['linear'], ['log10', ['max', ['get', 'point_count'], 1]],
+  0, 10,
+  2, 11,
+  5.5, Math.min(13, maxR * 0.8),
+];
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -173,6 +211,10 @@ const map = new maplibregl.Map({
   attributionControl: { compact: true },
   style: {
     version: 8,
+    // MapLibre cannot draw text without a glyph source. This is MapLibre's own
+    // keyless server; if it fails, the circles still render and only the numbers
+    // are missing.
+    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
     sources: {
       // A keyless dark basemap, so this page needs no API key to be useful. If you
       // adapt this for anything real, point it at your own tile source: CARTO's
@@ -195,10 +237,23 @@ const map = new maplibregl.Map({
         tiles: [API + '/tiles/{z}/{x}/{y}.mvt'],
         minzoom: 0, maxzoom: 16,
       },
+      // One point, the cluster you just clicked, so the split has a visible origin.
+      pulse: { type: 'geojson', data: { type: 'FeatureCollection', features: [] } },
     },
     layers: [
       { id: 'bg', type: 'background', paint: { 'background-color': '#0b0d10' } },
       { id: 'basemap', type: 'raster', source: 'basemap', paint: { 'raster-opacity': 0.85 } },
+      {
+        id: 'pulse', type: 'circle', source: 'pulse',
+        paint: {
+          'circle-radius': 0,
+          'circle-color': '#ffce7a',
+          'circle-opacity': 0,
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#ffce7a',
+          'circle-stroke-opacity': 0,
+        },
+      },
       {
         id: 'points', type: 'circle', source: 'fleet', 'source-layer': 'clusters',
         filter: ['!=', ['get', 'cluster'], true],
@@ -208,12 +263,36 @@ const map = new maplibregl.Map({
         id: 'clusters', type: 'circle', source: 'fleet', 'source-layer': 'clusters',
         filter: ['==', ['get', 'cluster'], true],
         paint: {
-          'circle-radius': ['interpolate', ['linear'], ['sqrt', ['get', 'point_count']], 1, 6, 10, 16, 50, 30, 250, 52],
-          'circle-color': ['interpolate', ['linear'], ['log10', ['get', 'point_count']],
+          'circle-radius': radiusExpr(MAX_R),
+          'circle-color': ['interpolate', ['linear'], ['log10', ['max', ['get', 'point_count'], 1]],
                             0, '#ffce7a', 1, '#ff9f45', 2, '#f4633a', 3.5, '#c62f5a'],
-          'circle-opacity': 0.82,
-          'circle-stroke-width': 1,
-          'circle-stroke-color': 'rgba(255,255,255,0.35)',
+          'circle-opacity': 0.88,
+          'circle-stroke-width': 1.5,
+          'circle-stroke-color': 'rgba(255,255,255,0.45)',
+          // Paint transitions: zooming changes these continuously rather than
+          // snapping, which is most of what reads as "the clusters animated".
+          'circle-radius-transition': { duration: 320 },
+          'circle-color-transition': { duration: 320 },
+          'circle-opacity-transition': { duration: 260 },
+        },
+      },
+      {
+        id: 'cluster-count', type: 'symbol', source: 'fleet', 'source-layer': 'clusters',
+        filter: ['==', ['get', 'cluster'], true],
+        layout: {
+          'text-field': ['get', 'point_count_abbreviated'],
+          'text-font': ['Noto Sans Bold'],
+          'text-size': textExpr(MAX_R),
+          // The number belongs to its circle, so it is drawn whether or not the
+          // labeller thinks there is room. Without this, the counts that matter
+          // most -- dense areas -- are the ones that disappear.
+          'text-allow-overlap': true,
+          'text-ignore-placement': true,
+        },
+        paint: {
+          'text-color': '#1a1206',
+          'text-halo-color': 'rgba(255,255,255,0.55)',
+          'text-halo-width': 0.8,
         },
       },
     ],
@@ -238,13 +317,42 @@ map.on('sourcedata', e => {
 });
 setInterval(() => { if (running) refresh(); }, 1000);
 
+// A ring that expands and fades from the clicked cluster while the map eases into
+// the zoom where it splits. MapLibre has no notion of "this cluster became those
+// three" -- tiles are replaced wholesale and cluster ids are explicitly unstable
+// across updates -- so the animation marks *where* the split happens rather than
+// morphing one marker into several.
+function ripple(lngLat, ms = 650) {
+  map.getSource('pulse').setData({
+    type: 'FeatureCollection',
+    features: [{ type: 'Feature', geometry: { type: 'Point', coordinates: [lngLat.lng, lngLat.lat] }, properties: {} }],
+  });
+  const t0 = performance.now();
+  const frame = () => {
+    const t = Math.min(1, (performance.now() - t0) / ms);
+    const ease = 1 - Math.pow(1 - t, 3);
+    map.setPaintProperty('pulse', 'circle-radius', MAX_R + ease * 70);
+    map.setPaintProperty('pulse', 'circle-stroke-opacity', 0.7 * (1 - ease));
+    map.setPaintProperty('pulse', 'circle-opacity', 0.18 * (1 - ease));
+    if (t < 1) requestAnimationFrame(frame);
+    else map.getSource('pulse').setData({ type: 'FeatureCollection', features: [] });
+  };
+  requestAnimationFrame(frame);
+}
+
 map.on('click', 'clusters', async e => {
   const p = e.features[0].properties;
   const cid = e.features[0].id;
+  ripple(e.lngLat);
   try {
     const r = await (await fetch(API + '/clusters/' + cid + '/children')).json();
     if (r.expansion_zoom != null) {
-      map.easeTo({ center: e.lngLat, zoom: r.expansion_zoom, duration: 500 });
+      // Slow enough to watch the cluster come apart. The markers resize
+      // continuously on the way, because circle-radius is a paint transition.
+      map.easeTo({
+        center: e.lngLat, zoom: r.expansion_zoom,
+        duration: 900, easing: t => t * (2 - t),
+      });
     }
     $('info').textContent = `cluster of ${Number(p.point_count).toLocaleString()} vehicles ` +
                             `-> splits into ${r.features?.length ?? 0} at zoom ${r.expansion_zoom}`;
