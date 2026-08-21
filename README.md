@@ -3,11 +3,12 @@
 A **clustering server**. Ingest position reports for things that move; serve
 clustered vector tiles.
 
-Tile38 answers *"which devices are near here"* and *"which just crossed this
-fence"*. It has no clustering — so people run Tile38 **and** a separate
-supercluster instance that gets rebuilt on a timer for the map. This closes that
-seam: the primary index is a net hierarchy, so clustering is a first-class query
-and the index is never rebuilt.
+Geospatial databases index points for proximity — *what is near here*, *what is
+inside this polygon* — and leave clustering to the client. So a map of moving
+things ends up running two systems: one for the queries, and a separate
+supercluster instance rebuilt on a timer for the markers. This closes that seam:
+the primary index is a net hierarchy, so clustering is a first-class query and the
+index is never rebuilt.
 
 ```
 POST /v1/collections/fleet/positions     ->  917,000 reports/s
@@ -141,10 +142,11 @@ because there is nothing to protect.
 
 Two consequences worth knowing before you deploy it:
 
-- **Do not shard geographically.** Tile38 can, because an R-tree query is spatially
-  local. This hierarchy is *globally coupled at coarse zooms* — a cluster at `z=0`
-  spans continents, so a vehicle in Brazil and one in Angola can share a parent.
-  Shard by collection (fleet A, fleet B), never by region.
+- **Do not shard geographically.** An ordinary spatial index can be split by
+  region, because an R-tree or grid query is spatially local. This hierarchy is
+  *globally coupled at coarse zooms* — a cluster at `z=0` spans continents, so a
+  vehicle in Brazil and one in Angola can share a parent. Shard by collection
+  (fleet A, fleet B), never by region.
 - **Route a client stickily.** Replicas consuming updates in different interleavings
   build slightly different trees, so cluster ids and groupings can differ between
   them. Visually that is markers flickering as a client's polls bounce across
@@ -186,9 +188,9 @@ cargo test --release
 
 ## What this deliberately does not do
 
-Geofencing, polygon `WITHIN`/`INTERSECTS`, webhooks, persistence, replication. If
-you need those, you need Tile38 or PostGIS — and you can run this alongside them
-for the map, which is the thing they do not do.
+Geofencing, polygon `WITHIN`/`INTERSECTS`, webhooks, persistence, replication.
+Those belong to a full geospatial database — PostGIS and its peers — and you can
+run this alongside one for the map, which is the part they leave to you.
 
 ## License
 

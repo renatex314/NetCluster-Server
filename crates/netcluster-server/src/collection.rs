@@ -16,12 +16,12 @@
 //!
 //! # Why not shard geographically
 //!
-//! Because you cannot. Tile38 can shard by region, since an R-tree query is
-//! spatially local. This hierarchy is *globally coupled at coarse zooms* -- a
-//! cluster at z=0 spans continents, so a vehicle in Brazil and one in Angola can
-//! share a parent. Split the world in two and the coarse zooms are wrong. Shard by
-//! collection (fleet A, fleet B), never by region, and size a process so that one
-//! collection fits in it.
+//! Because you cannot. An ordinary spatial index can be split by region, since an
+//! R-tree or grid query is spatially local. This hierarchy is *globally coupled at
+//! coarse zooms* -- a cluster at z=0 spans continents, so a vehicle in Brazil and
+//! one in Angola can share a parent. Split the world in two and the coarse zooms
+//! are wrong. Shard by collection (fleet A, fleet B), never by region, and size a
+//! process so that one collection fits in it.
 
 use netcluster::{Feature, NetCluster, Options};
 use std::collections::HashMap;

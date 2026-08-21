@@ -2,11 +2,11 @@
 //!
 //! Ingest position reports for moving things; serve clustered vector tiles.
 //!
-//! Tile38 answers "which devices are near here" and "which crossed this fence".
-//! It has no clustering, so people run it *and* a separate supercluster instance
-//! that gets rebuilt on a timer for the map. This closes that seam: the primary
-//! index is a net hierarchy, so clustering is a first-class query and the index is
-//! never rebuilt.
+//! Geospatial databases index points for proximity and leave clustering to the
+//! client, so a map of moving things ends up running two systems: one for the
+//! queries, and a separate supercluster instance rebuilt on a timer for the
+//! markers. This closes that seam: the primary index is a net hierarchy, so
+//! clustering is a first-class query and the index is never rebuilt.
 //!
 //! Configuration is entirely environment variables, because a process with no
 //! durable state has nothing else to configure:
