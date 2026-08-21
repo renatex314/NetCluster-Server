@@ -202,6 +202,19 @@ curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: app
 - **Omit `props` and the device keeps what it had.** Positions arrive many times a
   second and attributes change rarely, so a position report does not have to resend
   the number plate to avoid erasing it. Send `{}` to clear.
+
+  | `props` | effect |
+  |---|---|
+  | omitted | unchanged — the ordinary position update |
+  | `{...}` | replaces the whole object |
+  | `{}` | clears |
+
+- **There is no partial update.** `props` replaces wholesale, so changing one field
+  means resending the object. That is deliberate: merge semantics on nested values
+  are ambiguous — given a stored `{"nested":{"a":1}}`, a patch of `{"nested":{"b":2}}`
+  could reasonably replace `nested` or merge into it — and "replaces wholesale" is
+  not. Keep `props` small and it is a non-issue; anything you change often and
+  independently is usually a `category`.
 - **Clusters carry none** — forty vehicles do not share a battery level. Use
   `/clusters/{id}/leaves` to reach the members.
 - **In vector tiles**, top-level scalars become MVT tags so you can style by them.

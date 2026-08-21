@@ -64,6 +64,10 @@ export interface Point {
    * more often than attributes change, so a position report does not have to
    * resend the number plate to avoid erasing it. Send `{}` to clear.
    *
+   * There is no partial update: this replaces the whole object, so changing one
+   * field means resending it. Merge semantics on nested values are ambiguous and
+   * replacement is not.
+   *
    * Capped by the collection's `maxPropsBytes` (default 1024).
    */
   props?: Record<string, unknown>;

@@ -47,10 +47,21 @@ await fleet.report([{
 (await fleet.getDevice('truck-1')).props;   // { plate: 'ABC-1234', ... }
 ```
 
+| `props` | effect |
+|---|---|
+| omitted | unchanged — the ordinary position update |
+| `{...}` | replaces the whole object |
+| `{}` | clears |
+
 Omit `props` and the device keeps what it had — positions arrive far more often
 than attributes change, so a position report should not have to resend the plate to
-avoid erasing it. Send `{}` to clear. The reporter carries properties forward
-across coalescing for the same reason.
+avoid erasing it. The reporter carries properties forward across coalescing for the
+same reason.
+
+**There is no partial update.** `props` replaces wholesale, so changing one field
+means resending the object. Merge semantics on nested values are ambiguous — given
+a stored `{nested: {a: 1}}`, a patch of `{nested: {b: 2}}` could reasonably replace
+or merge — and replacing is not. Keep `props` small and it does not come up.
 
 Single points return their props as the GeoJSON `properties`; the device id is on
 the feature itself (`feature.id`). Clusters carry none. In vector tiles, top-level

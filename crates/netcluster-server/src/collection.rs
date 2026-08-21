@@ -158,6 +158,11 @@ pub struct Report<'a> {
     /// positions arrive many times a second, so a position report should not have
     /// to resend the number plate to avoid erasing it. To actually clear them,
     /// send an empty object.
+    ///
+    /// There is no partial update. `Some` replaces the whole object, deliberately:
+    /// merge semantics on nested values are ambiguous -- given a stored
+    /// `{"nested":{"a":1}}`, a patch of `{"nested":{"b":2}}` could reasonably
+    /// replace `nested` or merge into it -- and replacement is not.
     pub props: Option<&'a RawValue>,
 }
 

@@ -50,6 +50,32 @@ There is a Node client on npm: **[`netcluster-client`](https://www.npmjs.com/pac
 (zero dependencies, TypeScript declarations bundled). The index itself is also
 available as a standalone JavaScript library, **[`netcluster-js`](https://www.npmjs.com/package/netcluster-js)**.
 
+## Attaching data to a device
+
+```bash
+curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: application/json' \
+  -d '[{"id":"truck-1","lng":-46.6333,"lat":-23.5505,
+        "props":{"plate":"ABC-1234","battery":87}}]'
+```
+
+Returned verbatim on single-point features and on `GET .../devices/{id}`. Clusters
+carry none — forty vehicles do not share a battery level.
+
+| `props` | effect |
+|---|---|
+| omitted | unchanged — the ordinary position update |
+| `{...}` | replaces the whole object |
+| `{}` | clears |
+
+Omitting it is the common case: positions arrive many times a second while
+attributes change rarely, so a position report does not have to resend the number
+plate to avoid erasing it. There is **no partial update** — `props` replaces
+wholesale, because merge semantics on nested values are ambiguous and replacement
+is not.
+
+Capped by `max_props_bytes` (default 1024). Anything you filter or group by belongs
+in `categories` instead, which is indexed.
+
 ## Tuning the clustering
 
 Set per collection when you create it:
