@@ -25,8 +25,10 @@
 
 use crate::snapshot::DeviceRecord;
 use netcluster::{Feature, NetCluster, Options};
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,6 +55,13 @@ pub struct Config {
     /// Category labels. The index of a label *is* its category, so a query can say
     /// `?cat=delivering` instead of `?cat=2`.
     pub categories: Vec<String>,
+    /// Largest per-device properties blob accepted, in bytes. 0 refuses properties
+    /// entirely.
+    ///
+    /// Memory is bounded by devices times this number, so it is a real limit and
+    /// not a formality: at a million devices, every kilobyte allowed here is a
+    /// gigabyte you have promised to have.
+    pub max_props_bytes: usize,
     /// Drop a device that has not reported for this long. 0 disables expiry.
     ///
     /// You almost always want this set. A vehicle that stops reporting does not
@@ -68,6 +77,7 @@ impl Default for Config {
             extent: 512.0,
             hysteresis: 0.25,
             categories: Vec::new(),
+            max_props_bytes: 1024,
             ttl_seconds: 300,
         }
     }
@@ -83,6 +93,12 @@ struct IdMap {
     to_str: Vec<String>,
     /// Last report time per interned id; `u64::MAX` means "not currently live".
     last_seen: Vec<u64>,
+    /// Free-form properties per interned id, as raw JSON.
+    ///
+    /// Held behind an `Arc` so a query copies a refcount rather than the text: at
+    /// max zoom a viewport can return tens of thousands of single points, and
+    /// cloning each blob would dominate the query.
+    props: Vec<Option<Arc<Box<RawValue>>>>,
 }
 
 impl IdMap {
@@ -93,6 +109,7 @@ impl IdMap {
         let n = self.to_str.len() as u64;
         self.to_str.push(id.to_string());
         self.last_seen.push(u64::MAX);
+        self.props.push(None);
         self.to_num.insert(id.to_string(), n);
         n
     }
@@ -135,6 +152,13 @@ pub struct Report<'a> {
     pub lng: f64,
     pub lat: f64,
     pub cat: u32,
+    /// `None` leaves whatever the device already had; `Some` replaces it.
+    ///
+    /// That asymmetry is the point: properties are slow-changing metadata and
+    /// positions arrive many times a second, so a position report should not have
+    /// to resend the number plate to avoid erasing it. To actually clear them,
+    /// send an empty object.
+    pub props: Option<&'a RawValue>,
 }
 
 /// One thing to draw.
@@ -147,6 +171,9 @@ pub struct OutFeature {
     pub device: Option<String>,
     /// The cluster handle, when it is not.
     pub cluster_id: Option<u64>,
+    /// The device's properties, for single points. A cluster has none: forty
+    /// vehicles do not share a battery level.
+    pub props: Option<Arc<Box<RawValue>>>,
 }
 
 /// Everything the index knows about one device.
@@ -163,6 +190,8 @@ pub struct DeviceInfo {
     /// How long ago that was. The useful form: compare it against the TTL to see
     /// how close a device is to being swept.
     pub age_ms: u64,
+    /// Whatever was last reported for this device, or null.
+    pub props: Option<Arc<Box<RawValue>>>,
 }
 
 /// A point placed inside a vector tile.
@@ -173,6 +202,7 @@ pub struct OutTileFeature {
     pub count: u32,
     pub id: u64,
     pub device: Option<String>,
+    pub props: Option<Arc<Box<RawValue>>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -196,6 +226,10 @@ pub struct CollectionStats {
     pub last_snapshot_bytes: u64,
     pub snapshot_failures: u64,
     pub restored: u64,
+    /// Bytes of device properties currently held. Worth watching: it is the one
+    /// part of the index whose size you control from outside.
+    pub props_bytes: usize,
+    pub max_props_bytes: usize,
 }
 
 impl Collection {
@@ -263,6 +297,9 @@ impl Collection {
                 let n = st.ids.intern(&r.id);
                 st.index.insert_projected(n, r.x, r.y, cat);
                 st.ids.last_seen[n as usize] = r.last_seen_ms;
+                if let Some(p) = &r.props {
+                    st.ids.props[n as usize] = RawValue::from_string(p.clone()).ok().map(Arc::new);
+                }
             }
         }
         c.restored
@@ -292,6 +329,9 @@ impl Collection {
                 y,
                 cat: st.index.category_of(n).unwrap_or(0),
                 last_seen_ms: seen,
+                props: st.ids.props[n as usize]
+                    .as_ref()
+                    .map(|p| p.get().to_owned()),
             });
         }
         out
@@ -342,6 +382,7 @@ impl Collection {
 
     pub fn upsert(&self, reports: &[Report<'_>]) -> Result<usize, String> {
         let k = self.config.categories.len();
+        let cap = self.config.max_props_bytes;
         for r in reports {
             if !r.lng.is_finite() || !r.lat.is_finite() {
                 return Err(format!("device {:?} sent a non-finite coordinate", r.id));
@@ -351,6 +392,31 @@ impl Collection {
                     "device {:?} has category {} but this collection has {k}",
                     r.id, r.cat
                 ));
+            }
+            if let Some(p) = r.props {
+                let raw = p.get();
+                // GeoJSON properties is an object. serde already proved the text is
+                // valid JSON, so the first character settles the type without a parse.
+                if !raw.trim_start().starts_with('{') {
+                    return Err(format!(
+                        "device {:?}: props must be a JSON object, got {}",
+                        r.id,
+                        raw.chars().take(20).collect::<String>()
+                    ));
+                }
+                if cap == 0 {
+                    return Err(format!(
+                        "device {:?} sent props but this collection has max_props_bytes = 0",
+                        r.id
+                    ));
+                }
+                if raw.len() > cap {
+                    return Err(format!(
+                        "device {:?}: props are {} bytes, the limit is {cap}",
+                        r.id,
+                        raw.len()
+                    ));
+                }
             }
         }
         let now = now_ms();
@@ -363,6 +429,12 @@ impl Collection {
                 st.index.insert_with_category(n, r.lng, r.lat, r.cat);
             }
             st.ids.last_seen[n as usize] = now;
+            if let Some(p) = r.props {
+                // Reparsing here is what makes reads free: the blob is stored as
+                // validated raw text and handed straight to the serialiser.
+                st.ids.props[n as usize] =
+                    RawValue::from_string(p.get().to_owned()).ok().map(Arc::new);
+            }
         }
         self.ingested
             .fetch_add(reports.len() as u64, Ordering::Relaxed);
@@ -377,6 +449,9 @@ impl Collection {
         let gone = st.index.remove(n);
         if gone {
             st.ids.last_seen[n as usize] = u64::MAX;
+            // Interning is permanent, so without this a device that comes back
+            // silently inherits the properties it had in a previous life.
+            st.ids.props[n as usize] = None;
         }
         gone
     }
@@ -409,6 +484,7 @@ impl Collection {
             cat_index,
             last_seen_ms,
             age_ms: now_ms().saturating_sub(last_seen_ms),
+            props: st.ids.props.get(n as usize).cloned().flatten(),
         })
     }
 
@@ -438,6 +514,8 @@ impl Collection {
                 count: 1,
                 device: Some(ids.name(id).to_string()),
                 cluster_id: None,
+                // An Arc clone: a refcount bump, not a copy of the text.
+                props: ids.props.get(id as usize).cloned().flatten(),
             },
             Feature::Cluster {
                 cluster_id,
@@ -450,6 +528,7 @@ impl Collection {
                 count,
                 device: None,
                 cluster_id: Some(cluster_id),
+                props: None,
             },
         }
     }
@@ -469,6 +548,11 @@ impl Collection {
                     None
                 } else {
                     Some(st.ids.name(t.id).to_string())
+                },
+                props: if t.is_cluster {
+                    None
+                } else {
+                    st.ids.props.get(t.id as usize).cloned().flatten()
                 },
             })
             .collect()
@@ -542,6 +626,7 @@ impl Collection {
                     && st.index.remove(n)
                 {
                     st.ids.last_seen[n as usize] = u64::MAX;
+                    st.ids.props[n as usize] = None;
                     dropped += 1;
                 }
             }
@@ -576,6 +661,13 @@ impl Collection {
             last_snapshot_bytes: self.last_snapshot_bytes.load(Ordering::Relaxed),
             snapshot_failures: self.snapshot_failures.load(Ordering::Relaxed),
             restored: self.restored.load(Ordering::Relaxed),
+            props_bytes: st
+                .ids
+                .props
+                .iter()
+                .filter_map(|p| p.as_ref().map(|v| v.get().len()))
+                .sum(),
+            max_props_bytes: self.config.max_props_bytes,
         }
     }
 

@@ -172,6 +172,89 @@ await test('an expired device stops being registered', async () => {
   await tmp.drop();
 });
 
+await test('free-form properties round-trip through the API', async () => {
+  await fleet.report([{
+    id: 'truck-1',
+    lng: -46.6333, lat: -23.5505, cat: 'delivering',
+    props: { plate: 'ABC-1234', driver: 'Ana', battery: 87, tags: ['cold'], nested: { a: 1 } },
+  }]);
+  const d = await fleet.getDevice('truck-1');
+  assert.equal(d.props.plate, 'ABC-1234');
+  assert.equal(d.props.battery, 87);
+  assert.deepEqual(d.props.tags, ['cold']);
+  assert.equal(d.props.nested.a, 1, 'nested structure was flattened');
+
+  const fc = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom: 16 });
+  const f = fc.features.find((x) => x.id === 'truck-1');
+  assert.equal(f.properties.plate, 'ABC-1234', 'properties missing from the query path');
+
+  // a cluster has none: forty vehicles do not share a battery level
+  const low = await fleet.getClusters({ bbox: [-60, -35, -30, -10], zoom: 2 });
+  const cluster = low.features.find((x) => x.properties.cluster);
+  assert.ok(cluster, 'expected a cluster');
+  assert.equal(cluster.properties.battery, undefined);
+});
+
+await test('a position report does not erase properties', async () => {
+  for (let i = 0; i < 10; i++) {
+    await fleet.report([{ id: 'truck-1', lng: -46.6333 + i * 0.0001, lat: -23.5505 }]);
+  }
+  const d = await fleet.getDevice('truck-1');
+  assert.equal(d.props.plate, 'ABC-1234', '10 position reports erased the properties');
+
+  await fleet.report([{ id: 'truck-1', lng: -46.6333, lat: -23.5505, props: {} }]);
+  assert.deepEqual((await fleet.getDevice('truck-1')).props, {}, 'an empty object should clear');
+  await fleet.report([{ id: 'truck-1', lng: -46.6333, lat: -23.5505,
+                        props: { plate: 'ABC-1234' }, cat: 'delivering' }]);
+});
+
+// Coalescing keeps the newest report, and a position report carries no props --
+// so without care, reporting properties then a position before the next flush
+// would discard them before they were ever sent.
+await test('the reporter does not lose properties when coalescing', async () => {
+  const r = nc.reporter('fleet', { flushMs: 60_000 });
+  r.report({ id: 'coalesce-1', lng: 1, lat: 1, props: { plate: 'KEEP-ME' } });
+  r.report({ id: 'coalesce-1', lng: 2, lat: 2 });
+  r.report({ id: 'coalesce-1', lng: 3, lat: 3 });
+  assert.equal(r.pending.size, 1);
+  assert.deepEqual(r.pending.get('coalesce-1').props, { plate: 'KEEP-ME' });
+  await r.flush();
+  const d = await fleet.getDevice('coalesce-1');
+  assert.equal(d.props.plate, 'KEEP-ME', 'coalescing dropped the properties');
+  assert.ok(Math.abs(d.lng - 3) < 1e-6, `the newest position should win, got ${d.lng}`);
+
+  // but an explicit props on a newer report still wins
+  r.report({ id: 'coalesce-1', lng: 4, lat: 4, props: { plate: 'NEWER' } });
+  r.report({ id: 'coalesce-1', lng: 5, lat: 5 });
+  await r.flush();
+  assert.equal((await fleet.getDevice('coalesce-1')).props.plate, 'NEWER');
+  await r.close();
+  await fleet.remove('coalesce-1');
+});
+
+await test('oversized and malformed properties are rejected', async () => {
+  const tmp = nc.collection('props-cap');
+  await tmp.create({ maxPropsBytes: 64 });
+  await tmp.report([{ id: 'a', lng: 1, lat: 1, props: { a: 'short' } }]);
+  await assert.rejects(
+    () => tmp.report([{ id: 'b', lng: 1, lat: 1, props: { a: 'x'.repeat(200) } }]),
+    (e) => e instanceof NetClusterError && e.status === 400 && /limit is 64/.test(e.message)
+  );
+  assert.equal(await tmp.has('b'), false);
+  await tmp.drop();
+});
+
+// A stray attribute at the top level is a mistake; silently discarding it means
+// finding out weeks later that nothing was ever stored.
+await test('unknown top-level fields are rejected, not silently dropped', async () => {
+  const res = await fetch(`${URL}/v1/collections/fleet/positions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify([{ id: 'x', lng: 1, lat: 1, plate: 'ABC-1234' }]),
+  });
+  assert.equal(res.status, 422, `expected a rejection, got ${res.status}`);
+  assert.equal(await fleet.has('x'), false);
+});
+
 await test('remove a device', async () => {
   assert.deepEqual(await fleet.remove('truck-4'), { removed: true });
   assert.deepEqual(await fleet.remove('truck-4'), { removed: false });
@@ -189,7 +272,10 @@ await test('reporter coalesces repeated reports for one device', async () => {
   await r.close();
   // the last position wins
   const fc = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom: 16 });
-  const t1 = fc.features.find((f) => f.properties.id === 'truck-1');
+  // `feature.id` rather than `properties.id`: once a device has props, its
+  // properties object is the props verbatim. The id is on the feature, which is
+  // where GeoJSON puts it.
+  const t1 = fc.features.find((f) => f.id === 'truck-1');
   assert.ok(Math.abs(t1.geometry.coordinates[0] - (-46.6 + 9 * 0.001)) < 1e-6);
 });
 

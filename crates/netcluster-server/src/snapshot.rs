@@ -23,7 +23,8 @@
 //! magic     "NCSNAP" + u16 version
 //! meta      u32 length + JSON  { name, config }
 //! count     u64
-//! records   count x { u16 id_len, id bytes, i32 x, i32 y, u32 cat, u64 last_seen_ms }
+//! records   count x { u16 id_len, id bytes, i32 x, i32 y, u32 cat, u64 last_seen_ms,
+//!                     u32 props_len, props JSON bytes }     (props: version 2+)
 //! checksum  u64 FNV-1a over everything above
 //! ```
 //!
@@ -37,7 +38,10 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 6] = b"NCSNAP";
-const VERSION: u16 = 1;
+/// Bumped to 2 when per-device properties were added. Version 1 files are still
+/// read -- a format that cannot load its predecessor forces data loss on upgrade,
+/// which is a poor trade for one field.
+const VERSION: u16 = 2;
 const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
 const FNV_PRIME: u64 = 1_099_511_628_211;
 
@@ -62,6 +66,9 @@ pub struct DeviceRecord {
     pub y: i32,
     pub cat: u32,
     pub last_seen_ms: u64,
+    /// Raw JSON object, exactly as it arrived. Kept as text rather than a parsed
+    /// value so neither writing a snapshot nor answering a query re-parses it.
+    pub props: Option<String>,
 }
 
 fn fnv(hash: &mut u64, bytes: &[u8]) {
@@ -155,6 +162,9 @@ pub fn write(path: &Path, meta: &Meta, records: &[DeviceRecord]) -> io::Result<u
             w.write_all(&r.y.to_le_bytes())?;
             w.write_all(&r.cat.to_le_bytes())?;
             w.write_all(&r.last_seen_ms.to_le_bytes())?;
+            let props = r.props.as_deref().unwrap_or("");
+            w.write_all(&(props.len() as u32).to_le_bytes())?;
+            w.write_all(props.as_bytes())?;
         }
         let sum = w.hash;
         w.write_all(&sum.to_le_bytes())?;
@@ -208,11 +218,12 @@ pub fn read(path: &Path) -> io::Result<(Meta, Vec<DeviceRecord>)> {
         return Err(bad("not a netcluster snapshot"));
     }
     let version = u16::from_le_bytes(take(2)?.try_into().unwrap());
-    if version != VERSION {
+    if version == 0 || version > VERSION {
         return Err(bad(&format!(
-            "snapshot format version {version}, this build understands {VERSION}"
+            "snapshot format version {version}, this build understands up to {VERSION}"
         )));
     }
+    let has_props = version >= 2;
     let cfg_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
     let meta: Meta = serde_json::from_slice(take(cfg_len)?).map_err(io::Error::other)?;
     let count = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
@@ -228,12 +239,27 @@ pub fn read(path: &Path) -> io::Result<(Meta, Vec<DeviceRecord>)> {
         let y = i32::from_le_bytes(take(4)?.try_into().unwrap());
         let cat = u32::from_le_bytes(take(4)?.try_into().unwrap());
         let last_seen_ms = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        let props = if has_props {
+            let n = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+            let raw = take(n)?;
+            if raw.is_empty() {
+                None
+            } else {
+                Some(
+                    String::from_utf8(raw.to_vec())
+                        .map_err(|_| bad("device properties are not valid UTF-8"))?,
+                )
+            }
+        } else {
+            None
+        };
         out.push(DeviceRecord {
             id,
             x,
             y,
             cat,
             last_seen_ms,
+            props,
         });
     }
     if p != body.len() {
@@ -302,6 +328,7 @@ mod tests {
             extent: 512.0,
             hysteresis: 0.3,
             categories: vec!["idle".into(), "enroute".into()],
+            max_props_bytes: 1024,
             ttl_seconds: 120,
         }
     }
@@ -313,6 +340,11 @@ mod tests {
             y: x / 2,
             cat: (x as u32) % 2,
             last_seen_ms: 1_700_000_000_000 + x as u64,
+            props: if x % 3 == 0 {
+                Some(format!(r#"{{"plate":"ABC-{x}","battery":{}}}"#, x % 100))
+            } else {
+                None
+            },
         }
     }
 
@@ -343,9 +375,36 @@ mod tests {
         let (_, r2) = read(&p).unwrap();
         assert_eq!(r2.len(), 100_000);
         assert_eq!(r2[99_999], records[99_999]);
-        // the size claim in the module docs, checked rather than asserted in prose
-        let per = bytes as f64 / 100_000.0;
-        assert!(per < 40.0, "{per:.1} bytes per device");
+        assert!(
+            r2.iter().any(|r| r.props.is_some()),
+            "props did not survive"
+        );
+
+        // The size claim in the module docs, checked rather than asserted in prose.
+        // Measured without properties, because with them the size is whatever you
+        // chose to store and no longer says anything about the format.
+        let bare: Vec<_> = records
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.props = None;
+                r
+            })
+            .collect();
+        let bare_bytes = write(&path_for(&d, "bare"), &meta(), &bare).unwrap();
+        let per = bare_bytes as f64 / 100_000.0;
+        assert!(per < 40.0, "{per:.1} bytes per device without properties");
+
+        // and properties cost close to exactly what they weigh
+        let props_bytes: usize = records
+            .iter()
+            .filter_map(|r| r.props.as_ref().map(|p| p.len()))
+            .sum();
+        let overhead = bytes as i64 - bare_bytes as i64 - props_bytes as i64;
+        assert!(
+            overhead.unsigned_abs() < 100_000 * 5,
+            "properties cost {overhead} bytes beyond their own length"
+        );
     }
 
     #[test]

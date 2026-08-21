@@ -41,6 +41,14 @@ export interface CollectionConfig {
   categories?: string[];
   /** Drop a device that has not reported for this long. 0 disables expiry. */
   ttlSeconds?: number;
+  /**
+   * Largest per-device `props` blob accepted, in bytes. Default 1024; 0 refuses
+   * properties entirely.
+   *
+   * Memory is bounded by devices times this number, so it is a real limit: at a
+   * million devices every kilobyte allowed here is a gigabyte promised.
+   */
+  maxPropsBytes?: number;
 }
 
 /** One position report. `cat` may be a label from the collection, or its index. */
@@ -49,12 +57,23 @@ export interface Point {
   lng: number;
   lat: number;
   cat?: number | string;
+  /**
+   * Free-form attributes for this device. Any JSON object.
+   *
+   * Omit it and the device keeps whatever it already had -- positions arrive far
+   * more often than attributes change, so a position report does not have to
+   * resend the number plate to avoid erasing it. Send `{}` to clear.
+   *
+   * Capped by the collection's `maxPropsBytes` (default 1024).
+   */
+  props?: Record<string, unknown>;
 }
 
 export interface PointFeature {
   type: 'Feature';
   id: string;
-  properties: { id: string };
+  /** The device's `props` when it has any, otherwise `{ id }`. */
+  properties: Record<string, unknown>;
   geometry: { type: 'Point'; coordinates: [number, number] };
 }
 
@@ -82,6 +101,8 @@ export interface DeviceInfo {
   last_seen_ms: number;
   /** How long ago it reported. Compare against the collection's `ttl_seconds`. */
   age_ms: number;
+  /** Whatever was last reported for this device, or null. */
+  props: Record<string, unknown> | null;
 }
 
 export interface FeatureCollection {
@@ -115,6 +136,9 @@ export interface CollectionStats {
   snapshot_failures: number;
   /** Devices loaded from a snapshot at startup. */
   restored: number;
+  /** Bytes of device properties currently held. */
+  props_bytes: number;
+  max_props_bytes: number;
 }
 
 export interface Health {

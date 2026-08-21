@@ -202,6 +202,7 @@ export class NetClusterClient {
     if (config.hysteresis !== undefined) body.hysteresis = config.hysteresis;
     if (config.categories !== undefined) body.categories = config.categories;
     if (config.ttlSeconds !== undefined) body.ttl_seconds = config.ttlSeconds;
+    if (config.maxPropsBytes !== undefined) body.max_props_bytes = config.maxPropsBytes;
     return this._write(`/v1/collections/${enc(name)}`, { method: 'PUT', body });
   }
 
@@ -426,7 +427,18 @@ export class Reporter {
     if (!point || typeof point.id !== 'string') {
       throw new TypeError('netcluster: a report needs a string id');
     }
-    if (this.pending.has(point.id)) this.stats.coalesced++;
+    const prev = this.pending.get(point.id);
+    if (prev !== undefined) {
+      this.stats.coalesced++;
+      // Carry properties forward. Coalescing keeps the newest report, and a plain
+      // position report carries no `props` -- so without this, reporting
+      // properties and then a position before the next flush would discard them
+      // before they were ever sent. An explicit `props` on the newer report still
+      // wins, including `{}` to clear.
+      if (point.props === undefined && prev.props !== undefined) {
+        point = { ...point, props: prev.props };
+      }
+    }
     this.pending.set(point.id, point);
     this.stats.queued++;
   }

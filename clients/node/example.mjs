@@ -106,6 +106,21 @@ const bulk = Array.from({ length: 2500 }, (_, i) => ({
 const bulkRes = await fleet.report(bulk, { maxBatch: DEFAULT_MAX_BATCH });
 p(`bulk: ${bulkRes.accepted} reports sent in ${Math.ceil(bulk.length / DEFAULT_MAX_BATCH)} requests of ${DEFAULT_MAX_BATCH}`);
 
+// -- 3b. free-form attributes -------------------------------------------------
+h('3b. props  — attach anything to a device');
+await fleet.report([{
+  id: 'truck-1', lng: -46.6333, lat: -23.5505, cat: 'delivering',
+  props: { plate: 'ABC-1234', driver: 'Ana', battery: 87, tags: ['cold'] },
+}]);
+const withProps = await fleet.getDevice('truck-1');
+p(`getDevice('truck-1').props → ${JSON.stringify(withProps.props)}`);
+
+// Positions arrive far more often than attributes change, so a report without
+// `props` leaves them alone rather than erasing them.
+await fleet.report([{ id: 'truck-1', lng: -46.6334, lat: -23.5506 }]);
+p(`after a plain position report → ${JSON.stringify((await fleet.getDevice('truck-1')).props)}`);
+p(`send props: {} to clear them; nested objects and arrays survive intact`);
+
 // -- 4. what is on this server ------------------------------------------------
 h('4. listCollections()');
 const { collections } = await nc.listCollections();

@@ -55,6 +55,7 @@ fn a_restored_collection_holds_the_same_devices() {
             lng: -46.63 + (rng.next() - 0.5) * 0.9,
             lat: -23.55 + (rng.next() - 0.5) * 0.9,
             cat,
+            props: None,
         }])
         .unwrap();
         expected.push((id, cat));
@@ -67,6 +68,7 @@ fn a_restored_collection_holds_the_same_devices() {
             lng: 2.35,
             lat: 48.85,
             cat: i % 3,
+            props: None,
         }])
         .unwrap();
     }
@@ -123,6 +125,7 @@ fn a_restored_collection_holds_the_same_devices() {
             lng: 1.0,
             lat: 1.0,
             cat: 0,
+            props: None,
         }])
         .unwrap();
     assert!(restored.contains("brand-new"));
@@ -140,6 +143,7 @@ fn repeated_restores_do_not_drift() {
         lng: -46.633308,
         lat: -23.550520,
         cat: 0,
+        props: None,
     }])
     .unwrap();
     let first = c.device("still").unwrap();
@@ -167,6 +171,7 @@ fn records_past_the_ttl_are_not_restored() {
             y: 100,
             cat: 0,
             last_seen_ms: now,
+            props: None,
         },
         snapshot::DeviceRecord {
             id: "recent".into(),
@@ -174,6 +179,7 @@ fn records_past_the_ttl_are_not_restored() {
             y: 200,
             cat: 0,
             last_seen_ms: now - 30_000,
+            props: None,
         },
         snapshot::DeviceRecord {
             id: "stale".into(),
@@ -181,6 +187,7 @@ fn records_past_the_ttl_are_not_restored() {
             y: 300,
             cat: 0,
             last_seen_ms: now - 600_000,
+            props: None,
         },
         snapshot::DeviceRecord {
             id: "ancient".into(),
@@ -188,6 +195,7 @@ fn records_past_the_ttl_are_not_restored() {
             y: 400,
             cat: 0,
             last_seen_ms: 0,
+            props: None,
         },
     ];
     let (c, skipped) = Collection::restore("fleet", cfg(&[], 60), &records);
@@ -214,6 +222,7 @@ fn a_shrunken_category_list_does_not_take_the_process_down() {
             y: 100,
             cat: 0,
             last_seen_ms: now,
+            props: None,
         },
         snapshot::DeviceRecord {
             id: "b".into(),
@@ -221,6 +230,7 @@ fn a_shrunken_category_list_does_not_take_the_process_down() {
             y: 200,
             cat: 5,
             last_seen_ms: now,
+            props: None,
         },
     ];
     let (c, _) = Collection::restore("fleet", cfg(&["only-one"], 0), &records);
@@ -275,6 +285,7 @@ fn snapshots_during_heavy_writes_stay_consistent() {
             lng: -46.63 + (rng.next() - 0.5) * 0.9,
             lat: -23.55 + (rng.next() - 0.5) * 0.9,
             cat: 0,
+            props: None,
         })
         .collect();
     c.upsert(&initial).unwrap();
@@ -294,6 +305,7 @@ fn snapshots_during_heavy_writes_stay_consistent() {
                         lng: -46.63 + d,
                         lat: -23.55,
                         cat: 1,
+                        props: None,
                     })
                     .collect();
                 c.upsert(&batch).unwrap();
@@ -315,4 +327,79 @@ fn snapshots_during_heavy_writes_stay_consistent() {
     stop.store(true, Ordering::Relaxed);
     writer.join().unwrap();
     c.verify().unwrap();
+}
+
+/// Properties are part of a device's state, so they must survive a restart -- and
+/// a snapshot written by an older build, which had no field for them, must still
+/// load rather than being rejected.
+#[test]
+fn properties_survive_a_snapshot_and_a_v1_file_still_loads() {
+    let dir = tmpdir("props");
+    let c = Collection::new("fleet", cfg(&[], 0));
+    let p = serde_json::value::RawValue::from_string(
+        r#"{"plate":"ABC-1234","battery":87,"nested":{"a":[1,2]}}"#.to_string(),
+    )
+    .unwrap();
+    c.upsert(&[Report {
+        id: "truck-1",
+        lng: -46.63,
+        lat: -23.55,
+        cat: 0,
+        props: Some(&p),
+    }])
+    .unwrap();
+    c.upsert(&[Report {
+        id: "truck-2",
+        lng: 2.35,
+        lat: 48.85,
+        cat: 0,
+        props: None,
+    }])
+    .unwrap();
+
+    let path = snapshot::path_for(&dir, "fleet");
+    c.snapshot_to(&path).unwrap();
+    let (meta, records) = snapshot::read(&path).unwrap();
+    let (restored, _) = Collection::restore(&meta.name, meta.config, &records);
+
+    let d = restored.device("truck-1").unwrap();
+    let got: serde_json::Value = serde_json::from_str(d.props.unwrap().get()).unwrap();
+    assert_eq!(got["plate"], "ABC-1234");
+    assert_eq!(got["nested"]["a"][1], 2, "nested structure was flattened");
+    assert!(restored.device("truck-2").unwrap().props.is_none());
+    restored.verify().unwrap();
+
+    // A version-1 file: same layout without the props field. Hand-built, because
+    // the point is to prove an upgrade does not lose an existing snapshot.
+    let v1 = dir.join("legacy.ncs");
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"NCSNAP");
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    let meta_json = serde_json::to_vec(&snapshot::Meta {
+        name: "legacy".into(),
+        config: cfg(&[], 0),
+    })
+    .unwrap();
+    buf.extend_from_slice(&(meta_json.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&meta_json);
+    buf.extend_from_slice(&1u64.to_le_bytes());
+    buf.extend_from_slice(&3u16.to_le_bytes());
+    buf.extend_from_slice(b"old");
+    buf.extend_from_slice(&1234i32.to_le_bytes());
+    buf.extend_from_slice(&5678i32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&netcluster_server::collection::now_ms().to_le_bytes());
+    let mut h: u64 = 14_695_981_039_346_656_037;
+    for &b in &buf {
+        h ^= b as u64;
+        h = h.wrapping_mul(1_099_511_628_211);
+    }
+    buf.extend_from_slice(&h.to_le_bytes());
+    std::fs::write(&v1, &buf).unwrap();
+
+    let (m, r) = snapshot::read(&v1).expect("a version 1 snapshot must still load");
+    assert_eq!(m.name, "legacy");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].id, "old");
+    assert_eq!(r[0].props, None, "version 1 has no properties to report");
 }

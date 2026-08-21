@@ -15,7 +15,13 @@ fn cfg(categories: &[&str], ttl: u64) -> Config {
 }
 
 fn report<'a>(id: &'a str, lng: f64, lat: f64, cat: u32) -> Report<'a> {
-    Report { id, lng, lat, cat }
+    Report {
+        id,
+        lng,
+        lat,
+        cat,
+        props: None,
+    }
 }
 
 #[test]
@@ -340,4 +346,186 @@ fn an_expired_device_is_no_longer_registered() {
     assert_eq!(c.sweep(), 1);
     assert!(!c.contains("ghost"));
     assert!(c.device("ghost").is_none());
+}
+
+// --- free-form device properties -------------------------------------------
+
+fn raw(json: &str) -> Box<serde_json::value::RawValue> {
+    serde_json::value::RawValue::from_string(json.to_string()).unwrap()
+}
+
+fn with_props<'a>(
+    id: &'a str,
+    lng: f64,
+    lat: f64,
+    p: &'a serde_json::value::RawValue,
+) -> Report<'a> {
+    Report {
+        id,
+        lng,
+        lat,
+        cat: 0,
+        props: Some(p),
+    }
+}
+
+#[test]
+fn properties_come_back_verbatim() {
+    let c = Collection::new("t", cfg(&[], 0));
+    let p = raw(
+        r#"{"plate":"ABC-1234","driver":"Ana","battery":87,"tags":["cold","urgent"],"nested":{"a":1}}"#,
+    );
+    c.upsert(&[with_props("truck-1", -46.63, -23.55, &p)])
+        .unwrap();
+
+    let d = c.device("truck-1").unwrap();
+    let got: serde_json::Value = serde_json::from_str(d.props.unwrap().get()).unwrap();
+    assert_eq!(got["plate"], "ABC-1234");
+    assert_eq!(got["battery"], 87);
+    assert_eq!(got["tags"][1], "urgent");
+    assert_eq!(got["nested"]["a"], 1, "nested objects must survive intact");
+
+    // and on the query path, where they matter most
+    let f = &c.clusters([-47.0, -24.0, -46.0, -23.0], 16.0, -1)[0];
+    assert!(
+        f.props.is_some(),
+        "a single point should carry its properties"
+    );
+    assert!(f.props.as_ref().unwrap().get().contains("ABC-1234"));
+}
+
+/// Positions arrive many times a second and properties change rarely, so a report
+/// without props must not erase them.
+#[test]
+fn a_position_report_without_props_leaves_them_alone() {
+    let c = Collection::new("t", cfg(&[], 0));
+    let p = raw(r#"{"plate":"ABC-1234"}"#);
+    c.upsert(&[with_props("truck-1", -46.63, -23.55, &p)])
+        .unwrap();
+
+    for i in 0..50 {
+        c.upsert(&[report("truck-1", -46.63 + i as f64 * 0.001, -23.55, 0)])
+            .unwrap();
+    }
+    let d = c.device("truck-1").unwrap();
+    assert!(
+        d.props.is_some(),
+        "50 position reports erased the properties"
+    );
+    assert!(d.props.unwrap().get().contains("ABC-1234"));
+
+    // an explicit object replaces
+    let p2 = raw(r#"{"plate":"XYZ-9"}"#);
+    c.upsert(&[with_props("truck-1", -46.63, -23.55, &p2)])
+        .unwrap();
+    assert!(c
+        .device("truck-1")
+        .unwrap()
+        .props
+        .unwrap()
+        .get()
+        .contains("XYZ-9"));
+
+    // and an empty object clears
+    let empty = raw("{}");
+    c.upsert(&[with_props("truck-1", -46.63, -23.55, &empty)])
+        .unwrap();
+    assert_eq!(c.device("truck-1").unwrap().props.unwrap().get(), "{}");
+}
+
+/// Memory is bounded by devices times the cap, so the cap has to actually hold.
+#[test]
+fn oversized_properties_are_rejected() {
+    let c = Collection::new(
+        "t",
+        Config {
+            max_props_bytes: 64,
+            ..cfg(&[], 0)
+        },
+    );
+    let ok = raw(r#"{"a":"short"}"#);
+    c.upsert(&[with_props("a", 1.0, 1.0, &ok)]).unwrap();
+
+    let big = raw(&format!(r#"{{"a":"{}"}}"#, "x".repeat(200)));
+    let e = c.upsert(&[with_props("b", 1.0, 1.0, &big)]).unwrap_err();
+    assert!(e.contains("limit is 64"), "{e}");
+    assert!(
+        !c.contains("b"),
+        "a rejected batch must not be partially applied"
+    );
+
+    // 0 refuses properties entirely
+    let none = Collection::new(
+        "t",
+        Config {
+            max_props_bytes: 0,
+            ..cfg(&[], 0)
+        },
+    );
+    let e = none.upsert(&[with_props("a", 1.0, 1.0, &ok)]).unwrap_err();
+    assert!(e.contains("max_props_bytes = 0"), "{e}");
+    // but plain reports still work
+    none.upsert(&[report("a", 1.0, 1.0, 0)]).unwrap();
+    assert!(none.contains("a"));
+}
+
+#[test]
+fn properties_must_be_an_object() {
+    let c = Collection::new("t", cfg(&[], 0));
+    for bad in ["[1,2,3]", "\"a string\"", "42", "null", "true"] {
+        let p = raw(bad);
+        let e = c.upsert(&[with_props("x", 1.0, 1.0, &p)]).unwrap_err();
+        assert!(
+            e.contains("must be a JSON object"),
+            "{bad} was accepted: {e}"
+        );
+    }
+    assert!(!c.contains("x"));
+}
+
+/// Interning is permanent, so a device that comes back must not inherit the
+/// properties it had in a previous life.
+#[test]
+fn a_removed_device_does_not_keep_its_properties() {
+    let c = Collection::new("t", cfg(&[], 0));
+    let p = raw(r#"{"plate":"OLD"}"#);
+    c.upsert(&[with_props("truck-1", 1.0, 1.0, &p)]).unwrap();
+    assert!(c.remove("truck-1"));
+    c.upsert(&[report("truck-1", 2.0, 2.0, 0)]).unwrap();
+    assert!(
+        c.device("truck-1").unwrap().props.is_none(),
+        "a recycled id resurrected its old properties"
+    );
+}
+
+#[test]
+fn clusters_have_no_properties() {
+    let c = Collection::new("t", cfg(&[], 0));
+    let p = raw(r#"{"battery":87}"#);
+    for i in 0..20 {
+        let id = format!("v{i}");
+        c.upsert(&[with_props(&id, -46.63 + i as f64 * 0.0001, -23.55, &p)])
+            .unwrap();
+    }
+    let fs = c.clusters([-47.0, -24.0, -46.0, -23.0], 4.0, -1);
+    let cluster = fs.iter().find(|f| f.count > 1).expect("expected a cluster");
+    assert!(
+        cluster.props.is_none(),
+        "twenty vehicles do not share a battery level"
+    );
+}
+
+#[test]
+fn stats_report_what_properties_are_costing() {
+    let c = Collection::new("t", cfg(&[], 0));
+    assert_eq!(c.stats().props_bytes, 0);
+    let p = raw(r#"{"plate":"ABC-1234"}"#);
+    for i in 0..100 {
+        let id = format!("v{i}");
+        c.upsert(&[with_props(&id, 1.0 + i as f64 * 0.01, 1.0, &p)])
+            .unwrap();
+    }
+    let st = c.stats();
+    assert_eq!(st.props_bytes, 100 * p.get().len());
+    assert_eq!(st.max_props_bytes, 1024);
 }

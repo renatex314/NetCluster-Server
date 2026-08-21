@@ -36,6 +36,29 @@ const busy = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom: 12, cat
 const tile = await fleet.getTile(12, 1517, 2323);   // Uint8Array
 ```
 
+## Attaching data to a device
+
+```js
+await fleet.report([{
+  id: 'truck-1', lng: -46.6333, lat: -23.5505,
+  props: { plate: 'ABC-1234', driver: 'Ana', battery: 87 },
+}]);
+
+(await fleet.getDevice('truck-1')).props;   // { plate: 'ABC-1234', ... }
+```
+
+Omit `props` and the device keeps what it had — positions arrive far more often
+than attributes change, so a position report should not have to resend the plate to
+avoid erasing it. Send `{}` to clear. The reporter carries properties forward
+across coalescing for the same reason.
+
+Single points return their props as the GeoJSON `properties`; the device id is on
+the feature itself (`feature.id`). Clusters carry none. In vector tiles, top-level
+scalars become MVT tags so you can style by them.
+
+Capped by `maxPropsBytes` (default 1024). Anything you filter or group by belongs
+in `categories` instead.
+
 ## Tuning the clustering
 
 ```js

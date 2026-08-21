@@ -243,6 +243,8 @@ pub struct ConfigBody {
     pub hysteresis: Option<f64>,
     /// Category labels; a label's position in this list is its category index.
     pub categories: Option<Vec<String>>,
+    /// Largest per-device properties blob accepted, in bytes. 0 refuses properties.
+    pub max_props_bytes: Option<usize>,
     pub ttl_seconds: Option<u64>,
 }
 
@@ -255,6 +257,7 @@ impl ConfigBody {
             extent: self.extent.unwrap_or(d.extent),
             hysteresis: self.hysteresis.unwrap_or(d.hysteresis),
             categories: self.categories.unwrap_or(d.categories),
+            max_props_bytes: self.max_props_bytes.unwrap_or(d.max_props_bytes),
             ttl_seconds: self.ttl_seconds.unwrap_or(d.ttl_seconds),
         }
     }
@@ -386,20 +389,73 @@ enum CatVal {
     Name(String),
 }
 
+/// `deny_unknown_fields` on purpose. Free-form attributes go in `props`; a stray
+/// `"plate"` at the top level is a mistake, and silently discarding it means
+/// finding out weeks later that nothing was ever stored.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportBody {
     id: String,
     lng: f64,
     lat: f64,
     #[serde(default)]
     cat: Option<CatVal>,
+    /// Any JSON object. Omit it to leave the device's existing properties alone;
+    /// send `{}` to clear them.
+    #[serde(default)]
+    props: Option<Box<serde_json::value::RawValue>>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum PositionsBody {
-    Bare(Vec<ReportBody>),
-    Wrapped { points: Vec<ReportBody> },
+/// Either a bare array of reports or `{ "points": [...] }`.
+///
+/// Hand-written rather than `#[serde(untagged)]`, which cannot work here: an
+/// untagged enum deserialises by buffering the input into an intermediate
+/// representation and retrying each variant, and that buffer discards the original
+/// text -- which is exactly what `RawValue` needs to capture `props` without
+/// parsing. The derived version accepted both shapes right up until a report
+/// carried properties, then failed with "data did not match any variant".
+struct PositionsBody(Vec<ReportBody>);
+
+impl<'de> Deserialize<'de> for PositionsBody {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PositionsBody;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of position reports, or an object with a `points` array")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut v = Vec::with_capacity(a.size_hint().unwrap_or(0));
+                while let Some(r) = a.next_element()? {
+                    v.push(r);
+                }
+                Ok(PositionsBody(v))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut points: Option<Vec<ReportBody>> = None;
+                while let Some(k) = a.next_key::<String>()? {
+                    if k == "points" {
+                        points = Some(a.next_value()?);
+                    } else {
+                        return Err(serde::de::Error::unknown_field(&k, &["points"]));
+                    }
+                }
+                points
+                    .map(PositionsBody)
+                    .ok_or_else(|| serde::de::Error::missing_field("points"))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 async fn positions(
@@ -407,10 +463,7 @@ async fn positions(
     Path(name): Path<String>,
     Json(body): Json<PositionsBody>,
 ) -> ApiResult<Json<Value>> {
-    let reports = match body {
-        PositionsBody::Bare(v) => v,
-        PositionsBody::Wrapped { points } => points,
-    };
+    let reports = body.0;
     if reports.is_empty() {
         return Ok(Json(json!({ "accepted": 0 })));
     }
@@ -440,6 +493,7 @@ async fn positions(
             lng: r.lng,
             lat: r.lat,
             cat,
+            props: r.props.as_deref(),
         });
     }
     let n = c.upsert(&resolved).map_err(ApiError::bad)?;
@@ -516,10 +570,17 @@ fn abbrev(n: u32) -> String {
 /// GeoJSON in the shape supercluster emits, so existing client code works.
 fn geojson(f: &OutFeature) -> Value {
     if let Some(dev) = &f.device {
+        // The device's own properties when it has any, matching what the
+        // JavaScript library returns. The id is still on the feature itself, so
+        // nothing is lost by handing the object over verbatim.
+        let properties = match &f.props {
+            Some(p) => json!(p),
+            None => json!({ "id": dev }),
+        };
         json!({
             "type": "Feature",
             "id": dev,
-            "properties": { "id": dev },
+            "properties": properties,
             "geometry": { "type": "Point", "coordinates": [f.lng, f.lat] }
         })
     } else {
@@ -637,15 +698,35 @@ async fn tile(
             let mut layer = mvt::Layer::new("clusters", extent);
             for f in &feats {
                 if let Some(dev) = &f.device {
-                    layer.add_point(
-                        f.id,
-                        f.x,
-                        f.y,
-                        &[
-                            ("cluster", mvt::Val::Bool(false)),
-                            ("id", mvt::Val::Str(dev.clone())),
-                        ],
-                    );
+                    let mut tags = vec![
+                        ("cluster", mvt::Val::Bool(false)),
+                        ("id", mvt::Val::Str(dev.clone())),
+                    ];
+                    // Top-level scalars become tags so a renderer can style by
+                    // them. Nested objects and arrays are skipped rather than
+                    // stringified: a vector-tile value is a scalar, and quietly
+                    // turning {"a":1} into the text `{"a":1}` would produce a
+                    // filter that silently never matches.
+                    let flat = f.props.as_ref().and_then(|p| {
+                        serde_json::from_str::<serde_json::Map<String, Value>>(p.get()).ok()
+                    });
+                    if let Some(map) = &flat {
+                        for (k, v) in map {
+                            let val = match v {
+                                Value::String(x) => mvt::Val::Str(x.clone()),
+                                Value::Bool(b) => mvt::Val::Bool(*b),
+                                Value::Number(n) if n.is_u64() => {
+                                    mvt::Val::Uint(n.as_u64().unwrap())
+                                }
+                                Value::Number(n) => mvt::Val::Str(n.to_string()),
+                                _ => continue,
+                            };
+                            if k != "cluster" && k != "id" {
+                                tags.push((k.as_str(), val));
+                            }
+                        }
+                    }
+                    layer.add_point(f.id, f.x, f.y, &tags);
                 } else {
                     layer.add_point(
                         f.id,
@@ -685,6 +766,7 @@ async fn tile(
                     count: f.count,
                     device: f.device.clone(),
                     cluster_id: if f.device.is_some() { None } else { Some(f.id) },
+                    props: f.props.clone(),
                 })
                 .collect();
             let mut v = collection_json(&fs);

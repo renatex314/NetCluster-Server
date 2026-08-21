@@ -189,6 +189,40 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `GET .../verify` | full invariant check — admin only, `O(N²)` |
 | `GET /healthz`, `GET /metrics` | liveness, Prometheus |
 
+## Attaching data to a device
+
+Any JSON object, returned verbatim on single-point features and on `getDevice`:
+
+```bash
+curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: application/json' \
+  -d '[{"id":"truck-1","lng":-46.6333,"lat":-23.5505,
+        "props":{"plate":"ABC-1234","driver":"Ana","battery":87}}]'
+```
+
+- **Omit `props` and the device keeps what it had.** Positions arrive many times a
+  second and attributes change rarely, so a position report does not have to resend
+  the number plate to avoid erasing it. Send `{}` to clear.
+- **Clusters carry none** — forty vehicles do not share a battery level. Use
+  `/clusters/{id}/leaves` to reach the members.
+- **In vector tiles**, top-level scalars become MVT tags so you can style by them.
+  Nested objects and arrays are skipped rather than stringified: a tile value is a
+  scalar, and quietly turning `{"a":1}` into the text `{"a":1}` would produce a
+  filter that silently never matches.
+- **A device with `props` has them *as* its GeoJSON `properties`**, matching the
+  JavaScript library. The device id is on the feature itself (`feature.id`), which
+  is where GeoJSON puts it. A device without props still gets `{"id": ...}`.
+- **`max_props_bytes`** caps each blob, default 1024, `0` refuses properties
+  entirely. Memory is bounded by devices times this number, so it is a real limit:
+  at a million devices every kilobyte allowed is a gigabyte promised. `props_bytes`
+  in `/stats` reports what is actually held.
+
+Anything you want to **filter or group by** belongs in `categories` instead — that
+is indexed and costs nothing per update, whereas `props` are opaque payload.
+
+Unknown top-level fields are **rejected** with 422 rather than ignored: a stray
+`"plate"` outside `props` is a mistake, and silently discarding it means finding
+out weeks later that nothing was ever stored.
+
 ## Tuning the clustering
 
 Set per collection, at creation:
@@ -206,6 +240,7 @@ curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/js
 | `max_zoom` | `16` | finest zoom at which points still cluster; beyond it every point stands alone |
 | `hysteresis` | `0.25` | how far an assignment stretches before a point is re-homed |
 | `categories` | `[]` | filter labels; a label's position in the list is its index |
+| `max_props_bytes` | `1024` | largest per-device `props` blob; 0 refuses properties |
 | `ttl_seconds` | `300` | drop a device that has not reported for this long |
 
 `radius` and `extent` are one knob in two parts: what matters is the ratio. At the

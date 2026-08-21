@@ -61,6 +61,7 @@ Set per collection when you create it:
 | `max_zoom` | `16` | finest zoom at which points still cluster (max 20) |
 | `hysteresis` | `0.25` | how far an assignment stretches before a point is re-homed |
 | `categories` | `[]` | filter labels |
+| `max_props_bytes` | `1024` | largest per-device `props` blob; 0 refuses properties |
 | `ttl_seconds` | `300` | drop a device that has not reported for this long |
 
 Only the ratio of `radius` to `extent` matters. Raise `radius` for fewer, larger
