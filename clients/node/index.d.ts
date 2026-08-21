@@ -13,7 +13,7 @@ export declare class NetClusterError extends Error {
   readonly status: number;
   readonly url: string;
   /** The server's parsed JSON error body, when there was one. */
-  readonly body: { error?: string } | null;
+  readonly body: { error?: string; code?: string } | null;
 }
 
 export interface ClientOptions {
@@ -70,6 +70,19 @@ export interface ClusterFeature {
 }
 
 export type Feature = PointFeature | ClusterFeature;
+
+/** What the index knows about one registered device. */
+export interface DeviceInfo {
+  id: string;
+  lng: number;
+  lat: number;
+  /** The category label, or null when the collection has no labels. */
+  cat: string | null;
+  cat_index: number;
+  last_seen_ms: number;
+  /** How long ago it reported. Compare against the collection's `ttl_seconds`. */
+  age_ms: number;
+}
 
 export interface FeatureCollection {
   type: 'FeatureCollection';
@@ -158,6 +171,8 @@ export interface BoundCollection {
   verify(): Promise<{ ok: boolean; detail?: string; violation?: string }>;
   report(points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
   remove(id: string): Promise<{ removed: boolean }>;
+  has(id: string): Promise<boolean>;
+  getDevice(id: string): Promise<DeviceInfo | null>;
   getClusters(opts?: QueryOptions): Promise<FeatureCollection>;
   getTile(z: number, x: number, y: number, opts?: { cat?: number | string; format?: 'mvt' }): Promise<Uint8Array>;
   getTile(z: number, x: number, y: number, opts: { cat?: number | string; format: 'json' }): Promise<FeatureCollection>;
@@ -181,6 +196,11 @@ export declare class NetClusterClient {
 
   report(name: string, points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
   remove(name: string, id: string): Promise<{ removed: boolean }>;
+
+  /** Is a device with this id currently registered? Throws if the collection is unknown. */
+  has(name: string, id: string): Promise<boolean>;
+  /** Position, category and staleness for one device, or null if not registered. */
+  getDevice(name: string, id: string): Promise<DeviceInfo | null>;
 
   getClusters(name: string, opts?: QueryOptions): Promise<FeatureCollection>;
   getTile(name: string, z: number, x: number, y: number, opts?: { cat?: number | string; format?: 'mvt' }): Promise<Uint8Array>;

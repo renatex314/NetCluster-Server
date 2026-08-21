@@ -140,6 +140,22 @@ pub struct OutFeature {
     pub cluster_id: Option<u64>,
 }
 
+/// Everything the index knows about one device.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub lng: f64,
+    pub lat: f64,
+    /// The category label if the collection has any, otherwise the raw index.
+    pub cat: Option<String>,
+    pub cat_index: u32,
+    /// When this device last reported, in milliseconds since the epoch.
+    pub last_seen_ms: u64,
+    /// How long ago that was. The useful form: compare it against the TTL to see
+    /// how close a device is to being swept.
+    pub age_ms: u64,
+}
+
 /// A point placed inside a vector tile.
 #[derive(Debug, Clone)]
 pub struct OutTileFeature {
@@ -253,6 +269,37 @@ impl Collection {
             st.ids.last_seen[n as usize] = u64::MAX;
         }
         gone
+    }
+
+    /// Is a device with this id currently in the index?
+    ///
+    /// A read lock and a hash lookup. Distinct from "have we ever seen this id":
+    /// interning is permanent, so a removed device keeps its number, and only the
+    /// index is asked here.
+    pub fn contains(&self, id: &str) -> bool {
+        let st = self.state.read().unwrap();
+        match st.ids.to_num.get(id) {
+            Some(&n) => st.index.contains(n),
+            None => false,
+        }
+    }
+
+    /// Everything known about one device, or `None` if it is not registered.
+    pub fn device(&self, id: &str) -> Option<DeviceInfo> {
+        let st = self.state.read().unwrap();
+        let &n = st.ids.to_num.get(id)?;
+        let (lng, lat) = st.index.position_of(n)?;
+        let cat_index = st.index.category_of(n)?;
+        let last_seen_ms = st.ids.last_seen[n as usize];
+        Some(DeviceInfo {
+            id: id.to_string(),
+            lng,
+            lat,
+            cat: self.config.categories.get(cat_index as usize).cloned(),
+            cat_index,
+            last_seen_ms,
+            age_ms: now_ms().saturating_sub(last_seen_ms),
+        })
     }
 
     pub fn len(&self) -> usize {

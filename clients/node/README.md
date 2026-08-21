@@ -118,6 +118,8 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 | `listCollections()` / `stats(name)` | |
 | `report(name, points, { maxBatch })` | upserts; chunked |
 | `remove(name, id)` | |
+| `has(name, id)` | is this device registered? |
+| `getDevice(name, id)` | position, category and staleness, or `null` |
 | `getClusters(name, { bbox, zoom, cat })` | GeoJSON `FeatureCollection` |
 | `getTile(name, z, x, y, { cat, format })` | `Uint8Array` of MVT, or `format: 'json'` |
 | `getChildren(name, clusterId)` | one expansion step, plus `expansion_zoom` |
@@ -128,6 +130,26 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 | `reporter(name, opts)` | the batching reporter above |
 | `collection(name)` | bind the name into every call |
 | `forViewer(key)` | pin reads to one replica |
+
+### Registration
+
+```js
+await fleet.has('truck-1');          // true
+await fleet.remove('truck-1');
+await fleet.has('truck-1');          // false
+
+const d = await fleet.getDevice('truck-2');
+// { id, lng, lat, cat: 'delivering', cat_index: 2, last_seen_ms, age_ms }
+```
+
+`has` asks the index, not "have we ever seen this id" — a device that was removed,
+or that expired because it went quiet, answers `false`. Compare `age_ms` against
+the collection's `ttl_seconds` to see how close a device is to being swept.
+
+An unknown **collection** still throws rather than answering `false`. Two very
+different situations share the 404, so the server tags them (`device_not_registered`
+versus `no_such_collection`) and only the first becomes `false` — otherwise a typo
+in a collection name becomes a map that is quietly empty.
 
 ### Errors
 

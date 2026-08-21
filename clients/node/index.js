@@ -247,6 +247,41 @@ export class NetClusterClient {
     });
   }
 
+  /**
+   * Is a device with this id currently registered?
+   *
+   * A device that was removed, or that expired because it stopped reporting,
+   * answers `false` -- this asks the index, not "have we ever seen this id".
+   *
+   * An unknown *collection* still throws. Two very different situations share
+   * the 404 status, so the server tags them (`device_not_registered` versus
+   * `no_such_collection`) and only the first becomes `false`. Swallowing both
+   * would turn a typo in a collection name into a map that is quietly empty.
+   */
+  async has(name, id) {
+    return (await this.getDevice(name, id)) !== null;
+  }
+
+  /**
+   * What the index knows about one device -- position, category, and how long
+   * ago it last reported -- or `null` if it is not registered.
+   *
+   * `age_ms` against the collection's `ttl_seconds` tells you how close a device
+   * is to being swept.
+   */
+  async getDevice(name, id) {
+    try {
+      return await this._read(
+        `/v1/collections/${enc(name)}/devices/${enc(id)}`
+      );
+    } catch (e) {
+      if (e instanceof NetClusterError && e.body?.code === 'device_not_registered') {
+        return null;
+      }
+      throw e;
+    }
+  }
+
   // --------------------------------------------------------------- query --
 
   /**
@@ -326,6 +361,8 @@ export class NetClusterClient {
       verify: bind(this.verify),
       report: bind(this.report),
       remove: bind(this.remove),
+      has: bind(this.has),
+      getDevice: bind(this.getDevice),
       getClusters: bind(this.getClusters),
       getTile: bind(this.getTile),
       getChildren: bind(this.getChildren),

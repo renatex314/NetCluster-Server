@@ -161,6 +161,7 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `DELETE /v1/collections/{name}` | drop |
 | `POST /v1/collections/{name}/positions` | batch ingest |
 | `DELETE /v1/collections/{name}/devices/{id}` | remove one device |
+| `GET .../devices/{id}` | is it registered? 200 with position, category and staleness, or 404 (`HEAD` for a bare check) |
 | `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON |
 | `GET .../tiles/{z}/{x}/{y}.mvt` | vector tile (`.json` for tile-space GeoJSON) |
 | `GET .../devices/{id}/cluster?zoom=` | which marker contains this device |

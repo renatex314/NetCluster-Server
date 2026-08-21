@@ -225,10 +225,29 @@ for (const session of ['session-abc', 'session-xyz', 'session-abc']) {
 }
 p('same key always lands on the same replica; writes still go to all three');
 
-// -- 14. removing a device ----------------------------------------------------
-h('14. remove()');
+// -- 14. registration ---------------------------------------------------------
+h('14. has(), getDevice() and remove()');
+p(`has('truck-1')  → ${await fleet.has('truck-1')}`);
+p(`has('never-seen') → ${await fleet.has('never-seen')}`);
+
+const info = await fleet.getDevice('truck-1');
+p(`getDevice('truck-1') → ${info.lng.toFixed(4)}, ${info.lat.toFixed(4)} · ` +
+  `cat ${info.cat} (${info.cat_index}) · last reported ${info.age_ms} ms ago`);
+p(`getDevice('never-seen') → ${await fleet.getDevice('never-seen')}`);
+// age_ms against the collection's ttl_seconds tells you how close a device is to
+// being swept for going quiet.
+
 p(`remove('rio-2') → ${JSON.stringify(await fleet.remove('rio-2'))}`);
 p(`remove('rio-2') again → ${JSON.stringify(await fleet.remove('rio-2'))}`);
+p(`has('rio-2') after removal → ${await fleet.has('rio-2')}`);
+
+// A missing COLLECTION is not a missing device, and must not quietly answer
+// false -- that would turn a typo in a collection name into an empty map.
+try {
+  await nc.has('no-such-collection', 'truck-1');
+} catch (e) {
+  p(`has() on an unknown collection → ${e.name} ${e.status} (code: ${e.body.code})`);
+}
 
 // -- 15. errors ---------------------------------------------------------------
 h('15. NetClusterError');

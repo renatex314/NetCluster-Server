@@ -265,3 +265,79 @@ fn tiles_carry_the_same_devices_as_the_bbox_query() {
         assert_eq!(total, 500, "z={z}: tiles carried {total} of 500 devices");
     }
 }
+
+/// Registration must track the index, not the id-interning table. Interning is
+/// permanent -- a removed device keeps its number so it lands back in the same
+/// slot if it returns -- so asking the intern table "have I seen this id" would
+/// answer yes forever.
+#[test]
+fn contains_reflects_the_index_not_the_intern_table() {
+    let c = Collection::new("t", cfg(&["idle", "enroute"], 0));
+    assert!(!c.contains("truck-1"), "empty collection");
+    assert!(c.device("truck-1").is_none());
+
+    c.upsert(&[report("truck-1", -46.6333, -23.5505, 1)])
+        .unwrap();
+    assert!(c.contains("truck-1"));
+    assert!(!c.contains("truck-2"), "an id never reported");
+
+    // this is the case the intern table would get wrong
+    assert!(c.remove("truck-1"));
+    assert!(!c.contains("truck-1"), "a removed device is not registered");
+    assert!(c.device("truck-1").is_none());
+
+    c.upsert(&[report("truck-1", 1.0, 1.0, 0)]).unwrap();
+    assert!(c.contains("truck-1"), "reporting again re-registers it");
+}
+
+#[test]
+fn device_reports_position_category_and_staleness() {
+    let c = Collection::new("t", cfg(&["idle", "enroute", "delivering"], 300));
+    c.upsert(&[report("truck-1", -46.6333, -23.5505, 2)])
+        .unwrap();
+
+    let d = c.device("truck-1").expect("registered");
+    assert_eq!(d.id, "truck-1");
+    assert!((d.lng - -46.6333).abs() < 1e-6, "lng {}", d.lng);
+    assert!((d.lat - -23.5505).abs() < 1e-6, "lat {}", d.lat);
+    assert_eq!(d.cat.as_deref(), Some("delivering"));
+    assert_eq!(d.cat_index, 2);
+    assert!(d.last_seen_ms > 0);
+    assert!(
+        d.age_ms < 5_000,
+        "a device reported just now is {} ms stale",
+        d.age_ms
+    );
+
+    // a move updates the position and refreshes the age, without losing the category
+    thread::sleep(std::time::Duration::from_millis(30));
+    let before = c.device("truck-1").unwrap().age_ms;
+    assert!(before >= 25, "age did not advance: {before} ms");
+    c.upsert(&[report("truck-1", -46.70, -23.60, 2)]).unwrap();
+    let after = c.device("truck-1").unwrap();
+    assert!(after.age_ms < before, "reporting did not refresh last_seen");
+    assert!((after.lng - -46.70).abs() < 1e-6);
+    assert_eq!(after.cat_index, 2);
+}
+
+#[test]
+fn device_without_categories_still_answers() {
+    let c = Collection::new("t", cfg(&[], 0));
+    c.upsert(&[report("a", 1.0, 2.0, 0)]).unwrap();
+    let d = c.device("a").unwrap();
+    assert_eq!(d.cat, None, "no labels configured, so no label to report");
+    assert_eq!(d.cat_index, 0);
+}
+
+/// An expired device must stop being registered, not linger as a ghost that
+/// `contains` still vouches for.
+#[test]
+fn an_expired_device_is_no_longer_registered() {
+    let c = Collection::new("t", cfg(&[], 1));
+    c.upsert(&[report("ghost", 1.0, 1.0, 0)]).unwrap();
+    assert!(c.contains("ghost"));
+    thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(c.sweep(), 1);
+    assert!(!c.contains("ghost"));
+    assert!(c.device("ghost").is_none());
+}

@@ -117,6 +117,52 @@ await test('vector tile comes back as MVT bytes', async () => {
   assert.equal(asJson.type, 'FeatureCollection');
 });
 
+await test('has() and getDevice()', async () => {
+  assert.equal(await fleet.has('truck-1'), true);
+  assert.equal(await fleet.has('never-reported'), false);
+
+  const d = await fleet.getDevice('truck-1');
+  assert.equal(d.id, 'truck-1');
+  assert.ok(Math.abs(d.lng - -46.6333) < 1e-6, `lng ${d.lng}`);
+  assert.ok(Math.abs(d.lat - -23.5505) < 1e-6, `lat ${d.lat}`);
+  assert.equal(d.cat, 'delivering');
+  assert.equal(d.cat_index, 2);
+  assert.ok(d.age_ms >= 0 && d.age_ms < 60_000, `age_ms ${d.age_ms}`);
+  assert.equal(await fleet.getDevice('never-reported'), null);
+});
+
+// A device that is gone is not registered; a collection that is gone is an error.
+// Collapsing the two would turn a typo in a collection name into an empty map.
+await test('has() distinguishes an unknown device from an unknown collection', async () => {
+  await fleet.report([{ id: 'temp-1', lng: 1, lat: 1 }]);
+  assert.equal(await fleet.has('temp-1'), true);
+  await fleet.remove('temp-1');
+  assert.equal(await fleet.has('temp-1'), false, 'a removed device is not registered');
+
+  await assert.rejects(
+    () => nc.has('no-such-collection', 'truck-1'),
+    (e) =>
+      e instanceof NetClusterError &&
+      e.status === 404 &&
+      e.body.code === 'no_such_collection'
+  );
+});
+
+await test('an expired device stops being registered', async () => {
+  const tmp = nc.collection('reg-expiry');
+  await tmp.create({ ttlSeconds: 1 });
+  await tmp.report([{ id: 'ghost', lng: 1, lat: 1 }]);
+  assert.equal(await tmp.has('ghost'), true);
+  let gone = false;
+  for (let i = 0; i < 12; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    if (!(await tmp.has('ghost'))) { gone = true; break; }
+  }
+  assert.ok(gone, 'a device that stopped reporting is still registered');
+  assert.equal(await tmp.getDevice('ghost'), null);
+  await tmp.drop();
+});
+
 await test('remove a device', async () => {
   assert.deepEqual(await fleet.remove('truck-4'), { removed: true });
   assert.deepEqual(await fleet.remove('truck-4'), { removed: false });

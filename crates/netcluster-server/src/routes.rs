@@ -39,27 +39,40 @@ impl AppState {
             .unwrap()
             .get(name)
             .cloned()
-            .ok_or_else(|| ApiError::not_found(format!("no collection {name:?}")))
+            .ok_or_else(|| {
+                ApiError::not_found(format!("no collection {name:?}")).code("no_such_collection")
+            })
     }
 }
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(StatusCode, String, &'static str);
 
 impl ApiError {
     fn bad(m: impl Into<String>) -> Self {
-        ApiError(StatusCode::BAD_REQUEST, m.into())
+        ApiError(StatusCode::BAD_REQUEST, m.into(), "bad_request")
     }
     fn not_found(m: impl Into<String>) -> Self {
-        ApiError(StatusCode::NOT_FOUND, m.into())
+        ApiError(StatusCode::NOT_FOUND, m.into(), "not_found")
     }
     fn conflict(m: impl Into<String>) -> Self {
-        ApiError(StatusCode::CONFLICT, m.into())
+        ApiError(StatusCode::CONFLICT, m.into(), "conflict")
+    }
+    /// A stable slug beside the human message.
+    ///
+    /// Needed because two very different situations share a status: a device
+    /// that is not registered, and a collection that does not exist. A client
+    /// deciding between "return false" and "raise" cannot tell those apart from
+    /// 404 alone, and matching on the prose would break the first time it is
+    /// reworded.
+    fn code(mut self, c: &'static str) -> Self {
+        self.2 = c;
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        (self.0, Json(json!({ "error": self.1, "code": self.2 }))).into_response()
     }
 }
 
@@ -83,7 +96,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/v1/collections/{name}/devices/{id}",
-            axum::routing::delete(delete_device),
+            get(get_device).delete(delete_device),
         )
         .route(
             "/v1/collections/{name}/devices/{id}/cluster",
@@ -360,6 +373,25 @@ async fn positions(
     Ok(Json(json!({ "accepted": n, "devices": c.len() })))
 }
 
+/// Is this device registered, and what does the index know about it?
+///
+/// 200 with the record, 404 if it is not registered -- so a bare existence check
+/// is a HEAD against this route, which axum serves from the same handler without
+/// a body.
+async fn get_device(
+    State(s): State<Arc<AppState>>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let c = s.get(&name)?;
+    match c.device(&id) {
+        Some(d) => Ok(Json(json!(d))),
+        None => Err(
+            ApiError::not_found(format!("device {id:?} is not registered in {name:?}"))
+                .code("device_not_registered"),
+        ),
+    }
+}
+
 async fn delete_device(
     State(s): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
@@ -460,9 +492,10 @@ async fn device_cluster(
     let z = parse_zoom(&q)? as i32;
     match c.device_cluster(&id, z) {
         Some(f) => Ok(Json(geojson(&f))),
-        None => Err(ApiError::not_found(format!(
-            "device {id:?} is not in {name:?}"
-        ))),
+        None => Err(
+            ApiError::not_found(format!("device {id:?} is not in {name:?}"))
+                .code("device_not_registered"),
+        ),
     }
 }
 
