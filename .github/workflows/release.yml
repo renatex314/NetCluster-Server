@@ -97,26 +97,7 @@ jobs:
           curl -sf http://127.0.0.1:8080/healthz
           docker rm -f published
 
-      # Keep the Docker Hub page in step with the repository. Plain curl rather
-      # than a third-party action: it is six lines, and this step is handed a
-      # credential.
-      - name: Sync the Docker Hub overview
-        env:
-          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-          DH_PAT: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          JWT=$(curl -sf -H "Content-Type: application/json" \
-            -d "{\"identifier\":\"$DH_USER\",\"secret\":\"$DH_PAT\"}" \
-            https://hub.docker.com/v2/auth/token | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
-          # description is capped at 100 bytes by the API; full_description is not
-          python3 - <<'PY' > payload.json
-          import json, pathlib
-          print(json.dumps({
-            "description": "Clustered vector tiles for things that move. Update a point in ~0.65us, never rebuild.",
-            "full_description": pathlib.Path("docs/dockerhub-overview.md").read_text(),
-          }))
-          PY
-          curl -sf -X PATCH -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
-            --data-binary @payload.json \
-            "https://hub.docker.com/v2/repositories/$DH_USER/netcluster-server/" > /dev/null
-          echo "overview synced"
+      # The Docker Hub page is synced by its own workflow
+      # (.github/workflows/dockerhub-description.yml). It is documentation, and a
+      # release that published a correct image on both architectures should not go
+      # red because a description did not update.

@@ -1,0 +1,76 @@
+# Push docs/dockerhub-overview.md to the Docker Hub repository page.
+#
+# Its own workflow, separate from the release, for two reasons: the page is
+# documentation and should be updatable without cutting a release, and a release
+# that published a correct image on both architectures should not be marked failed
+# because a description did not update. Red for a cosmetic failure trains people to
+# ignore red.
+#
+# Needs a token with **Read, Write, Delete** permission. Read & Write is enough to
+# push images but not to edit repository metadata.
+name: dockerhub-description
+
+on:
+  push:
+    branches: [master]
+    paths: ["docs/dockerhub-overview.md", ".github/workflows/dockerhub-description.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Push the overview to Docker Hub
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          # A dedicated admin-scoped token if you have one, otherwise the token the
+          # release uses. Keeping them separate is better: the credential that can
+          # rewrite a public page does not need to be the one the build pipeline holds.
+          DH_PAT: ${{ secrets.DOCKERHUB_ADMIN_TOKEN || secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Explicit status checks rather than curl -f, so a failure says which call
+          # failed and what the API objected to. The previous version exited 22 with
+          # no indication of whether auth or the update was at fault.
+          code=$(curl -s -o auth.json -w '%{http_code}' -H "Content-Type: application/json" \
+            -d "{\"identifier\":\"$DH_USER\",\"secret\":\"$DH_PAT\"}" \
+            https://hub.docker.com/v2/auth/token)
+          if [ "$code" != "200" ]; then
+            echo "::error::Docker Hub auth returned $code: $(cat auth.json)"
+            echo "The token needs Read, Write, Delete permission to edit repository metadata."
+            exit 1
+          fi
+          JWT=$(python3 -c "import json;print(json.load(open('auth.json'))['access_token'])")
+          echo "authenticated as $DH_USER"
+
+          # description is capped at 100 BYTES by the API; full_description is not.
+          python3 - <<'PY' > payload.json
+          import json, pathlib, sys
+          short = "Clustered vector tiles for things that move. Update a point in ~0.65us, never rebuild."
+          if len(short.encode()) > 100:
+              sys.exit(f"short description is {len(short.encode())} bytes, the API caps it at 100")
+          print(json.dumps({
+            "description": short,
+            "full_description": pathlib.Path("docs/dockerhub-overview.md").read_text(),
+          }))
+          PY
+
+          code=$(curl -s -o resp.json -w '%{http_code}' -X PATCH \
+            -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+            --data-binary @payload.json \
+            "https://hub.docker.com/v2/repositories/$DH_USER/netcluster-server/")
+          if [ "$code" != "200" ]; then
+            echo "::error::Docker Hub update returned $code: $(cat resp.json)"
+            exit 1
+          fi
+          python3 -c "
+          import json
+          d = json.load(open('resp.json'))
+          print(f\"synced: {len(d['full_description'])} chars, description {d['description']!r}\")"
