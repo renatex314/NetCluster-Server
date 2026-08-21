@@ -79,9 +79,10 @@ Then open <http://localhost:8080/> for a live demo: a simulated fleet of up to
 200,000 vehicles moving continuously, rendered by MapLibre straight from the
 `.mvt` endpoint.
 
-The image is about 30 MB — a distroless base with no shell and no package manager.
-The container health check is a flag on the binary (`--health`), which is why it
-needs no curl.
+The image is 9.6 MB to pull (37 MB on disk) — a distroless base with no shell and
+no package manager, and a 1.3 MB binary. It runs as non-root under a read-only
+root filesystem. The container health check is a flag on the binary (`--health`),
+which is why it needs no curl.
 
 ```
 NETCLUSTER_ADDR             0.0.0.0:8080   listen address

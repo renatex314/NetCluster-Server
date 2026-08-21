@@ -111,9 +111,21 @@ docker build -t netcluster-server .
 docker run --rm -p 8080:8080 netcluster-server
 ```
 
-Roughly a 30 MB image: a distroless base with no shell and no package manager. The
-container health check is a flag on the binary itself (`--health`), which is why
-the image needs no curl.
+**9.6 MB to pull, 37 MB on disk**, of which the binary is 1.3 MB — the rest is the
+distroless base, which carries no shell and no package manager. The container
+health check is a flag on the binary itself (`--health`), which is why the image
+needs no curl.
+
+It runs as non-root and works under a read-only root filesystem, so the hardened
+settings in `deploy/k8s/` are not aspirational:
+
+```bash
+docker run --read-only --cap-drop ALL -p 8080:8080 netcluster-server
+```
+
+A cold build takes about 50 s. Changing source and rebuilding takes about 5 s: the
+dependency graph compiles in its own layer, keyed on the manifests alone, so
+editing code does not recompile axum and tokio.
 
 ```bash
 docker compose up          # server + the demo page on :8080

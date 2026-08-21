@@ -6,9 +6,13 @@
 #   docker build -t netcluster-server .
 #   docker run --rm -p 8080:8080 netcluster-server
 #
-# The result is roughly 30 MB. There is nothing to mount and nothing to persist --
-# the index is a materialised view of your position stream, so a container that
-# dies is a container you restart.
+# 9.6 MB to pull, 37 MB on disk, of which the binary is 1.3 MB -- the rest is the
+# distroless base. There is nothing to mount and nothing to persist: the index is a
+# materialised view of your position stream, so a container that dies is a
+# container you restart.
+#
+# A cold build takes about 50 s; changing source and rebuilding takes about 5 s,
+# because the dependency graph is compiled in its own cached layer below.
 
 # ---------------------------------------------------------------- build ------
 FROM rust:1.98-slim-bookworm AS builder
