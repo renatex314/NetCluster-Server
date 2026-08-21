@@ -36,6 +36,32 @@ const busy = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom: 12, cat
 const tile = await fleet.getTile(12, 1517, 2323);   // Uint8Array
 ```
 
+## Tuning the clustering
+
+```js
+await fleet.create({
+  radius: 40,        // cluster radius in screen pixels -- the main dial
+  extent: 512,       // tile extent those pixels are measured against
+  maxZoom: 16,       // finest zoom at which points still cluster (max 20)
+  hysteresis: 0.25,  // how far an assignment stretches before a point is re-homed
+  categories: ['idle', 'enroute', 'delivering'],
+  ttlSeconds: 300,
+});
+```
+
+Only the **ratio** of `radius` to `extent` matters, so `radius: 80, extent: 1024`
+clusters identically to the defaults.
+
+Raise `radius` for fewer, larger clusters — the dial most people need. Raise
+`maxZoom` if clusters break apart too early as you zoom in. Raise `hysteresis` if
+markers reshuffle distractingly while vehicles move: at 0 a vehicle idling on a
+cluster boundary flickers between two, and 0.25 lets the existing assignment
+survive 25% past the strict constraint.
+
+Geometry is fixed once a collection exists — `create()` is idempotent for the same
+values and rejects **409** for different ones. Full detail in the
+[server README](https://github.com/renatex314/NetCluster-Server#tuning-the-clustering).
+
 ## Reporting a live fleet
 
 Do not call `report()` per device per tick. Use the reporter: it batches on a

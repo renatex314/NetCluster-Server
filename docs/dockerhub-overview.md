@@ -50,6 +50,26 @@ There is a Node client on npm: **[`netcluster-client`](https://www.npmjs.com/pac
 (zero dependencies, TypeScript declarations bundled). The index itself is also
 available as a standalone JavaScript library, **[`netcluster-js`](https://www.npmjs.com/package/netcluster-js)**.
 
+## Tuning the clustering
+
+Set per collection when you create it:
+
+| | default | |
+|---|---|---|
+| `radius` | `40` | cluster radius in screen pixels — the dial most people need |
+| `extent` | `512` | tile extent those pixels are measured against |
+| `max_zoom` | `16` | finest zoom at which points still cluster (max 20) |
+| `hysteresis` | `0.25` | how far an assignment stretches before a point is re-homed |
+| `categories` | `[]` | filter labels |
+| `ttl_seconds` | `300` | drop a device that has not reported for this long |
+
+Only the ratio of `radius` to `extent` matters. Raise `radius` for fewer, larger
+clusters; raise `hysteresis` if markers reshuffle while vehicles move — at 0 a
+vehicle idling on a cluster boundary flickers between two.
+
+Geometry is fixed once a collection exists: re-creating with the same values is
+idempotent, different values return 409.
+
 ## Configuration
 
 | variable | default | |

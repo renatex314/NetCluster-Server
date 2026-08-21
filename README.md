@@ -189,6 +189,56 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `GET .../verify` | full invariant check — admin only, `O(N²)` |
 | `GET /healthz`, `GET /metrics` | liveness, Prometheus |
 
+## Tuning the clustering
+
+Set per collection, at creation:
+
+```bash
+curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/json' \
+  -d '{"radius":40,"extent":512,"max_zoom":16,"hysteresis":0.25,
+       "categories":["idle","enroute","delivering"],"ttl_seconds":300}'
+```
+
+| | default | |
+|---|---|---|
+| `radius` | `40` | cluster radius in screen pixels |
+| `extent` | `512` | tile extent those pixels are measured against |
+| `max_zoom` | `16` | finest zoom at which points still cluster; beyond it every point stands alone |
+| `hysteresis` | `0.25` | how far an assignment stretches before a point is re-homed |
+| `categories` | `[]` | filter labels; a label's position in the list is its index |
+| `ttl_seconds` | `300` | drop a device that has not reported for this long |
+
+`radius` and `extent` are one knob in two parts: what matters is the ratio. At the
+defaults a cluster is 40px across on a 512px tile, so `radius: 80, extent: 1024`
+clusters identically.
+
+**Too many markers, too cluttered** — raise `radius`. 60–80 gives noticeably
+fewer, larger clusters. This is almost always the right dial, and the only one most
+people need.
+
+**Clusters break apart too early as you zoom in** — raise `max_zoom`. It is the
+zoom at which clustering stops entirely. Hard-capped at 20: beyond that the
+fixed-point cell resolution runs out.
+
+**Markers reshuffle distractingly while vehicles move** — raise `hysteresis`. This
+is the one people do not know they want. At 0 a point is re-homed the instant it
+strictly violates its covering constraint, so a vehicle idling on a boundary
+flickers between two clusters. At 0.25 the existing assignment survives 25% past
+that, trading a slightly looser worst-case radius — `2(1+h)·r_z` instead of
+`2·r_z` — for far fewer visible changes. Try 0.5 if churn is still visible; it also
+costs less CPU, because fewer moves take the repair path.
+
+**Filtering** costs nothing extra at query time and nothing extra per update: a
+point belongs to exactly one category, so it touches exactly one aggregate slice
+per level regardless of how many categories exist.
+
+**Geometry is fixed once a collection exists.** Re-`PUT`ting the same values is
+idempotent; different values return **409**. That is deliberate — silently keeping
+the old geometry would leave two deployments disagreeing about what a cluster
+means while both believe they configured it. To change it, drop and recreate, or
+use a new name. `ttl_seconds` is not geometry and can be changed the same way, but
+it too requires a recreate today.
+
 ## Architecture
 
 **This is not a database.** It holds no truth — the authority for where your
