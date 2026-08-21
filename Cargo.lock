@@ -247,11 +247,11 @@ dependencies = [
 
 [[package]]
 name = "netcluster"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "netcluster-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "netcluster",
