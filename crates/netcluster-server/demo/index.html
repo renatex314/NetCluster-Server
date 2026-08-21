@@ -68,6 +68,7 @@ function hub() {
 }
 
 let fleet = [], sent = 0, running = false, timer = null, lastTick = 0, rateAcc = 0;
+let infoDefault = '';
 
 function makeFleet(n) {
   fleet = new Array(n);
@@ -95,23 +96,59 @@ function step() {
   }
 }
 
+// Chunked, for the same reason the Node client defaults to 1000: one request
+// holds the server's write lock for its whole duration, so batch size is the
+// head-of-line delay every reader pays. It is also a hard requirement -- the whole
+// fleet in one body exceeds the server's 2 MB request limit past about 40,000
+// vehicles, which this page used to do silently.
+const BATCH = 1000;
+
 async function push() {
   if (!running) return;
   step();
-  const body = fleet.map(v => ({ id: v.id, lng: +v.lng.toFixed(6), lat: +v.lat.toFixed(6) }));
   const t0 = performance.now();
-  try {
-    const r = await fetch(API + '/positions', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const j = await r.json();
-    sent += body.length; rateAcc += body.length;
-    $('s-dev').textContent = (j.devices ?? 0).toLocaleString();
+  let devices = 0, ok = true;
+  for (let i = 0; i < fleet.length && running; i += BATCH) {
+    const body = fleet.slice(i, i + BATCH)
+      .map(v => ({ id: v.id, lng: +v.lng.toFixed(6), lat: +v.lat.toFixed(6) }));
+    try {
+      const r = await fetch(API + '/positions', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        // Say so. Silently retrying a request that will never succeed is how this
+        // page came to show zeros with no explanation.
+        fail(`ingest failed: ${r.status} ${(await r.text()).slice(0, 120)}`);
+        ok = false;
+        break;
+      }
+      const j = await r.json();
+      devices = j.devices ?? devices;
+      sent += body.length; rateAcc += body.length;
+    } catch (e) {
+      fail(`cannot reach the server: ${e.message}`);
+      ok = false;
+      break;
+    }
+  }
+  if (ok) {
+    clearFail();
+    $('s-dev').textContent = devices.toLocaleString();
     $('s-sent').textContent = sent.toLocaleString();
-  } catch (e) { /* server restarting; the next tick retries */ }
+  }
   const dt = performance.now() - t0;
   if (running) timer = setTimeout(push, Math.max(120, 500 - dt));
+}
+
+function fail(msg) {
+  const el = $('info');
+  el.style.color = '#ff8a8a';
+  el.textContent = msg;
+}
+function clearFail() {
+  const el = $('info');
+  if (el.style.color) { el.style.color = ''; el.textContent = infoDefault; }
 }
 
 setInterval(() => {
@@ -124,9 +161,11 @@ async function poll() {
     const s = await (await fetch(API)).json();
     $('s-mem').textContent = (s.memory_bytes / 1e6).toFixed(0) + ' MB';
     $('s-fast').textContent = s.moves_fast_pct.toFixed(1) + '%';
-  } catch (e) {}
+  } catch (e) { /* stats are cosmetic; ingest reports its own failures */ }
 }
 setInterval(poll, 2000);
+
+infoDefault = $('info').textContent;
 
 const map = new maplibregl.Map({
   container: 'map',

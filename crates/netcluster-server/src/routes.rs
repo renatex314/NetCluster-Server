@@ -119,6 +119,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/collections/{name}/snapshot",
             axum::routing::post(force_snapshot),
         )
+        // Explicit rather than inherited. 2 MB is roughly 40,000 position reports,
+        // far beyond the 1000 the docs recommend batching at -- and the limit is a
+        // guardrail for that advice, not an obstacle to it: a bigger body holds the
+        // write lock longer and every reader waits behind it.
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn(cors))
         .with_state(state)
 }

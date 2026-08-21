@@ -529,3 +529,47 @@ fn stats_report_what_properties_are_costing() {
     assert_eq!(st.props_bytes, 100 * p.get().len());
     assert_eq!(st.max_props_bytes, 1024);
 }
+
+/// The bundled demo page must not out-grow the server's request limit.
+///
+/// It used to POST the whole simulated fleet in one body, which silently 413'd
+/// past about 40,000 vehicles and left the page showing zeros with no explanation.
+/// A static check, because the alternative is stubbing MapLibre and a DOM to catch
+/// one arithmetic mistake.
+#[test]
+fn the_demo_batches_within_the_request_limit() {
+    let html = include_str!("../demo/index.html");
+
+    let batch: usize = html
+        .split("const BATCH = ")
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.trim().parse().ok())
+        .expect("the demo should define a BATCH size");
+
+    // A position report serialises to well under 100 bytes; 2 MB is the server
+    // limit set in routes.rs. Leave an order of magnitude of headroom.
+    const LIMIT_BYTES: usize = 2 * 1024 * 1024;
+    const BYTES_PER_REPORT: usize = 100;
+    assert!(
+        batch * BYTES_PER_REPORT < LIMIT_BYTES / 4,
+        "a batch of {batch} could reach {} bytes against a {LIMIT_BYTES} byte limit",
+        batch * BYTES_PER_REPORT
+    );
+
+    // and the specific mistake: sending the entire fleet as one body
+    assert!(
+        !html.contains("body: JSON.stringify(body),\n    });") || html.contains("fleet.slice("),
+        "the demo appears to post the whole fleet in one request again"
+    );
+    assert!(
+        html.contains("fleet.slice(i, i + BATCH)"),
+        "the demo should slice the fleet into batches"
+    );
+
+    // failures must reach the user rather than being swallowed into a zeroed panel
+    assert!(
+        html.contains("fail(`ingest failed"),
+        "the demo should surface ingest failures"
+    );
+}
