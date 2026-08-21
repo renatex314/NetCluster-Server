@@ -1,0 +1,108 @@
+# Build and test on every push. Ubuntu only, deliberately: this is a private
+# repository, so Actions minutes come out of the account quota, and macOS runners
+# bill at ten times the rate for a workload that is entirely portable.
+name: ci
+
+on:
+  push:
+    branches: [master, netcluster]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+
+      # Release, not debug: the invariant checker is O(N squared) over long
+      # randomised operation streams and the differential fixture replays 15,680
+      # operations. Unoptimised, that is minutes instead of seconds.
+      - name: Tests
+        run: cargo test --release
+
+      - name: Build the server binary
+        run: cargo build --release --bin netcluster-server
+
+      - name: Upload the binary for the client job
+        uses: actions/upload-artifact@v7
+        with:
+          name: netcluster-server
+          path: target/release/netcluster-server
+          retention-days: 1
+
+  node-client:
+    needs: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: netcluster-server
+          path: target/release
+
+      - run: chmod +x target/release/netcluster-server
+
+      # The client tests spawn the real binary and drive it over HTTP, so they
+      # exercise the wire format rather than a mock. They also run example.mjs,
+      # which asserts it called every public method on the client.
+      - name: Client tests
+        working-directory: clients/node
+        run: npm test
+
+  # The image is the deliverable, so a change that breaks the build should fail
+  # here rather than at release time. Single platform: this only checks that it
+  # builds, and the release workflow does the multi-arch push.
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: netcluster-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image must actually serve
+        run: |
+          docker run -d --name ci --read-only --cap-drop ALL -p 8080:8080 netcluster-server:ci
+          for i in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8080/healthz && break; sleep 1; done
+          curl -sf http://127.0.0.1:8080/healthz
+          curl -sf -X POST http://127.0.0.1:8080/v1/collections/ci/positions \
+            -H 'content-type: application/json' \
+            -d '[{"id":"a","lng":-46.63,"lat":-23.55},{"id":"b","lng":-46.64,"lat":-23.56}]'
+          curl -sf 'http://127.0.0.1:8080/v1/collections/ci/clusters?zoom=4' | grep -q point_count
+          test "$(docker inspect ci --format '{{.State.Health.Status}}')" != "unhealthy"
+          docker rm -f ci

@@ -1,0 +1,122 @@
+# Publish the image to Docker Hub.
+#
+#   git tag v0.1.1 && git push origin v0.1.1
+#
+# or run it by hand from the Actions tab. The tag is the source of truth for the
+# image version, so tag and image never drift apart.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, without the leading v (e.g. 0.1.1)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # The arm64 leg is emulated through QEMU on an amd64 runner, which is slow --
+    # Rust spends most of that time in the compiler. The buildx cache makes
+    # repeat runs cheap, but the first one after a dependency change is not.
+    # If this becomes painful, cross-compile in the Dockerfile with
+    # --platform=$BUILDPLATFORM and a target linker instead of emulating.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Work out the version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "publishing $V"
+
+      # A tag that disagrees with Cargo.toml means the image and the crate claim
+      # different versions, which is the kind of thing nobody notices until they
+      # are trying to work out which build is in production.
+      - name: The tag must match Cargo.toml
+        run: |
+          CARGO_V=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$CARGO_V" != "${{ steps.v.outputs.version }}" ]; then
+            echo "tag says ${{ steps.v.outputs.version }}, Cargo.toml says $CARGO_V"
+            exit 1
+          fi
+          echo "both say $CARGO_V"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/netcluster-server:${{ steps.v.outputs.version }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/netcluster-server:latest
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            index:org.opencontainers.image.revision=${{ github.sha }}
+            index:org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            index:org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Both architectures must be in the manifest. Pushing an image that only
+      # runs on the builder's architecture is the classic way to fail at deploy
+      # time rather than build time.
+      - name: Verify the manifest carries both architectures
+        run: |
+          IMG=${{ secrets.DOCKERHUB_USERNAME }}/netcluster-server:${{ steps.v.outputs.version }}
+          docker buildx imagetools inspect "$IMG" > m.txt
+          cat m.txt
+          grep -q "linux/amd64" m.txt || { echo "no amd64 in the manifest"; exit 1; }
+          grep -q "linux/arm64" m.txt || { echo "no arm64 in the manifest"; exit 1; }
+
+      - name: The published image must serve
+        run: |
+          IMG=${{ secrets.DOCKERHUB_USERNAME }}/netcluster-server:${{ steps.v.outputs.version }}
+          docker run -d --name published -p 8080:8080 "$IMG"
+          for i in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8080/healthz && break; sleep 1; done
+          curl -sf http://127.0.0.1:8080/healthz
+          docker rm -f published
+
+      # Keep the Docker Hub page in step with the repository. Plain curl rather
+      # than a third-party action: it is six lines, and this step is handed a
+      # credential.
+      - name: Sync the Docker Hub overview
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_PAT: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          JWT=$(curl -sf -H "Content-Type: application/json" \
+            -d "{\"identifier\":\"$DH_USER\",\"secret\":\"$DH_PAT\"}" \
+            https://hub.docker.com/v2/auth/token | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+          # description is capped at 100 bytes by the API; full_description is not
+          python3 - <<'PY' > payload.json
+          import json, pathlib
+          print(json.dumps({
+            "description": "Clustered vector tiles for things that move. Update a point in ~0.65us, never rebuild.",
+            "full_description": pathlib.Path("docs/dockerhub-overview.md").read_text(),
+          }))
+          PY
+          curl -sf -X PATCH -H "Authorization: Bearer $JWT" -H "Content-Type: application/json" \
+            --data-binary @payload.json \
+            "https://hub.docker.com/v2/repositories/$DH_USER/netcluster-server/" > /dev/null
+          echo "overview synced"
