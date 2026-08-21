@@ -98,7 +98,15 @@ check is a flag on the binary (`--health`), which is why it needs no curl.
 NETCLUSTER_ADDR             0.0.0.0:8080   listen address
 NETCLUSTER_SWEEP_SECONDS    10             how often to drop expired devices
 NETCLUSTER_AUTO_CREATE      1              create a collection on first write
+NETCLUSTER_DATA_DIR         (unset)        snapshot directory; unset = no persistence
+NETCLUSTER_SNAPSHOT_SECONDS 60             snapshot interval
 ```
+
+Persistence is **opt-in**. Without `NETCLUSTER_DATA_DIR` the server keeps nothing,
+which is the right default when devices report on a timer — the index refills
+itself in about a second per million devices. Set it when reporting is
+event-driven, where a parked vehicle would otherwise never reappear after a
+restart. See [docs/DEPLOY.md](docs/DEPLOY.md#persistence-when-you-want-it).
 
 Turn `NETCLUSTER_AUTO_CREATE` **off** in production: with it on, a typo in a
 collection name silently creates an empty collection instead of returning 404, and
@@ -177,6 +185,7 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `GET .../devices/{id}/cluster?zoom=` | which marker contains this device |
 | `GET .../clusters/{id}/children` | one expansion step, plus `expansion_zoom` |
 | `GET .../clusters/{id}/leaves?limit=&offset=` | the individual devices inside |
+| `POST .../snapshot` | write a snapshot now (persistence must be on) |
 | `GET .../verify` | full invariant check — admin only, `O(N²)` |
 | `GET /healthz`, `GET /metrics` | liveness, Prometheus |
 

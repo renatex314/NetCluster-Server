@@ -4,6 +4,7 @@
 //   cargo build --release --bin netcluster-server
 //   node test.mjs
 import { spawn, spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -20,8 +21,16 @@ if (!existsSync(BIN)) {
   process.exit(1);
 }
 
+const DATA = join(tmpdir(), `netcluster-test-${process.pid}-${Date.now()}`);
 const server = spawn(BIN, [], {
-  env: { ...process.env, NETCLUSTER_ADDR: `127.0.0.1:${PORT}`, NETCLUSTER_SWEEP_SECONDS: '1' },
+  env: {
+    ...process.env,
+    NETCLUSTER_ADDR: `127.0.0.1:${PORT}`,
+    NETCLUSTER_SWEEP_SECONDS: '1',
+    // Persistence on, so the snapshot path is covered rather than skipped.
+    NETCLUSTER_DATA_DIR: DATA,
+    NETCLUSTER_SNAPSHOT_SECONDS: '3600',
+  },
   stdio: ['ignore', 'ignore', 'pipe'],
 });
 let serverErr = '';
@@ -217,6 +226,70 @@ await test('expiry drops devices that stop reporting', async () => {
   await tmp.drop();
 });
 
+await test('snapshot() writes a file that survives a restart', async () => {
+  const { existsSync, readdirSync } = await import('node:fs');
+  const r = await fleet.snapshot();
+  assert.ok(r.bytes > 0, 'snapshot reported no bytes');
+  assert.equal(r.snapshot, 'fleet');
+  assert.ok(existsSync(DATA), 'no data directory');
+  assert.ok(readdirSync(DATA).some((f) => f.endsWith('.ncs')), 'no snapshot file');
+
+  const st = await fleet.stats();
+  assert.ok(st.last_snapshot_ms > 0, 'stats did not record the snapshot');
+  assert.equal(st.snapshot_failures, 0);
+  assert.equal(st.last_snapshot_bytes, r.bytes);
+
+  assert.equal((await nc.health()).persistence, true);
+});
+
+// The whole point: a fresh process reading the same directory comes back with the
+// devices AND the geometry, so filters keep working after a restart.
+await test('a second process restores from the snapshot', async () => {
+  const before = await fleet.stats();
+  await fleet.snapshot();
+
+  const PORT2 = PORT + 1;
+  const second = spawn(BIN, [], {
+    env: { ...process.env, NETCLUSTER_ADDR: `127.0.0.1:${PORT2}`, NETCLUSTER_DATA_DIR: DATA },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  try {
+    const nc2 = new NetClusterClient({ url: `http://127.0.0.1:${PORT2}` });
+    for (let i = 0; i < 100; i++) {
+      try { await nc2.health(); break; } catch { await new Promise((r) => setTimeout(r, 50)); }
+    }
+    const after = await nc2.stats('fleet');
+    assert.equal(after.devices, before.devices, 'device count changed across the restart');
+    assert.equal(after.restored, before.devices, 'devices were not counted as restored');
+    assert.deepEqual(after.categories, before.categories, 'the geometry did not come back');
+    assert.equal(after.ttl_seconds, before.ttl_seconds);
+
+    // a filtered query still works, which is what the geometry restore buys
+    const fc = await nc2.getClusters('fleet', { zoom: 8, cat: 'delivering' });
+    assert.ok(fc.features.length > 0, 'the restored collection lost its categories');
+
+    const d = await nc2.getDevice('fleet', 'truck-2');
+    assert.ok(d, 'truck-2 did not survive');
+    const orig = await fleet.getDevice('truck-2');
+    assert.equal(d.lng, orig.lng, 'position drifted across the restart');
+    assert.equal(d.lat, orig.lat);
+  } finally {
+    second.kill();
+  }
+});
+
+await test('dropping a collection removes its snapshot', async () => {
+  const { readdirSync } = await import('node:fs');
+  const tmp = nc.collection('will-be-dropped');
+  await tmp.create({ ttlSeconds: 0 });
+  await tmp.report([{ id: 'x', lng: 1, lat: 1 }]);
+  await tmp.snapshot();
+  const before = readdirSync(DATA).length;
+  const res = await tmp.drop();
+  assert.equal(res.snapshot_removed, true, 'the snapshot file was left behind');
+  assert.equal(readdirSync(DATA).length, before - 1, 'file count did not drop');
+});
+
 await test('the index still passes its own invariant check', async () => {
   const v = await fleet.verify();
   assert.equal(v.ok, true, v.violation);
@@ -261,4 +334,8 @@ await test('example.mjs exercises every public method', async () => {
 });
 
 server.kill();
+try {
+  const { rmSync } = await import('node:fs');
+  rmSync(DATA, { recursive: true, force: true });
+} catch { /* best effort */ }
 console.log(`\n${passed} passed`);

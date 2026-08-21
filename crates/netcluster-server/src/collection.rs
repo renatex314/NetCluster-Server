@@ -23,6 +23,7 @@
 //! are wrong. Shard by collection (fleet A, fleet B), never by region, and size a
 //! process so that one collection fits in it.
 
+use crate::snapshot::DeviceRecord;
 use netcluster::{Feature, NetCluster, Options};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,7 +44,7 @@ pub fn now_ms() -> u64 {
 /// many short ones. 256 removals is about half a millisecond.
 const SWEEP_CHUNK: usize = 256;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub max_zoom: u8,
     pub radius: f64,
@@ -117,6 +118,14 @@ pub struct Collection {
     pub ingested: AtomicU64,
     pub queries: AtomicU64,
     pub expired: AtomicU64,
+    /// Snapshot bookkeeping. A snapshot that has silently stopped succeeding --
+    /// full disk, wrong permissions -- is exactly the failure you want to hear
+    /// about before you need the data, so it is surfaced in stats and metrics.
+    pub last_snapshot_ms: AtomicU64,
+    pub last_snapshot_bytes: AtomicU64,
+    pub snapshot_failures: AtomicU64,
+    /// Devices loaded from a snapshot at startup.
+    pub restored: AtomicU64,
 }
 
 /// One position report.
@@ -182,6 +191,11 @@ pub struct CollectionStats {
     pub expired: u64,
     pub uptime_ms: u64,
     pub moves_fast_pct: f64,
+    /// 0 when no snapshot has been written, or persistence is off.
+    pub last_snapshot_ms: u64,
+    pub last_snapshot_bytes: u64,
+    pub snapshot_failures: u64,
+    pub restored: u64,
 }
 
 impl Collection {
@@ -205,6 +219,102 @@ impl Collection {
             ingested: AtomicU64::new(0),
             queries: AtomicU64::new(0),
             expired: AtomicU64::new(0),
+            last_snapshot_ms: AtomicU64::new(0),
+            last_snapshot_bytes: AtomicU64::new(0),
+            snapshot_failures: AtomicU64::new(0),
+            restored: AtomicU64::new(0),
+        }
+    }
+
+    /// Rebuild a collection from a snapshot.
+    ///
+    /// Inserts the stored fixed-point coordinates directly rather than going back
+    /// through the projection: re-projecting would re-round every position on
+    /// every restart, and the drift would accumulate over a service's lifetime.
+    ///
+    /// Returns the collection and how many records were dropped for being older
+    /// than the TTL -- a snapshot from long enough ago restores nothing, which is
+    /// correct: those devices went quiet and would be swept within seconds anyway.
+    pub fn restore(name: &str, config: Config, records: &[DeviceRecord]) -> (Self, usize) {
+        let c = Collection::new(name, config);
+        let cutoff = if c.config.ttl_seconds > 0 {
+            now_ms().saturating_sub(c.config.ttl_seconds * 1000)
+        } else {
+            0
+        };
+        let k = c.config.categories.len();
+        let mut skipped = 0usize;
+        {
+            let mut st = c.state.write().unwrap();
+            for r in records {
+                if r.last_seen_ms < cutoff {
+                    skipped += 1;
+                    continue;
+                }
+                // The config can have changed since the snapshot was written. A
+                // category that no longer exists falls back to 0 rather than
+                // panicking on a startup path, where a panic means the process
+                // never comes back at all.
+                let cat = if k > 0 && (r.cat as usize) < k {
+                    r.cat
+                } else {
+                    0
+                };
+                let n = st.ids.intern(&r.id);
+                st.index.insert_projected(n, r.x, r.y, cat);
+                st.ids.last_seen[n as usize] = r.last_seen_ms;
+            }
+        }
+        c.restored
+            .store(c.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        (c, skipped)
+    }
+
+    /// Every live device, as stored.
+    ///
+    /// The read lock covers the copy and nothing else. A read lock blocks the
+    /// writer, so serialising tens of megabytes inside it would stall ingest for
+    /// the duration of the write -- the caller serialises afterwards.
+    pub fn export(&self) -> Vec<DeviceRecord> {
+        let st = self.state.read().unwrap();
+        let mut out = Vec::with_capacity(st.index.len());
+        for (n, &seen) in st.ids.last_seen.iter().enumerate() {
+            if seen == u64::MAX {
+                continue; // interned once, not currently live
+            }
+            let n = n as u64;
+            let Some((x, y)) = st.index.position(n) else {
+                continue;
+            };
+            out.push(DeviceRecord {
+                id: st.ids.to_str[n as usize].clone(),
+                x,
+                y,
+                cat: st.index.category_of(n).unwrap_or(0),
+                last_seen_ms: seen,
+            });
+        }
+        out
+    }
+
+    /// Export and write a snapshot, recording the outcome for /metrics.
+    pub fn snapshot_to(&self, path: &std::path::Path) -> std::io::Result<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let records = self.export();
+        let meta = crate::snapshot::Meta {
+            name: self.name.clone(),
+            config: self.config.clone(),
+        };
+        match crate::snapshot::write(path, &meta, &records) {
+            Ok(n) => {
+                self.last_snapshot_ms.store(now_ms(), Relaxed);
+                self.last_snapshot_bytes.store(n, Relaxed);
+                Ok(n)
+            }
+            Err(e) => {
+                self.snapshot_failures.fetch_add(1, Relaxed);
+                Err(e)
+            }
         }
     }
 
@@ -462,6 +572,10 @@ impl Collection {
             } else {
                 0.0
             },
+            last_snapshot_ms: self.last_snapshot_ms.load(Ordering::Relaxed),
+            last_snapshot_bytes: self.last_snapshot_bytes.load(Ordering::Relaxed),
+            snapshot_failures: self.snapshot_failures.load(Ordering::Relaxed),
+            restored: self.restored.load(Ordering::Relaxed),
         }
     }
 

@@ -5,3 +5,4 @@
 pub mod collection;
 pub mod mvt;
 pub mod routes;
+pub mod snapshot;

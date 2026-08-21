@@ -271,8 +271,26 @@ try {
   p(`unreachable server → status ${e.status} (0 means no response at all)`);
 }
 
-// -- 16. verify ---------------------------------------------------------------
-h('16. verify()  — admin only, O(N²)');
+// -- 16a. persistence ---------------------------------------------------------
+h('16. snapshot() and verify()');
+// The server is stateless unless started with NETCLUSTER_DATA_DIR. When it is, it
+// snapshots on a timer and on shutdown; this forces one now, which is what you
+// want before a deliberate restart.
+try {
+  const snap = await fleet.snapshot();
+  p(`snapshot() → ${snap.bytes} bytes on disk`);
+  const st2 = await fleet.stats();
+  p(`last snapshot ${new Date(st2.last_snapshot_ms).toISOString()} · ` +
+    `failures ${st2.snapshot_failures} · restored at boot ${st2.restored}`);
+} catch (e) {
+  if (e.body?.code === 'persistence_disabled') {
+    p('snapshot() → persistence is off (start the server with NETCLUSTER_DATA_DIR)');
+  } else {
+    throw e;
+  }
+}
+
+// -- 16b. verify --------------------------------------------------------------
 const v = await fleet.verify();
 p(`ok=${v.ok} · ${v.detail ?? v.violation}`);
 // Re-derives every structural invariant from scratch. A staging tool, not a

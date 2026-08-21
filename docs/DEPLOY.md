@@ -23,7 +23,7 @@ steady state at 500,000 devices.
 CPU: give it 2 cores and it will keep up with almost anything. Writes are
 serialised through a single lock, so more cores raise read throughput, not ingest.
 
-## There is nothing to persist
+## By default there is nothing to persist
 
 No volume, no PVC, no StatefulSet, no backup, no snapshot schedule.
 
@@ -35,6 +35,82 @@ microsecond per device — a 500,000 device fleet is back in roughly a second.
 That is also why there is no readiness gate on "index warm": an empty index
 answers queries correctly, it just answers with fewer markers until the reports
 arrive.
+
+## Persistence, when you want it
+
+The paragraph above assumes devices report on a timer. If reporting is
+**event-driven** — a device only reports when it moves — a parked vehicle never
+reappears after a restart, and the map is quietly missing it until it happens to
+move. That is the case persistence is for.
+
+```bash
+docker run -v ncdata:/data -e NETCLUSTER_DATA_DIR=/data -p 8080:8080 \
+  renatex314/netcluster-server
+```
+
+| variable | default | |
+|---|---|---|
+| `NETCLUSTER_DATA_DIR` | *(unset)* | where snapshots live; unset means no persistence |
+| `NETCLUSTER_SNAPSHOT_SECONDS` | `60` | how often to snapshot |
+
+The server writes a snapshot on that interval, on graceful shutdown, and whenever
+you ask:
+
+```bash
+curl -X POST localhost:8080/v1/collections/fleet/snapshot   # before a deliberate restart
+```
+
+### What is actually stored
+
+Not the index — that is derived, and rebuilds at about a microsecond per device.
+A snapshot holds the collection's geometry and, per device, its id, position,
+category and last report time: roughly 30 bytes each, one file per collection,
+written to a temp file and renamed so a crash mid-write cannot destroy the previous
+good one.
+
+Two consequences worth knowing:
+
+- **Cluster ids change across a restart.** A restore inserts in snapshot order
+  rather than the original operation order, so the tree shape differs and marker
+  groupings may reshuffle slightly. Cluster ids are already documented as
+  invalidated by mutations, so nothing contractual changes.
+- **Restoring brings the geometry back**, which closes the `AUTO_CREATE` trap
+  below: a restart returns your categories and TTL instead of silently recreating a
+  default collection.
+
+An unclean kill loses at most one interval of position updates. Device
+*membership* survives, and the next report from each device corrects its position —
+which is the thing that actually matters.
+
+Devices already older than the TTL are **not** restored. A snapshot from long
+enough ago restores nothing, by construction: those devices went quiet and the
+sweep would drop them within seconds anyway.
+
+A snapshot that fails to load is skipped loudly and that collection starts empty.
+Refusing to boot would be worse — one corrupt file would keep the whole service
+down when the position stream will refill it.
+
+### In Kubernetes
+
+`deploy/k8s/` mounts an **emptyDir** at `/data`. That survives a container restart
+or OOM-kill *within the same pod*, which is the common case, and costs nothing: it
+is node-local scratch, not storage. `readOnlyRootFilesystem: true` stays — the
+mount is writable and nothing else needs to be.
+
+It does **not** survive the pod being rescheduled. For that you need a PVC, which
+means a StatefulSet and per-pod volumes, and reintroduces the node affinity and
+slower failover that the stateless design avoids. Most deployments should not:
+every replica holds the full index, so a rescheduled pod refills from the stream
+while its neighbours keep serving.
+
+`terminationGracePeriodSeconds` is 30 so the shutdown snapshot completes.
+
+### Watch it
+
+`netcluster_snapshot_failures_total` and `netcluster_snapshot_last_success_timestamp`
+are in `/metrics`. Alert on both. A snapshot that has quietly stopped succeeding —
+full disk, wrong permissions — is a failure you want to hear about *before* you need
+the data, and it is invisible until the restart that needed it.
 
 ## If you run more than one replica
 
@@ -144,6 +220,8 @@ docker compose up          # server + the demo page on :8080
 | `NETCLUSTER_ADDR` | `0.0.0.0:8080` | listen address |
 | `NETCLUSTER_SWEEP_SECONDS` | `10` | how often to drop expired devices |
 | `NETCLUSTER_AUTO_CREATE` | `1` | create a collection on first write |
+| `NETCLUSTER_DATA_DIR` | *(unset)* | snapshot directory; unset means no persistence |
+| `NETCLUSTER_SNAPSHOT_SECONDS` | `60` | snapshot interval |
 
 Turn `NETCLUSTER_AUTO_CREATE` **off** in production. With it on, a typo in a
 collection name silently creates an empty collection with default geometry instead

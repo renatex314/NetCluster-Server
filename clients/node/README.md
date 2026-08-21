@@ -125,6 +125,7 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 | `getChildren(name, clusterId)` | one expansion step, plus `expansion_zoom` |
 | `getLeaves(name, clusterId, { limit, offset })` | the individual devices |
 | `deviceCluster(name, id, zoom)` | which marker contains this device |
+| `snapshot(name)` | write a snapshot now; rejects `persistence_disabled` if off |
 | `verify(name)` | full invariant check — admin only, `O(N²)` |
 | `health()` | |
 | `reporter(name, opts)` | the batching reporter above |

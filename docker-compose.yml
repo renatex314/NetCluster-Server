@@ -15,6 +15,10 @@ services:
       # On, so the demo page can create its collection on first write. Turn this
       # off anywhere real -- see docs/DEPLOY.md.
       NETCLUSTER_AUTO_CREATE: "1"
+      # Survive `docker compose restart` and container crashes. Remove this line
+      # (or the volume) to go back to the stateless default.
+      NETCLUSTER_DATA_DIR: /data
+      NETCLUSTER_SNAPSHOT_SECONDS: "60"
     # The binary probes itself; the image carries no shell to curl with.
     healthcheck:
       test: ["CMD", "/usr/local/bin/netcluster-server", "--health"]
@@ -23,8 +27,12 @@ services:
       retries: 3
       start_period: 3s
     restart: unless-stopped
-    # There is no volume. Nothing here is persisted, by design.
+    volumes:
+      - ncdata:/data
     deploy:
       resources:
         limits:
           memory: 1G
+
+volumes:
+  ncdata:

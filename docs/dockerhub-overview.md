@@ -57,6 +57,8 @@ available as a standalone JavaScript library, **[`netcluster-js`](https://www.np
 | `NETCLUSTER_ADDR` | `0.0.0.0:8080` | listen address |
 | `NETCLUSTER_SWEEP_SECONDS` | `10` | how often to drop expired devices |
 | `NETCLUSTER_AUTO_CREATE` | `1` | create a collection on first write |
+| `NETCLUSTER_DATA_DIR` | *(unset)* | snapshot directory; unset means no persistence |
+| `NETCLUSTER_SNAPSHOT_SECONDS` | `60` | snapshot interval |
 
 Turn `NETCLUSTER_AUTO_CREATE` **off** in production: with it on, a typo in a
 collection name silently creates an empty collection instead of returning 404, and
@@ -105,11 +107,23 @@ docker run --read-only --cap-drop ALL -p 8080:8080 renatex314/netcluster-server
 Ask for roughly triple the steady state: the index grows by doubling its arrays,
 so peak RSS during a rebuild runs above the settled figure.
 
-**There is nothing to persist.** No volume, no PVC, no StatefulSet, no backup. The
-index holds no truth — the authority for where your devices are is whatever
-produces the position reports, and this is a materialised view of that stream. A
-container that dies is a container you restart, and it refills at about a
+**By default there is nothing to persist.** No volume, no PVC, no StatefulSet, no
+backup. The index holds no truth — the authority for where your devices are is
+whatever produces the position reports, and this is a materialised view of that
+stream. A container that dies is a container you restart, and it refills at about a
 microsecond per device.
+
+That assumes devices report on a timer. If reporting is **event-driven**, a parked
+vehicle never reappears after a restart — so persistence is available as an opt-in:
+
+```bash
+docker run -v ncdata:/data -e NETCLUSTER_DATA_DIR=/data -p 8080:8080 \
+  renatex314/netcluster-server
+```
+
+It snapshots on an interval, on shutdown, and on request. Only device positions and
+the collection geometry are stored, never the tree — that rebuilds in about a
+second per million devices.
 
 ## Scaling
 

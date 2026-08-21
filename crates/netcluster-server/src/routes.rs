@@ -30,6 +30,8 @@ pub struct AppState {
     /// development; in production you usually want the config to be explicit.
     pub auto_create: bool,
     pub requests: AtomicU64,
+    /// Where snapshots live, when persistence is on.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -113,6 +115,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/collections/{name}/tiles/{z}/{x}/{y}", get(tile))
         .route("/v1/collections/{name}/verify", get(verify))
+        .route(
+            "/v1/collections/{name}/snapshot",
+            axum::routing::post(force_snapshot),
+        )
         .layer(middleware::from_fn(cors))
         .with_state(state)
 }
@@ -156,6 +162,7 @@ async fn healthz(State(s): State<Arc<AppState>>) -> Json<Value> {
         "collections": cs.len(),
         "devices": devices,
         "uptime_ms": crate::collection::now_ms().saturating_sub(s.started_ms),
+        "persistence": s.data_dir.is_some(),
     }))
 }
 
@@ -192,6 +199,24 @@ async fn metrics(State(s): State<Arc<AppState>>) -> impl IntoResponse {
         out.push_str(&format!(
             "netcluster_fast_move_ratio{{collection=\"{n}\"}} {:.4}\n",
             st.moves_fast_pct / 100.0
+        ));
+        // A snapshot that has quietly stopped succeeding is the failure you want
+        // to hear about before you need the data, not after.
+        out.push_str(&format!(
+            "netcluster_snapshot_last_success_timestamp{{collection=\"{n}\"}} {}\n",
+            st.last_snapshot_ms / 1000
+        ));
+        out.push_str(&format!(
+            "netcluster_snapshot_bytes{{collection=\"{n}\"}} {}\n",
+            st.last_snapshot_bytes
+        ));
+        out.push_str(&format!(
+            "netcluster_snapshot_failures_total{{collection=\"{n}\"}} {}\n",
+            st.snapshot_failures
+        ));
+        out.push_str(&format!(
+            "netcluster_restored_devices{{collection=\"{n}\"}} {}\n",
+            st.restored
         ));
     }
     out.push_str(&format!(
@@ -284,14 +309,62 @@ async fn drop_collection(
     State(s): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    match s.collections.write().unwrap().remove(&name) {
-        Some(c) => Ok(Json(json!({ "dropped": name, "devices": c.len() }))),
-        None => Err(ApiError::not_found(format!("no collection {name:?}"))),
+    let dropped = s.collections.write().unwrap().remove(&name);
+    match dropped {
+        Some(c) => {
+            // The snapshot has to go with it, or the collection resurrects at the
+            // next restart and a delete quietly did not stick.
+            let mut file_removed = false;
+            if let Some(dir) = &s.data_dir {
+                match crate::snapshot::remove(&crate::snapshot::path_for(dir, &name)) {
+                    Ok(()) => file_removed = true,
+                    Err(e) => eprintln!("[snapshot] could not delete {name}: {e}"),
+                }
+            }
+            Ok(Json(json!({
+                "dropped": name,
+                "devices": c.len(),
+                "snapshot_removed": file_removed,
+            })))
+        }
+        None => {
+            Err(ApiError::not_found(format!("no collection {name:?}")).code("no_such_collection"))
+        }
     }
 }
 
 async fn stats(State(s): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(s.get(&name)?.stats())))
+}
+
+/// Write a snapshot now.
+///
+/// Worth having before a deliberate restart, where waiting out the interval would
+/// otherwise lose whatever arrived since the last one.
+async fn force_snapshot(
+    State(s): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let Some(dir) = s.data_dir.clone() else {
+        return Err(ApiError::bad(
+            "persistence is off; start the server with NETCLUSTER_DATA_DIR set",
+        )
+        .code("persistence_disabled"));
+    };
+    let c = s.get(&name)?;
+    let path = crate::snapshot::path_for(&dir, &name);
+    // Serialising and writing must not happen on a runtime worker.
+    let bytes = tokio::task::spawn_blocking(move || c.snapshot_to(&path))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), "panic"))?
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("snapshot failed: {e}"),
+                "snapshot_failed",
+            )
+        })?;
+    Ok(Json(json!({ "snapshot": name, "bytes": bytes })))
 }
 
 async fn verify(

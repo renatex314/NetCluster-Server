@@ -213,6 +213,19 @@ export class NetClusterClient {
     return this._read(`/v1/collections/${enc(name)}`);
   }
 
+  /**
+   * Write a snapshot now, rather than waiting for the next interval.
+   *
+   * Worth calling before a deliberate restart. Rejects with
+   * `code: 'persistence_disabled'` when the server was started without
+   * `NETCLUSTER_DATA_DIR`.
+   *
+   * Goes to every replica: each holds the full index and snapshots independently.
+   */
+  snapshot(name) {
+    return this._write(`/v1/collections/${enc(name)}/snapshot`, { method: 'POST' });
+  }
+
   /** Full invariant check. Admin only: O(N squared). */
   verify(name) {
     return this._read(`/v1/collections/${enc(name)}/verify`);
@@ -359,6 +372,7 @@ export class NetClusterClient {
       drop: bind(this.dropCollection),
       stats: bind(this.stats),
       verify: bind(this.verify),
+      snapshot: bind(this.snapshot),
       report: bind(this.report),
       remove: bind(this.remove),
       has: bind(this.has),

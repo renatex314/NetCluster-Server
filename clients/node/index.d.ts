@@ -109,6 +109,12 @@ export interface CollectionStats {
   expired: number;
   uptime_ms: number;
   moves_fast_pct: number;
+  /** 0 when no snapshot has been written, or persistence is off. */
+  last_snapshot_ms: number;
+  last_snapshot_bytes: number;
+  snapshot_failures: number;
+  /** Devices loaded from a snapshot at startup. */
+  restored: number;
 }
 
 export interface Health {
@@ -116,6 +122,8 @@ export interface Health {
   collections: number;
   devices: number;
   uptime_ms: number;
+  /** Whether the server was started with a data directory. */
+  persistence: boolean;
 }
 
 export interface ReportResult {
@@ -169,6 +177,7 @@ export interface BoundCollection {
   drop(): Promise<unknown>;
   stats(): Promise<CollectionStats>;
   verify(): Promise<{ ok: boolean; detail?: string; violation?: string }>;
+  snapshot(): Promise<{ snapshot: string; bytes: number }>;
   report(points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
   remove(id: string): Promise<{ removed: boolean }>;
   has(id: string): Promise<boolean>;
@@ -193,6 +202,8 @@ export declare class NetClusterClient {
   dropCollection(name: string): Promise<unknown>;
   stats(name: string): Promise<CollectionStats>;
   verify(name: string): Promise<{ ok: boolean; detail?: string; violation?: string }>;
+  /** Force a snapshot now. Rejects with code 'persistence_disabled' if the server has none. */
+  snapshot(name: string): Promise<{ snapshot: string; bytes: number }>;
 
   report(name: string, points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
   remove(name: string, id: string): Promise<{ removed: boolean }>;

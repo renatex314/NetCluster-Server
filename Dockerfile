@@ -38,7 +38,8 @@ RUN touch crates/netcluster/src/lib.rs \
           crates/netcluster-server/src/lib.rs \
           crates/netcluster-server/src/main.rs \
  && cargo build --release --bin netcluster-server \
- && strip target/release/netcluster-server
+ && strip target/release/netcluster-server \
+ && mkdir -p /emptydir
 
 # -------------------------------------------------------------- runtime ------
 # distroless/cc carries glibc and nothing else: no shell, no apt, no busybox. That
@@ -46,9 +47,23 @@ RUN touch crates/netcluster/src/lib.rs \
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /build/target/release/netcluster-server /usr/local/bin/netcluster-server
 
+# /data must exist in the image, owned by the user the server runs as. Docker
+# copies a directory's ownership into an empty named volume mounted over it, so
+# without this the volume arrives owned by root and every snapshot fails with
+# EACCES -- at shutdown, which is the worst possible moment to find out.
+COPY --from=builder --chown=65532:65532 /emptydir /data
+
 ENV NETCLUSTER_ADDR=0.0.0.0:8080 \
     NETCLUSTER_SWEEP_SECONDS=10 \
-    NETCLUSTER_AUTO_CREATE=1
+    NETCLUSTER_AUTO_CREATE=1 \
+    NETCLUSTER_SNAPSHOT_SECONDS=60
+
+# Persistence is off unless NETCLUSTER_DATA_DIR points somewhere writable. Point it
+# at a mounted volume, not a path inside the image: this runs happily with a
+# read-only root filesystem and should keep doing so.
+#
+#   docker run -v ncdata:/data -e NETCLUSTER_DATA_DIR=/data ...
+VOLUME ["/data"]
 
 EXPOSE 8080
 USER nonroot

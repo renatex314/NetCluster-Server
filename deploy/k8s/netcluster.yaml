@@ -39,12 +39,16 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: /metrics
     spec:
-      # Nothing to flush on shutdown: close the listener, finish in-flight
-      # requests, exit.
-      terminationGracePeriodSeconds: 15
+      # Long enough for the shutdown snapshot to finish. The server writes one
+      # after it stops serving; a million devices is a few hundred milliseconds,
+      # but a slow volume is a slow volume.
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
+        # Without this the kubelet leaves the mounted volume root-owned and the
+        # server, running as 65532, cannot write its snapshots.
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -67,6 +71,16 @@ spec:
             # an empty map instead of reading an error.
             - name: NETCLUSTER_AUTO_CREATE
               value: "0"
+            # Persistence. emptyDir survives a container restart or OOM-kill
+            # *within the same pod*, which is the common case, and costs nothing:
+            # it is node-local scratch, not storage. It does NOT survive the pod
+            # being rescheduled -- for that you need a PVC, which means a
+            # StatefulSet and per-pod volumes. Most deployments do not: every
+            # replica holds the full index and refills from the position stream.
+            - name: NETCLUSTER_DATA_DIR
+              value: /data
+            - name: NETCLUSTER_SNAPSHOT_SECONDS
+              value: "60"
           resources:
             # Sized for ~1M devices. Ask for roughly triple the steady state: the
             # index grows by doubling its arrays, so peak RSS during a rebuild runs
@@ -92,11 +106,20 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
           securityContext:
             allowPrivilegeEscalation: false
+            # Stays true: /data is a mounted volume, so snapshots write there and
+            # nowhere else in the filesystem needs to be writable.
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 2Gi
       # Spread replicas so one node failure does not take out the read path.
       topologySpreadConstraints:
         - maxSkew: 1
