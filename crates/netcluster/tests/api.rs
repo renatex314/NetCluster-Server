@@ -298,3 +298,35 @@ fn reinserting_the_same_id_moves_it_rather_than_duplicating() {
     assert!((f[0].lng() - 2.35).abs() < 1e-6, "id 1 did not move");
     nc.verify().unwrap();
 }
+
+/// `cluster_of` must name the same marker a viewport query would draw the device
+/// inside of. If these disagree, "find my vehicle" highlights the wrong marker.
+#[test]
+fn cluster_of_agrees_with_the_viewport_query() {
+    let nc = build(400, 616);
+    for z in [0, 3, 7, 11, 16] {
+        let drawn = nc.get_clusters(WORLD, z as f64, -1);
+        for id in 0..400u64 {
+            let c = nc
+                .cluster_of(id, z)
+                .expect("every live device has a cluster");
+            let found = drawn.iter().find(|f| match (f, &c) {
+                (
+                    Feature::Cluster { cluster_id: a, .. },
+                    Feature::Cluster { cluster_id: b, .. },
+                ) => a == b,
+                (Feature::Point { id: a, .. }, Feature::Point { id: b, .. }) => a == b,
+                _ => false,
+            });
+            let f = found.unwrap_or_else(|| {
+                panic!("z={z}: cluster_of({id}) is not among the drawn markers")
+            });
+            assert_eq!(f.count(), c.count(), "z={z}: device {id} count disagrees");
+            assert!(
+                (f.lng() - c.lng()).abs() < 1e-12,
+                "z={z}: device {id} position disagrees"
+            );
+        }
+    }
+    assert_eq!(nc.cluster_of(999_999, 5), None);
+}

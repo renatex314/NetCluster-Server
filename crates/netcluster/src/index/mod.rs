@@ -1386,6 +1386,26 @@ impl NetCluster {
         Some(self.ext[s as usize])
     }
 
+    /// The cluster a device is drawn as at `zoom`.
+    ///
+    /// The direct answer to "my vehicle is somewhere on this map -- which marker
+    /// is it inside?", which otherwise needs a viewport query and a search.
+    pub fn cluster_of(&self, id: u64, zoom: i32) -> Option<Feature> {
+        let z = zoom.clamp(self.min_zoom as i32, self.max_zoom as i32);
+        let s = self.representative_slot(id, z)?;
+        let (count, ax, ay) = self.cluster_at(s, z, -1);
+        if count <= 0 {
+            return None;
+        }
+        Some(self.feature(
+            s,
+            z,
+            count as u32,
+            ax as f64 / count as f64,
+            ay as f64 / count as f64,
+        ))
+    }
+
     /// The level-`z` representative as an internal slot.
     pub fn representative_slot(&self, id: u64, z: i32) -> Option<Slot> {
         let mut s = *self.ids.get(&id)?;
