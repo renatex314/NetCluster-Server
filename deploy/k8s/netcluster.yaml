@@ -1,0 +1,183 @@
+# netcluster-server on Kubernetes.
+#
+#   kubectl apply -f deploy/k8s/
+#
+# A Deployment, not a StatefulSet: there is nothing to persist. The index is a
+# materialised view of your position stream, so a pod that dies is a pod that
+# restarts and refills in about a second.
+#
+# Two Services, deliberately:
+#   netcluster          reads  -- ordinary ClusterIP, sticky per client
+#   netcluster-headless writes -- per-pod addresses, so ingest can fan out
+#
+# Every replica holds the COMPLETE index. A position report must reach all of
+# them, which is why writes must not go through a round-robin balancer. See
+# docs/DEPLOY.md.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netcluster
+  labels:
+    app.kubernetes.io/name: netcluster
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: netcluster
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: netcluster
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /metrics
+    spec:
+      # Nothing to flush on shutdown: close the listener, finish in-flight
+      # requests, exit.
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          # Replace with your own registry. Nothing publishes this image yet:
+          #   docker build -t <registry>/netcluster-server:v1 . && docker push ...
+          image: ghcr.io/renatex314/netcluster-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: NETCLUSTER_ADDR
+              value: "0.0.0.0:8080"
+            - name: NETCLUSTER_SWEEP_SECONDS
+              value: "10"
+            # Off in production: with it on, a typo in a collection name silently
+            # creates an empty collection instead of returning 404, and you debug
+            # an empty map instead of reading an error.
+            - name: NETCLUSTER_AUTO_CREATE
+              value: "0"
+          resources:
+            # Sized for ~1M devices. Ask for roughly triple the steady state: the
+            # index grows by doubling its arrays, so peak RSS during a rebuild runs
+            # well above the settled figure.
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          # Plain HTTP probes. The image has no shell, so an exec probe would not
+          # work even if you wanted one.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 15
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      # Spread replicas so one node failure does not take out the read path.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: netcluster
+---
+# READ path. sessionAffinity pins a viewer to one replica: replicas that consumed
+# updates in different interleavings hold slightly different trees, so a viewer
+# bouncing between them sees markers jump between groupings.
+apiVersion: v1
+kind: Service
+metadata:
+  name: netcluster
+  labels:
+    app.kubernetes.io/name: netcluster
+spec:
+  type: ClusterIP
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+  selector:
+    app.kubernetes.io/name: netcluster
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# WRITE path. Headless, so DNS returns one A record per pod and the ingest worker
+# can address each replica individually and fan a report out to all of them.
+apiVersion: v1
+kind: Service
+metadata:
+  name: netcluster-headless
+  labels:
+    app.kubernetes.io/name: netcluster
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: netcluster
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: netcluster
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: netcluster
+---
+# Scale on CPU, never on memory. Memory tracks fleet size, which does not change
+# when you add replicas -- every replica holds the same full index -- so a
+# memory-based HPA scales up and never comes back down.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: netcluster
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: netcluster
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # A new replica starts with an empty index and fills as reports arrive, so
+      # churning replicas churns the map. Scale down slowly.
+      stabilizationWindowSeconds: 300

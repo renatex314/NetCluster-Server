@@ -1,0 +1,26 @@
+{
+  "name": "netcluster-client",
+  "version": "0.1.0",
+  "description": "Node client for netcluster-server: report moving positions, read clustered vector tiles.",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": { "types": "./index.d.ts", "default": "./index.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "engines": { "node": ">=18" },
+  "keywords": ["geospatial","clustering","marker-clustering","vector-tiles","mvt",
+               "maps","realtime","fleet-tracking","netcluster","supercluster"],
+  "repository": { "type": "git", "url": "git+https://github.com/renatex314/NetCluster-Server.git",
+                  "directory": "clients/node" },
+  "bugs": { "url": "https://github.com/renatex314/NetCluster-Server/issues" },
+  "homepage": "https://github.com/renatex314/NetCluster-Server/tree/master/clients/node#readme",
+  "license": "MIT",
+  "dependencies": {},
+  "scripts": {
+    "test": "node test.mjs",
+    "example": "node example.mjs"
+  }
+}

@@ -19,8 +19,16 @@ Two branches:
 
 | branch | what |
 |---|---|
-| **`master`** | the server |
+| **`master`** | the server, the Node client, deployment manifests |
 | **`netcluster`** | the index on its own — a direct Rust port of [netcluster-js], usable as a plain crate |
+
+```
+crates/netcluster/          the index          (no dependencies)
+crates/netcluster-server/   the HTTP server    (axum, tokio)
+clients/node/               the Node client    (no dependencies)
+deploy/k8s/                 Kubernetes manifests
+docs/DEPLOY.md              Docker, Kubernetes, GCP, AWS
+```
 
 `netcluster` is the base; `master` merges it and builds on top. Both share
 `crates/netcluster`, so library work lands on `netcluster` and merges forward
@@ -64,18 +72,52 @@ the Redis version a wide query blocked every other client for its full duration
 ## Run
 
 ```bash
-cargo run --release -p netcluster-server
+docker compose up                   # or: cargo run --release -p netcluster-server
 ```
 
 Then open <http://localhost:8080/> for a live demo: a simulated fleet of up to
 200,000 vehicles moving continuously, rendered by MapLibre straight from the
 `.mvt` endpoint.
 
+The image is about 30 MB — a distroless base with no shell and no package manager.
+The container health check is a flag on the binary (`--health`), which is why it
+needs no curl.
+
 ```
 NETCLUSTER_ADDR             0.0.0.0:8080   listen address
 NETCLUSTER_SWEEP_SECONDS    10             how often to drop expired devices
 NETCLUSTER_AUTO_CREATE      1              create a collection on first write
 ```
+
+Turn `NETCLUSTER_AUTO_CREATE` **off** in production: with it on, a typo in a
+collection name silently creates an empty collection instead of returning 404, and
+you debug an empty map instead of reading an error.
+
+## Node client
+
+```bash
+npm install netcluster-client
+```
+
+```js
+import { NetClusterClient } from 'netcluster-client';
+
+const fleet = new NetClusterClient({ url: 'http://localhost:8080' }).collection('fleet');
+await fleet.create({ ttlSeconds: 300, categories: ['idle', 'enroute', 'delivering'] });
+
+// batches on a timer AND coalesces by device id, so a vehicle reporting ten
+// times between flushes sends one entry with its latest position
+const reporter = fleet.reporter({ flushMs: 500 });
+onGpsFix((f) => reporter.report({ id: f.deviceId, lng: f.lng, lat: f.lat }));
+
+const { features } = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom: 12 });
+const tile = await fleet.getTile(12, 1517, 2323);   // Uint8Array of MVT
+```
+
+Zero dependencies, TypeScript declarations bundled, and it knows the replication
+rules below — writes fan out to every replica, reads go to one, and
+`client.forViewer(sessionId)` pins a viewer so markers do not flicker. Full
+documentation in [`clients/node/`](clients/node/).
 
 ## API
 
@@ -140,6 +182,9 @@ position stream ──┬──> replica A (full index) ──> queries
 Read capacity scales by adding processes. No leader, no consensus, no rebalancing,
 because there is nothing to protect.
 
+Deployment specifics — Docker, Kubernetes manifests, GKE, Cloud Run, ECS, EKS,
+sizing and operational limits — are in **[docs/DEPLOY.md](docs/DEPLOY.md)**.
+
 Two consequences worth knowing before you deploy it:
 
 - **Do not shard geographically.** An ordinary spatial index can be split by
@@ -185,6 +230,9 @@ cargo test --release
 - The MVT encoder is checked by decoding its own wire format.
 - The server layer is checked for id interning, category resolution, expiry, tile
   coverage, and **concurrent readers running against a live writer**.
+- The Node client has 17 integration tests that spawn the real server binary and
+  drive it over HTTP, so they exercise the wire format rather than a mock
+  (`cd clients/node && npm test`).
 
 ## What this deliberately does not do
 

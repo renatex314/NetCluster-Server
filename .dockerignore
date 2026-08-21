@@ -1,0 +1,10 @@
+target/
+.git/
+.github/
+node_modules/
+clients/node/node_modules/
+**/*.md
+!crates/netcluster-server/demo/*
+deploy/
+Dockerfile
+.dockerignore

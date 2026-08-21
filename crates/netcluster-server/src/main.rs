@@ -33,9 +33,38 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// `netcluster-server --health`: connect to our own listener and check `/healthz`.
+///
+/// This exists so the container image can carry no shell and no curl. Kubernetes
+/// and ALB probe over HTTP directly and do not need it, but `docker run` and
+/// compose do, and a HEALTHCHECK that shells out is the reason most images end up
+/// with a package manager in them.
+fn health_check(addr: &str) -> ! {
+    use std::io::{Read, Write};
+    // A container listening on 0.0.0.0 is reached from inside as loopback.
+    let target = addr
+        .replace("0.0.0.0", "127.0.0.1")
+        .replace("[::]", "[::1]");
+    let ok = (|| -> Option<bool> {
+        let sa: std::net::SocketAddr = target.parse().ok()?;
+        let mut s = std::net::TcpStream::connect_timeout(&sa, Duration::from_secs(2)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        s.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .ok()?;
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).ok()?;
+        Some(buf[..n].windows(3).any(|w| w == b"200"))
+    })()
+    .unwrap_or(false);
+    std::process::exit(i32::from(!ok));
+}
+
 #[tokio::main]
 async fn main() {
     let addr: String = env_or("NETCLUSTER_ADDR", "0.0.0.0:8080".to_string());
+    if std::env::args().any(|a| a == "--health") {
+        health_check(&addr);
+    }
     let sweep_secs: u64 = env_or("NETCLUSTER_SWEEP_SECONDS", 10);
     let auto_create: u8 = env_or("NETCLUSTER_AUTO_CREATE", 1);
 

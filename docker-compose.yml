@@ -1,0 +1,28 @@
+# docker compose up
+#
+# The server, with the demo page at http://localhost:8080/
+services:
+  netcluster:
+    build: .
+    image: netcluster-server:local
+    ports:
+      - "8080:8080"
+    environment:
+      NETCLUSTER_ADDR: "0.0.0.0:8080"
+      NETCLUSTER_SWEEP_SECONDS: "10"
+      # On, so the demo page can create its collection on first write. Turn this
+      # off anywhere real -- see docs/DEPLOY.md.
+      NETCLUSTER_AUTO_CREATE: "1"
+    # The binary probes itself; the image carries no shell to curl with.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/netcluster-server", "--health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    restart: unless-stopped
+    # There is no volume. Nothing here is persisted, by design.
+    deploy:
+      resources:
+        limits:
+          memory: 1G
