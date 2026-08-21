@@ -1,0 +1,25 @@
+# One workspace, globbed members. The glob matters: the `netcluster` branch
+# carries only crates/netcluster, `master` carries the server too, and because
+# neither branch has to edit this file to say so, merging the library branch
+# into master never conflicts here.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/renatex314/NetCluster-Server"
+rust-version = "1.75"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+debug = true

@@ -1,0 +1,17 @@
+[package]
+name = "netcluster"
+description = "Fully dynamic hierarchical geospatial clustering: move a point without rebuilding the index."
+keywords = ["geospatial", "clustering", "cover-tree", "supercluster", "maps"]
+categories = ["data-structures", "science::geo"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# No dependencies, deliberately -- same as the JavaScript original. Everything
+# here is arithmetic over flat Vecs.
+[dependencies]
+
+[dev-dependencies]
