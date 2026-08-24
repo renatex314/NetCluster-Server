@@ -56,7 +56,9 @@ impl<'de> Deserialize<'de> for IdString {
                 }
             }
             fn visit_bool<E: de::Error>(self, v: bool) -> Result<IdString, E> {
-                Err(E::custom(format!("id is {v}, expected a string or a number")))
+                Err(E::custom(format!(
+                    "id is {v}, expected a string or a number"
+                )))
             }
             fn visit_unit<E: de::Error>(self) -> Result<IdString, E> {
                 Err(E::custom("id is null, expected a string or a number"))
@@ -412,7 +414,11 @@ pub fn peek_props(
 mod tests {
     use super::*;
 
-    fn peek(raw: &str, id: Option<&str>, cats: &[&str]) -> (Option<String>, Option<u32>, Option<String>) {
+    fn peek(
+        raw: &str,
+        id: Option<&str>,
+        cats: &[&str],
+    ) -> (Option<String>, Option<u32>, Option<String>) {
         let (i, c) = peek_props(raw, id, cats).unwrap();
         let (n, name) = match c {
             Some(CatVal::Num(n)) => (Some(n), None),
@@ -425,9 +431,15 @@ mod tests {
     #[test]
     fn pulls_out_only_what_it_was_asked_for() {
         let raw = r#"{"plate":"ABC","cat":2,"route":{"stops":[1,2,3]},"id":"v7"}"#;
-        assert_eq!(peek(raw, Some("id"), &["cat"]), (Some("v7".into()), Some(2), None));
+        assert_eq!(
+            peek(raw, Some("id"), &["cat"]),
+            (Some("v7".into()), Some(2), None)
+        );
         assert_eq!(peek(raw, None, &["cat"]), (None, Some(2), None));
-        assert_eq!(peek(raw, Some("plate"), &[]), (Some("ABC".into()), None, None));
+        assert_eq!(
+            peek(raw, Some("plate"), &[]),
+            (Some("ABC".into()), None, None)
+        );
         assert_eq!(peek(raw, None, &[]), (None, None, None));
     }
 
@@ -437,7 +449,10 @@ mod tests {
         // and the loser must still be stepped over rather than left unread.
         let raw = r#"{"category":"enroute","cat":1}"#;
         assert_eq!(peek(raw, None, &["cat", "category"]), (None, Some(1), None));
-        assert_eq!(peek(raw, None, &["category", "cat"]), (None, None, Some("enroute".into())));
+        assert_eq!(
+            peek(raw, None, &["category", "cat"]),
+            (None, None, Some("enroute".into()))
+        );
     }
 
     #[test]
@@ -476,7 +491,9 @@ mod tests {
             r#"{"type":"Polygon","coordinates":[[[0,0],[1,1],[1,0],[0,0]]]}"#,
             r#"{"coordinates":[[[0,0],[1,1],[1,0],[0,0]]],"type":"Polygon"}"#,
         ] {
-            let e = serde_json::from_str::<PointGeom>(body).unwrap_err().to_string();
+            let e = serde_json::from_str::<PointGeom>(body)
+                .unwrap_err()
+                .to_string();
             assert!(e.contains("Polygon"), "{e}");
             assert!(e.contains("representative point"), "{e}");
         }

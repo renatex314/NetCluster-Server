@@ -616,7 +616,11 @@ async fn positions(
                 }
                 match &f.props {
                     Some(p) => {
-                        let id_key = if want_id { id_prop.or(Some("id")) } else { None };
+                        let id_key = if want_id {
+                            id_prop.or(Some("id"))
+                        } else {
+                            None
+                        };
                         let keys: &[&str] = if want_cat { &cat_keys } else { &[] };
                         peeked.push(peek_props(p.get(), id_key, keys).map_err(|e| {
                             ApiError::bad(format!("features[{i}]: properties are unreadable: {e}"))

@@ -32,7 +32,12 @@ fn state(categories: &[&str]) -> Arc<AppState> {
     })
 }
 
-async fn call(s: &Arc<AppState>, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+async fn call(
+    s: &Arc<AppState>,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let req = Request::builder().method(method).uri(uri);
     let req = match body {
         Some(b) => req
@@ -43,7 +48,9 @@ async fn call(s: &Arc<AppState>, method: &str, uri: &str, body: Option<Value>) -
     };
     let res = router(s.clone()).oneshot(req).await.unwrap();
     let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), 4 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 4 << 20)
+        .await
+        .unwrap();
     let v = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, v)
 }
@@ -157,16 +164,41 @@ async fn geojson_and_the_compact_form_build_the_same_index() {
 async fn the_id_comes_from_three_places() {
     let s = state(&[]);
     // on the feature, as GeoJSON says
-    post(&s, "/v1/collections/fleet/positions", fc(vec![feature(json!("onfeature"), 1.0, 1.0, Value::Null)])).await;
+    post(
+        &s,
+        "/v1/collections/fleet/positions",
+        fc(vec![feature(json!("onfeature"), 1.0, 1.0, Value::Null)]),
+    )
+    .await;
     // a numeric id becomes its decimal form, so 7 and "7" are one device
-    post(&s, "/v1/collections/fleet/positions", fc(vec![feature(json!(7), 2.0, 2.0, Value::Null)])).await;
+    post(
+        &s,
+        "/v1/collections/fleet/positions",
+        fc(vec![feature(json!(7), 2.0, 2.0, Value::Null)]),
+    )
+    .await;
     // from properties when the feature has none
-    post(&s, "/v1/collections/fleet/positions", fc(vec![feature(Value::Null, 3.0, 3.0, json!({ "id": "inprops" }))])).await;
+    post(
+        &s,
+        "/v1/collections/fleet/positions",
+        fc(vec![feature(
+            Value::Null,
+            3.0,
+            3.0,
+            json!({ "id": "inprops" }),
+        )]),
+    )
+    .await;
     // named explicitly
     let (st, v) = post(
         &s,
         "/v1/collections/fleet/positions?id_property=plate",
-        fc(vec![feature(json!("ignored"), 4.0, 4.0, json!({ "plate": "ABC-9" }))]),
+        fc(vec![feature(
+            json!("ignored"),
+            4.0,
+            4.0,
+            json!({ "plate": "ABC-9" }),
+        )]),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -185,11 +217,19 @@ async fn a_named_id_property_does_not_fall_back() {
     let (st, v) = post(
         &s,
         "/v1/collections/fleet/positions?id_property=plate",
-        fc(vec![feature(json!("has-an-id"), 1.0, 1.0, json!({ "other": 1 }))]),
+        fc(vec![feature(
+            json!("has-an-id"),
+            1.0,
+            1.0,
+            json!({ "other": 1 }),
+        )]),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
-    assert!(v["error"].as_str().unwrap().contains("properties.plate"), "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("properties.plate"),
+        "{v}"
+    );
     assert_eq!(v["code"], "bad_geojson");
 }
 
@@ -208,12 +248,34 @@ async fn categories_come_from_properties() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
 
-    let (_, v) = call(&s, "GET", "/v1/collections/fleet/clusters?zoom=20&cat=delivering", None).await;
-    let ids: Vec<&str> = v["features"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap()).collect();
+    let (_, v) = call(
+        &s,
+        "GET",
+        "/v1/collections/fleet/clusters?zoom=20&cat=delivering",
+        None,
+    )
+    .await;
+    let ids: Vec<&str> = v["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
     assert_eq!(ids, vec!["byindex"]);
 
-    let (_, v) = call(&s, "GET", "/v1/collections/fleet/clusters?zoom=20&cat=enroute", None).await;
-    let ids: Vec<&str> = v["features"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap()).collect();
+    let (_, v) = call(
+        &s,
+        "GET",
+        "/v1/collections/fleet/clusters?zoom=20&cat=enroute",
+        None,
+    )
+    .await;
+    let ids: Vec<&str> = v["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
     assert_eq!(ids, vec!["byname"]);
 }
 
@@ -223,11 +285,22 @@ async fn cat_property_renames_the_category_field() {
     let (st, v) = post(
         &s,
         "/v1/collections/fleet/positions?cat_property=status",
-        fc(vec![feature(json!("v1"), 1.0, 1.0, json!({ "status": "enroute", "cat": "idle" }))]),
+        fc(vec![feature(
+            json!("v1"),
+            1.0,
+            1.0,
+            json!({ "status": "enroute", "cat": "idle" }),
+        )]),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    let (_, v) = call(&s, "GET", "/v1/collections/fleet/clusters?zoom=20&cat=enroute", None).await;
+    let (_, v) = call(
+        &s,
+        "GET",
+        "/v1/collections/fleet/clusters?zoom=20&cat=enroute",
+        None,
+    )
+    .await;
     assert_eq!(v["features"].as_array().unwrap().len(), 1, "{v}");
 }
 
@@ -237,7 +310,12 @@ async fn properties_are_stored_verbatim_and_null_leaves_them_alone() {
     post(
         &s,
         "/v1/collections/fleet/positions",
-        fc(vec![feature(json!("v1"), 1.0, 1.0, json!({ "plate": "ABC", "nested": { "a": [1, 2] } }))]),
+        fc(vec![feature(
+            json!("v1"),
+            1.0,
+            1.0,
+            json!({ "plate": "ABC", "nested": { "a": [1, 2] } }),
+        )]),
     )
     .await;
     let (_, v) = call(&s, "GET", "/v1/collections/fleet/devices/v1", None).await;
@@ -246,12 +324,25 @@ async fn properties_are_stored_verbatim_and_null_leaves_them_alone() {
 
     // GeoJSON's "no properties" must mean "leave what is stored alone", the same
     // as omitting `props` in the compact form.
-    post(&s, "/v1/collections/fleet/positions", fc(vec![feature(json!("v1"), 5.0, 5.0, Value::Null)])).await;
+    post(
+        &s,
+        "/v1/collections/fleet/positions",
+        fc(vec![feature(json!("v1"), 5.0, 5.0, Value::Null)]),
+    )
+    .await;
     let (_, v) = call(&s, "GET", "/v1/collections/fleet/devices/v1", None).await;
-    assert_eq!(v["props"]["plate"], "ABC", "null properties wiped the stored ones");
+    assert_eq!(
+        v["props"]["plate"], "ABC",
+        "null properties wiped the stored ones"
+    );
 
     // an explicit {} still clears
-    post(&s, "/v1/collections/fleet/positions", fc(vec![feature(json!("v1"), 6.0, 6.0, json!({}))])).await;
+    post(
+        &s,
+        "/v1/collections/fleet/positions",
+        fc(vec![feature(json!("v1"), 6.0, 6.0, json!({}))]),
+    )
+    .await;
     let (_, v) = call(&s, "GET", "/v1/collections/fleet/devices/v1", None).await;
     assert!(v["props"]["plate"].is_null(), "{v}");
 }
@@ -275,7 +366,10 @@ async fn foreign_members_and_altitude_are_ignored() {
     let (st, v) = post(&s, "/v1/collections/fleet/positions", body).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let d = devices(&s).await;
-    assert!((d["v1"].0 - 10.0).abs() < 1e-6 && (d["v1"].1 - 20.0).abs() < 1e-6, "{d:?}");
+    assert!(
+        (d["v1"].0 - 10.0).abs() < 1e-6 && (d["v1"].1 - 20.0).abs() < 1e-6,
+        "{d:?}"
+    );
 }
 
 #[tokio::test]
@@ -295,8 +389,10 @@ async fn rejections_name_the_feature_and_the_reason() {
             "features[1]",
         ),
         (
-            fc(vec![json!({ "type": "Feature", "id": "p", "properties": null,
-                            "geometry": { "type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 1.0]]] } })]),
+            fc(vec![
+                json!({ "type": "Feature", "id": "p", "properties": null,
+                            "geometry": { "type": "Polygon", "coordinates": [[[0.0, 0.0], [1.0, 1.0]]] } }),
+            ]),
             StatusCode::UNPROCESSABLE_ENTITY,
             "unprocessable_body",
             "geometry is a Polygon",
@@ -331,7 +427,10 @@ async fn rejections_name_the_feature_and_the_reason() {
         assert_eq!(st, want_status, "{v}");
         assert_eq!(v["code"], want_code, "{v}");
         let msg = v["error"].as_str().unwrap_or("");
-        assert!(msg.contains(needle), "message {msg:?} does not mention {needle:?}");
+        assert!(
+            msg.contains(needle),
+            "message {msg:?} does not mention {needle:?}"
+        );
     }
     // nothing from a rejected batch may land
     assert!(devices(&s).await.is_empty());
@@ -351,7 +450,9 @@ async fn a_body_that_is_not_json_is_still_rejected_as_json() {
         .unwrap();
     let res = router(s.clone()).oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let v: Value = serde_json::from_slice(&bytes).expect("the rejection body must be JSON");
     assert_eq!(v["code"], "malformed_json");
 }
@@ -367,8 +468,18 @@ async fn an_empty_feature_collection_is_accepted_and_does_nothing() {
 #[tokio::test]
 async fn geojson_moves_a_device_that_already_exists() {
     let s = state(&[]);
-    post(&s, "/v1/collections/fleet/positions", json!([{ "id": "v1", "lng": 1.0, "lat": 1.0 }])).await;
-    post(&s, "/v1/collections/fleet/positions", fc(vec![feature(json!("v1"), 20.0, 30.0, Value::Null)])).await;
+    post(
+        &s,
+        "/v1/collections/fleet/positions",
+        json!([{ "id": "v1", "lng": 1.0, "lat": 1.0 }]),
+    )
+    .await;
+    post(
+        &s,
+        "/v1/collections/fleet/positions",
+        fc(vec![feature(json!("v1"), 20.0, 30.0, Value::Null)]),
+    )
+    .await;
     let d = devices(&s).await;
     assert_eq!(d.len(), 1, "the GeoJSON report inserted a second device");
     assert!((d["v1"].0 - 20.0).abs() < 1e-6, "{d:?}");
