@@ -121,6 +121,37 @@ await fleet.report([{ id: 'truck-1', lng: -46.6334, lat: -23.5506 }]);
 p(`after a plain position report → ${JSON.stringify((await fleet.getDevice('truck-1')).props)}`);
 p(`send props: {} to clear them; nested objects and arrays survive intact`);
 
+// -- 3c. GeoJSON in ------------------------------------------------------------
+h('3c. reportGeoJSON()  — the same endpoint, GeoJSON on the wire');
+// Whatever produced your points -- a .geojson file, a PostGIS query, a Mapbox
+// source -- is probably already emitting this shape. It upserts exactly as
+// report() does; the id comes from `id` where GeoJSON puts it, and `properties`
+// is stored verbatim.
+const geoRes = await fleet.reportGeoJSON({
+  type: 'FeatureCollection',
+  features: [
+    { type: 'Feature', id: 'van-1', properties: { plate: 'GEO-001', cat: 'idle' },
+      geometry: { type: 'Point', coordinates: [-46.6400, -23.5600] } },
+    // properties: null is GeoJSON for "none", and leaves stored ones alone
+    { type: 'Feature', id: 'van-2', properties: null,
+      geometry: { type: 'Point', coordinates: [-46.6410, -23.5610, 720] } },
+  ],
+});
+p(`reportGeoJSON() → ${geoRes.accepted} features, ${geoRes.devices} devices`);
+p(`van-1 props → ${JSON.stringify((await fleet.getDevice('van-1')).props)}`);
+// The third coordinate is altitude: allowed by the spec, ignored by clustering.
+p(`van-2 → ${JSON.stringify((await fleet.getDevice('van-2')).lng)}, altitude dropped`);
+
+// Where the file keeps its id somewhere other than `id`, name the property.
+// Naming it is strict on purpose: a feature missing it is rejected rather than
+// silently keyed by feature.id, which would split one fleet across two id spaces.
+await fleet.reportGeoJSON(
+  [{ type: 'Feature', properties: { plate: 'GEO-777' },
+     geometry: { type: 'Point', coordinates: [-46.642, -23.562] } }],
+  { idProperty: 'plate' }
+);
+p(`idProperty: 'plate' → registered as ${JSON.stringify(await fleet.has('GEO-777'))}`);
+
 // -- 4. what is on this server ------------------------------------------------
 h('4. listCollections()');
 const { collections } = await nc.listCollections();

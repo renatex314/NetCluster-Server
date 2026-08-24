@@ -400,6 +400,101 @@ await test('a 4xx is not retried', async () => {
   assert.equal(calls, 1, `retried a 400 ${calls} times`);
 });
 
+await test('reportGeoJSON: FeatureCollection, array and lone Feature all ingest', async () => {
+  const g = nc.collection('geo');
+  await g.create({ categories: ['idle', 'busy'], ttl_seconds: 0 });
+  const f = (id, lng, lat, props = null) => ({
+    type: 'Feature', id, properties: props,
+    geometry: { type: 'Point', coordinates: [lng, lat] },
+  });
+
+  const a = await g.reportGeoJSON({ type: 'FeatureCollection', features: [f('a', 1, 1), f('b', 2, 2)] });
+  assert.equal(a.accepted, 2);
+  assert.equal(await g.has('a'), true);
+
+  await g.reportGeoJSON([f('c', 3, 3)]);
+  await g.reportGeoJSON(f('d', 4, 4));
+  assert.equal((await g.stats()).devices, 4);
+
+  // properties stored verbatim; null leaves them alone; {} clears
+  await g.reportGeoJSON([f('a', 1, 1, { plate: 'ABC', cat: 'busy' })]);
+  assert.equal((await g.getDevice('a')).props.plate, 'ABC');
+  await g.reportGeoJSON([f('a', 1.5, 1.5)]);
+  assert.equal((await g.getDevice('a')).props.plate, 'ABC', 'null properties wiped stored ones');
+  await g.reportGeoJSON([f('a', 1.5, 1.5, {})]);
+  assert.deepEqual((await g.getDevice('a')).props, {}, 'an explicit {} should clear them');
+
+  // the category came from properties.cat
+  await g.reportGeoJSON([f('e', 5, 5, { cat: 'busy' })]);
+  const busy = await g.getClusters({ zoom: 20, cat: 'busy' });
+  assert.equal(busy.features.length, 1);
+  assert.equal(busy.features[0].id, 'e');
+
+  // A device's category is fixed when it is first seen. A later report moves it
+  // and replaces its properties but does not re-file it, so this stays 'busy'.
+  // Not a GeoJSON quirk -- the compact path behaves the same way, because
+  // move_to carries no category.
+  await g.reportGeoJSON([f('e', 5.001, 5.001, { cat: 'idle' })]);
+  assert.equal((await g.getClusters({ zoom: 20, cat: 'busy' })).features.length, 1,
+    'a category change on an existing device should be ignored');
+  assert.equal((await g.getClusters({ zoom: 20, cat: 'idle' })).features.length, 4);
+  await g.drop();
+});
+
+await test('reportGeoJSON chunks at maxBatch and reaches every replica', async () => {
+  const g = nc.collection('geobulk');
+  await g.create({ ttl_seconds: 0 });
+  const features = Array.from({ length: 2500 }, (_, i) => ({
+    type: 'Feature', id: `g${i}`, properties: null,
+    geometry: { type: 'Point', coordinates: [-46.63 + (i % 50) * 0.002, -23.55 + (i / 50) * 0.002] },
+  }));
+  const r = await g.reportGeoJSON(features, { maxBatch: 500 });
+  assert.equal(r.accepted, 2500);
+  assert.equal((await g.stats()).devices, 2500);
+  await g.drop();
+});
+
+await test('reportGeoJSON rejects bad input in this API error shape', async () => {
+  const g = nc.collection('geobad');
+  await g.create({ ttl_seconds: 0 });
+  const bad = (feature) => g.reportGeoJSON([feature]);
+
+  // A named id property does not fall back to feature.id.
+  await assert.rejects(
+    () => g.reportGeoJSON(
+      [{ type: 'Feature', id: 'x', properties: {}, geometry: { type: 'Point', coordinates: [1, 1] } }],
+      { idProperty: 'plate' }
+    ),
+    (e) => {
+      assert.equal(e.body.code, 'bad_geojson');
+      assert.match(e.body.error, /properties\.plate/);
+      return true;
+    }
+  );
+  // A Polygon is refused rather than reduced to a centroid.
+  await assert.rejects(
+    () => bad({ type: 'Feature', id: 'p', properties: null,
+                geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 1], [1, 0], [0, 0]]] } }),
+    (e) => {
+      assert.match(e.body.error, /Polygon/);
+      return true;
+    }
+  );
+  // Coordinates the wrong way round, when the swap is detectable.
+  await assert.rejects(
+    () => bad({ type: 'Feature', id: 't', properties: null,
+                geometry: { type: 'Point', coordinates: [35.68, 139.69] } }),
+    (e) => {
+      assert.match(e.body.error, /longitude, latitude/);
+      return true;
+    }
+  );
+  // Nothing that is not GeoJSON at all reaches the network.
+  await assert.rejects(() => g.reportGeoJSON({ type: 'Point', coordinates: [0, 0] }), TypeError);
+  assert.equal((await g.stats()).devices, 0);
+  await g.drop();
+});
+
 // The example's last section asserts it called every public method. Running it
 // here is what keeps that assertion meaningful: add a method to the client and
 // forget to demonstrate it, and this fails.

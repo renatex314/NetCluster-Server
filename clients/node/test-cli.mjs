@@ -127,6 +127,61 @@ test('import rejects a malformed record instead of half-loading', () => {
   assert.equal(cli(['has', 'fleet', 'bad']).status, 1);
 });
 
+test('load takes a FeatureCollection, a bare array, and NDJSON features', () => {
+  const feat = (id, lng, lat, props = null) =>
+    ({ type: 'Feature', id, properties: props, geometry: { type: 'Point', coordinates: [lng, lat] } });
+
+  const f = join(tmpdir(), `cli-load-${process.pid}.geojson`);
+  writeFileSync(f, JSON.stringify({ type: 'FeatureCollection', features: [feat('g1', 1, 1), feat('g2', 2, 2)] }));
+  const a = cli(['load', 'fleet', f]);
+  assert.equal(a.status, 0, a.stderr);
+  assert.match(a.stdout, /loaded 2/);
+  rmSync(f, { force: true });
+
+  const b = cli(['load', 'fleet', '-'], { input: JSON.stringify([feat('g3', 3, 3)]) });
+  assert.equal(b.status, 0, b.stderr);
+  assert.match(b.stdout, /loaded 1/);
+
+  // One Feature per line: how large exports are written, so that a producer can
+  // stream them. The leading U+001E of RFC 8142 sequences is tolerated.
+  const nd = `${JSON.stringify(feat('g4', 4, 4))}\n\u001e${JSON.stringify(feat('g5', 5, 5))}\n`;
+  const c = cli(['load', 'fleet', '-'], { input: nd });
+  assert.equal(c.status, 0, c.stderr);
+  assert.match(c.stdout, /loaded 2/);
+
+  for (const id of ['g1', 'g2', 'g3', 'g4', 'g5']) {
+    assert.equal(cli(['has', 'fleet', id]).status, 0, `${id} not registered`);
+  }
+});
+
+test('load --id-property names where the id lives', () => {
+  const body = JSON.stringify([{
+    type: 'Feature', properties: { plate: 'CLI-42' },
+    geometry: { type: 'Point', coordinates: [6, 6] },
+  }]);
+  const r = cli(['load', 'fleet', '-', '--id-property', 'plate'], { input: body });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(cli(['has', 'fleet', 'CLI-42']).status, 0);
+});
+
+test('load rejects non-Point geometry instead of half-loading', () => {
+  const body = JSON.stringify({
+    type: 'FeatureCollection',
+    features: [{ type: 'Feature', id: 'poly', properties: null,
+                 geometry: { type: 'Polygon', coordinates: [[[0, 0], [1, 1], [1, 0], [0, 0]]] } }],
+  });
+  const r = cli(['load', 'fleet', '-'], { input: body });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /Polygon/);
+  assert.equal(cli(['has', 'fleet', 'poly']).status, 1);
+});
+
+test('load explains itself when handed something that is not GeoJSON', () => {
+  const r = cli(['load', 'fleet', '-'], { input: '{"type":"Point","coordinates":[0,0]}' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /FeatureCollection/);
+});
+
 test('clusters, where, children and leaves chain together', () => {
   const c = JSON.parse(cli(['clusters', 'fleet', '--zoom', '5', '--json']).stdout);
   const total = c.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
@@ -198,7 +253,7 @@ test('help lists every command', () => {
   const r = cli(['help']);
   assert.equal(r.status, 0);
   for (const c of ['health', 'collections', 'create', 'drop', 'stats', 'verify', 'snapshot',
-                   'report', 'import', 'seed', 'get', 'has', 'rm',
+                   'report', 'import', 'load', 'seed', 'get', 'has', 'rm',
                    'clusters', 'where', 'children', 'leaves', 'tile', 'watch']) {
     assert.match(r.stdout, new RegExp(`\\b${c}\\b`), `${c} missing from help`);
   }

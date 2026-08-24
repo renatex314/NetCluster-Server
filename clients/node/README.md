@@ -15,6 +15,7 @@ npx netcluster-client health       # or use the CLI without installing
 ```bash
 netcluster create fleet --categories idle,enroute,delivering --ttl 300
 netcluster seed fleet --count 50000          # a simulated fleet, for demos and load tests
+netcluster load fleet points.geojson         # bulk-load GeoJSON
 netcluster clusters fleet --zoom 6           # what the map would draw
 netcluster where fleet v42 --zoom 10         # which marker holds this device
 netcluster watch                             # live devices, ingest rate, memory, snapshot age
@@ -23,7 +24,7 @@ netcluster watch                             # live devices, ingest rate, memory
 ```
 SERVER       health, collections, watch
 COLLECTIONS  create, drop, stats, verify, snapshot
-DEVICES      report, import, seed, get, has, rm
+DEVICES      report, import, load, seed, get, has, rm
 QUERIES      clusters, where, children, leaves, tile
 ```
 
@@ -35,6 +36,7 @@ Every command takes `--json`, so it composes:
 netcluster stats fleet --json | jq .devices
 netcluster has fleet v42 && echo "still reporting"      # exit 0 present, 1 absent
 cat positions.ndjson | netcluster import fleet -
+cat fleet.geojson    | netcluster load fleet -            # NDJSON features work too
 ```
 
 Exit codes are meant for scripts: **0** fine, **1** the request failed or the
@@ -59,6 +61,9 @@ await fleet.report([
   { id: 'truck-1', lng: -46.6333, lat: -23.5505, cat: 'delivering' },
   { id: 'truck-2', lng: -46.6340, lat: -23.5510, cat: 'delivering' },
 ]);
+
+// already GeoJSON? send it as-is -- same endpoint, same upsert
+await fleet.reportGeoJSON(await (await fetch('/fleet.geojson')).json());
 
 // GeoJSON, in the shape supercluster emits
 const { features } = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom: 12 });
@@ -211,6 +216,7 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 | `dropCollection(name)` | |
 | `listCollections()` / `stats(name)` | |
 | `report(name, points, { maxBatch })` | upserts; chunked |
+| `reportGeoJSON(name, geojson, { maxBatch, idProperty, catProperty })` | the same, with GeoJSON on the wire |
 | `remove(name, id)` | |
 | `has(name, id)` | is this device registered? |
 | `getDevice(name, id)` | position, category and staleness, or `null` |
@@ -225,6 +231,44 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 | `reporter(name, opts)` | the batching reporter above |
 | `collection(name)` | bind the name into every call |
 | `forViewer(key)` | pin reads to one replica |
+
+### GeoJSON
+
+```js
+await fleet.reportGeoJSON({ type: 'FeatureCollection', features: [...] });
+await fleet.reportGeoJSON([feature1, feature2]);   // a bare array works too
+await fleet.reportGeoJSON(feature);                // or one on its own
+```
+
+Same endpoint and same upsert semantics as `report` — only the wire format
+differs. Chunked at `maxBatch` for the same reason: one huge request holds the
+server's write lock for its whole duration.
+
+The id comes from `feature.id`, where GeoJSON says it goes, then `properties.id`.
+`properties` is stored verbatim, `null` leaves what is stored alone, and
+`properties.cat` (or `category`) sets the category. A third coordinate is
+altitude and is ignored; anything that is not a Point geometry is rejected rather
+than quietly reduced to a centroid.
+
+```js
+// where the file keeps its id somewhere else
+await fleet.reportGeoJSON(features, { idProperty: 'plate', catProperty: 'status' });
+```
+
+`idProperty` is strict: a feature missing that property is rejected rather than
+falling back to `feature.id`, because a silent fallback keys half a fleet one way
+and half the other.
+
+Rejections arrive as `NetClusterError` with `e.body.code === 'bad_geojson'` and a
+message naming the feature by index:
+
+```
+features[8123] has a null geometry, so it has no position to cluster
+```
+
+Ingest runs at roughly 830,000 features/s against 940,000 reports/s for the
+compact form — GeoJSON is about twice the bytes per point. Full table in the
+[server README](../../README.md#geojson).
 
 ### Registration
 

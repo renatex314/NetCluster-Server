@@ -152,6 +152,51 @@ function readRecords(path) {
     });
 }
 
+/**
+ * GeoJSON from a file or stdin, in any of the shapes one actually arrives in: a
+ * FeatureCollection, a bare array of Features, one Feature, or newline-delimited
+ * Features -- which is how large exports are usually written, because it lets a
+ * producer stream them without holding the whole collection.
+ */
+function readFeatures(path) {
+  const raw = path === '-' || path === undefined ? readFileSync(0, 'utf8') : readFileSync(path, 'utf8');
+  const t = raw.trim();
+  if (!t) return [];
+  if (t.startsWith('{') || t.startsWith('[')) {
+    let doc;
+    try {
+      doc = JSON.parse(t);
+    } catch (e) {
+      // Falls through to NDJSON: a file of one Feature per line starts with '{'
+      // too, and JSON.parse stopping at the end of line 1 is the giveaway.
+      return readNdjsonFeatures(t);
+    }
+    if (Array.isArray(doc)) return doc;
+    if (doc.type === 'Feature') return [doc];
+    if (Array.isArray(doc.features)) return doc.features;
+    throw new UsageError(
+      `expected a FeatureCollection, an array of Features, or one Feature; got ${
+        doc.type ? `type ${JSON.stringify(doc.type)}` : 'an object with no features'
+      }`
+    );
+  }
+  return readNdjsonFeatures(t);
+}
+
+function readNdjsonFeatures(t) {
+  return t
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l, i) => {
+      try {
+        // RFC 8142 GeoJSON Text Sequences prefix each record with U+001E.
+        return JSON.parse(l.replace(/^\u001e/, ''));
+      } catch (e) {
+        throw new UsageError(`line ${i + 1} is not valid JSON: ${e.message}`);
+      }
+    });
+}
+
 // ---------------------------------------------------------------- commands --
 
 const commands = {};
@@ -332,6 +377,28 @@ cmd('import', {
     if (out({ ...r, ms }, flags)) return;
     const rate = Math.round((records.length / Math.max(ms, 1)) * 1000);
     console.log(`  ${green('imported')} ${n(r.accepted)} reports in ${ms} ms (${n(rate)}/s), ${n(r.devices)} devices`);
+  },
+});
+
+cmd('load', {
+  usage: 'load <name> [file.geojson] [--batch 1000] [--id-property plate] [--cat-property status]',
+  blurb: 'bulk load GeoJSON (reads stdin with - or no file)',
+  async run(nc, [name, file], flags) {
+    if (!name) throw new UsageError('load needs a collection name');
+    const features = readFeatures(file);
+    if (!features.length) return console.log(dim('  nothing to load'));
+    const t0 = Date.now();
+    const r = await nc.reportGeoJSON(name, features, {
+      maxBatch: num(flags, 'batch', 1000),
+      idProperty: flags['id-property'],
+      catProperty: flags['cat-property'],
+    });
+    const ms = Date.now() - t0;
+    if (out({ ...r, ms }, flags)) return;
+    const rate = Math.round((features.length / Math.max(ms, 1)) * 1000);
+    console.log(
+      `  ${green('loaded')} ${n(r.accepted)} features in ${ms} ms (${n(rate)}/s), ${n(r.devices)} devices`
+    );
   },
 });
 
@@ -580,7 +647,7 @@ ${dim('SERVER')}`);
   console.log(`\n${dim('COLLECTIONS')}`);
   for (const k of ['create', 'drop', 'stats', 'verify', 'snapshot']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
   console.log(`\n${dim('DEVICES')}`);
-  for (const k of ['report', 'import', 'seed', 'get', 'has', 'rm']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
+  for (const k of ['report', 'import', 'load', 'seed', 'get', 'has', 'rm']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
   console.log(`\n${dim('QUERIES')}`);
   for (const k of ['clusters', 'where', 'children', 'leaves', 'tile']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
   console.log(`

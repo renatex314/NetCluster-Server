@@ -36,6 +36,10 @@ curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/js
 curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: application/json' \
   -d '[{"id":"truck-1","lng":-46.6333,"lat":-23.5505,"cat":"delivering"}]'
 
+# or post GeoJSON straight through -- same endpoint, same upsert
+curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: application/json' \
+  --data-binary @fleet.geojson
+
 # vector tiles -- MapLibre and Leaflet consume these natively
 curl localhost:8080/v1/collections/fleet/tiles/10/379/580.mvt
 
@@ -126,7 +130,8 @@ and clusters quietly fill with ghosts until every count on the map reads high.
 | peak RSS | 551 MB | **172 MB** |
 
 Through HTTP with JSON parsing, at 100,000 devices: **917,000 reports/s** cold,
-**952,000/s** for moves, tiles in 0.11–0.18 ms. Eight clients sustained 32,091
+**952,000/s** for moves, **~830,000/s** posting GeoJSON instead, tiles in
+0.11–0.18 ms. Eight clients sustained 32,091
 tile reads in 3 s (p50 0.19 ms, p99 4.58 ms) **while 2,780,000 positions were
 written concurrently** — queries hold a read lock and mutations a write lock, so
 readers genuinely run alongside the writer.

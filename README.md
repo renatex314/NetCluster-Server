@@ -119,6 +119,7 @@ npm install -g netcluster-client     # or: npx netcluster-client <command>
 
 netcluster create fleet --categories idle,enroute,delivering --ttl 300
 netcluster seed fleet --count 50000
+netcluster load fleet points.geojson         # bulk-load GeoJSON
 netcluster clusters fleet --zoom 6
 netcluster watch
 ```
@@ -143,6 +144,9 @@ await fleet.create({ ttlSeconds: 300, categories: ['idle', 'enroute', 'deliverin
 // times between flushes sends one entry with its latest position
 const reporter = fleet.reporter({ flushMs: 500 });
 onGpsFix((f) => reporter.report({ id: f.deviceId, lng: f.lng, lat: f.lat }));
+
+// already have GeoJSON? send it as-is
+await fleet.reportGeoJSON(await (await fetch('/fleet.geojson')).json());
 
 const { features } = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom: 12 });
 const tile = await fleet.getTile(12, 1517, 2323);   // Uint8Array of MVT
@@ -174,6 +178,10 @@ curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: app
   -d '[{"id":"truck-1","lng":-46.6333,"lat":-23.5505,"cat":"delivering"},
        {"id":"truck-2","lng":-46.6340,"lat":-23.5510,"cat":"delivering"}]'
 
+# or post GeoJSON straight through -- same endpoint, same upsert
+curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: application/json' \
+  --data-binary @fleet.geojson
+
 # vector tiles -- MapLibre and Leaflet consume these natively
 curl localhost:8080/v1/collections/fleet/tiles/10/379/580.mvt
 
@@ -192,7 +200,7 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `PUT /v1/collections/{name}` | create; idempotent, 409 on a different geometry |
 | `GET /v1/collections` | list, with stats |
 | `DELETE /v1/collections/{name}` | drop |
-| `POST /v1/collections/{name}/positions` | batch ingest |
+| `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson) |
 | `DELETE /v1/collections/{name}/devices/{id}` | remove one device |
 | `GET .../devices/{id}` | is it registered? 200 with position, category and staleness, or 404 (`HEAD` for a bare check) |
 | `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON |
@@ -203,6 +211,76 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `POST .../snapshot` | write a snapshot now (persistence must be on) |
 | `GET .../verify` | full invariant check — admin only, `O(N²)` |
 | `GET /healthz`, `GET /metrics` | liveness, Prometheus |
+
+## GeoJSON
+
+`/clusters` has always emitted GeoJSON in supercluster's shape. It goes in too, on
+the same endpoint, with the same upsert semantics:
+
+```bash
+curl -X POST localhost:8080/v1/collections/fleet/positions \
+  -H 'content-type: application/json' --data-binary @fleet.geojson
+
+netcluster load fleet fleet.geojson          # or through the CLI
+```
+
+```js
+await nc.collection('fleet').reportGeoJSON(featureCollection);
+```
+
+A **bare array is always the compact form**; GeoJSON must arrive as
+`{"type": "FeatureCollection", "features": [...]}`, which is what every GeoJSON
+producer emits anyway. Sniffing each element to decide would put a branch on the
+hottest parse in the server and would still guess wrong on a mixed array, so the
+format is settled once by the shape of the container.
+
+**Reading rules**
+
+| | |
+|---|---|
+| id | `feature.id`, where GeoJSON says it goes, then `properties.id`. `?id_property=plate` names another one — and naming it is strict: a feature missing it is rejected rather than falling back, because a silent fallback keys half a fleet one way and half the other. A numeric id becomes its decimal form, so `7` and `"7"` are one device. |
+| position | `geometry.coordinates`. Point only. A third coordinate is altitude and is ignored. |
+| properties | stored verbatim, byte for byte — never reparsed, so a read hands the original text straight to the serialiser. `null` means "leave what is stored alone", the same as omitting `props`; `{}` clears. |
+| category | `properties.cat`, then `properties.category`. `?cat_property=status` names another. Index or declared name. |
+| anything else | ignored. RFC 7946 §6.1 allows foreign members on a Feature and real files carry them, so `bbox`, `title` and friends pass through harmlessly. |
+
+**Rejections name the feature.** A Polygon is refused rather than quietly reduced
+to a centroid, a null geometry is refused, and coordinates written the wrong way
+round are caught whenever the swap puts a longitude past ±90 into the latitude
+slot. Everything comes back as this API's `{"error", "code"}` body — `400` with
+`bad_geojson` for content this handler judges, `422` with `unprocessable_body` for
+a shape serde rejects, both naming the offending index:
+
+```json
+{"code":"bad_geojson","error":"features[8123] has a null geometry, so it has no position to cluster"}
+```
+
+**What it costs.** GeoJSON is roughly twice the bytes per point, and it shows —
+this is the whole ingest path, through HTTP, with real JSON parsing, at 100,000
+devices:
+
+| body | reports/s | posted |
+|---|---|---|
+| `[{id, lng, lat}]` | 1,071,000 | 6.7 MB |
+| `[{id, lng, lat, props}]` | 943,000 | 9.7 MB |
+| FeatureCollection | 876,000 | 13.4 MB |
+| FeatureCollection + properties | 828,000 | 15.1 MB |
+| FeatureCollection + properties + category | 722,000 | 15.9 MB |
+
+The last row pays for one extra skip-scan over each `properties` object to find
+the category — everything not asked for is stepped over rather than materialised,
+which is what lets `properties` stay stored as untouched bytes. The compact path
+is untouched by any of this, and was measured before and after to confirm it.
+
+Reproduce with `node scripts/bench-ingest.mjs`. All five rows come from one run,
+so they are comparable with each other; the absolute figures move ±10% with
+machine state, which is why they differ from the ones under
+[Measured](#measured) taken on a separate run.
+
+**One thing to know:** a device's category is fixed when it is first seen. A later
+report moves it and replaces its properties, but does not re-file it into another
+category. That is not a GeoJSON quirk — the compact path behaves the same way. If
+a vehicle's status changes, `DELETE` it and report it again.
 
 ## Attaching data to a device
 

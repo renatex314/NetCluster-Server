@@ -8,9 +8,10 @@
 //! hits. At coarse zooms one query serves every viewer looking at that region.
 
 use crate::collection::{Collection, Config, OutFeature, Report};
+use crate::geojson::{peek_props, CatVal, GeoFeature};
 use crate::mvt;
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{rejection::JsonRejection, FromRequest, Path, Query, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -79,6 +80,43 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+/// `Json<T>`, rejected in this API's error shape.
+///
+/// axum's own rejection body is plain text. Every other error here is
+/// `{"error": ..., "code": ...}`, so a client matching on `code` -- which the
+/// Node client does -- gets nothing back from the one failure mode that is
+/// hardest to diagnose remotely, and gets a `JSON.parse` exception on top.
+///
+/// The status codes are axum's and stay that way: 400 for JSON that does not
+/// parse, 422 for JSON that parses but does not fit, 413 for a body over the
+/// limit. Those distinctions are worth keeping, and a client that was already
+/// switching on them still works.
+pub struct JsonBody<T>(pub T);
+
+impl<T, S> FromRequest<S> for JsonBody<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(JsonBody(v)),
+            Err(e) => {
+                let code = match &e {
+                    JsonRejection::JsonDataError(_) => "unprocessable_body",
+                    JsonRejection::JsonSyntaxError(_) => "malformed_json",
+                    JsonRejection::MissingJsonContentType(_) => "wrong_content_type",
+                    JsonRejection::BytesRejection(_) => "body_too_large",
+                    _ => "bad_body",
+                };
+                Err(ApiError(e.status(), e.body_text(), code))
+            }
+        }
+    }
+}
 
 // ------------------------------------------------------------------ router --
 
@@ -387,13 +425,6 @@ async fn verify(
 
 // ------------------------------------------------------------------ ingest --
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum CatVal {
-    Num(u32),
-    Name(String),
-}
-
 /// `deny_unknown_fields` on purpose. Free-form attributes go in `props`; a stray
 /// `"plate"` at the top level is a mistake, and silently discarding it means
 /// finding out weeks later that nothing was ever stored.
@@ -411,7 +442,17 @@ pub struct ReportBody {
     props: Option<Box<serde_json::value::RawValue>>,
 }
 
-/// Either a bare array of reports or `{ "points": [...] }`.
+/// What `/positions` accepts: the compact form, or GeoJSON.
+///
+///   `[{id, lng, lat}, ...]`                      compact, bare array
+///   `{ "points": [...] }`                        compact, wrapped
+///   `{ "type": "FeatureCollection", "features": [...] }`
+///
+/// A bare array is *always* the compact form. Sniffing each element to see
+/// whether it looked like a Feature would put a branch on the hottest parse in
+/// the server and would still guess wrong on a mixed array, so the format is
+/// settled once, by the shape of the container, before any element is read.
+/// Every GeoJSON producer emits the object form anyway.
 ///
 /// Hand-written rather than `#[serde(untagged)]`, which cannot work here: an
 /// untagged enum deserialises by buffering the input into an intermediate
@@ -419,7 +460,19 @@ pub struct ReportBody {
 /// text -- which is exactly what `RawValue` needs to capture `props` without
 /// parsing. The derived version accepted both shapes right up until a report
 /// carried properties, then failed with "data did not match any variant".
-struct PositionsBody(Vec<ReportBody>);
+enum PositionsBody {
+    Compact(Vec<ReportBody>),
+    Geo(Vec<GeoFeature>),
+}
+
+impl PositionsBody {
+    fn is_empty(&self) -> bool {
+        match self {
+            PositionsBody::Compact(v) => v.is_empty(),
+            PositionsBody::Geo(v) => v.is_empty(),
+        }
+    }
+}
 
 impl<'de> Deserialize<'de> for PositionsBody {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -428,7 +481,10 @@ impl<'de> Deserialize<'de> for PositionsBody {
             type Value = PositionsBody;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("an array of position reports, or an object with a `points` array")
+                f.write_str(
+                    "an array of position reports, an object with a `points` array, or a GeoJSON \
+                     FeatureCollection",
+                )
             }
 
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
@@ -439,7 +495,7 @@ impl<'de> Deserialize<'de> for PositionsBody {
                 while let Some(r) = a.next_element()? {
                     v.push(r);
                 }
-                Ok(PositionsBody(v))
+                Ok(PositionsBody::Compact(v))
             }
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -447,29 +503,61 @@ impl<'de> Deserialize<'de> for PositionsBody {
                 mut a: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut points: Option<Vec<ReportBody>> = None;
+                let mut features: Option<Vec<GeoFeature>> = None;
                 while let Some(k) = a.next_key::<String>()? {
-                    if k == "points" {
-                        points = Some(a.next_value()?);
-                    } else {
-                        return Err(serde::de::Error::unknown_field(&k, &["points"]));
+                    match k.as_str() {
+                        "points" => points = Some(a.next_value()?),
+                        "features" => features = Some(a.next_value()?),
+                        // Read for the error it can give, not for the dispatch:
+                        // `features` alone settles the format, so key order does
+                        // not matter and a FeatureCollection missing its `type`
+                        // still works.
+                        "type" => {
+                            let t: String = a.next_value()?;
+                            if t != "FeatureCollection" {
+                                return Err(serde::de::Error::custom(format!(
+                                    "type is {t:?}; /positions takes a FeatureCollection, an \
+                                     array of reports, or {{\"points\": [...]}}"
+                                )));
+                            }
+                        }
+                        // RFC 7946 lets a FeatureCollection carry `bbox` and
+                        // foreign members. Ignoring them is what makes real files
+                        // work.
+                        _ => {
+                            a.next_value::<serde::de::IgnoredAny>()?;
+                        }
                     }
                 }
-                points
-                    .map(PositionsBody)
-                    .ok_or_else(|| serde::de::Error::missing_field("points"))
+                match (points, features) {
+                    (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                        "the body has both `points` and `features`; send one form or the other",
+                    )),
+                    (Some(p), None) => Ok(PositionsBody::Compact(p)),
+                    (None, Some(f)) => Ok(PositionsBody::Geo(f)),
+                    (None, None) => Err(serde::de::Error::custom(
+                        "the body has neither a `points` array nor a GeoJSON `features` array",
+                    )),
+                }
             }
         }
         d.deserialize_any(V)
     }
 }
 
+/// Where a GeoJSON Feature's category is looked for in `properties`, in order of
+/// preference, unless `?cat_property=` names one. Both spellings are here because
+/// the compact form calls it `cat` and the JavaScript library defaults to
+/// `category`, and a file exported from one should load into the other.
+const CAT_PROPERTIES: [&str; 2] = ["cat", "category"];
+
 async fn positions(
     State(s): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Json(body): Json<PositionsBody>,
+    Query(q): Query<HashMap<String, String>>,
+    JsonBody(body): JsonBody<PositionsBody>,
 ) -> ApiResult<Json<Value>> {
-    let reports = body.0;
-    if reports.is_empty() {
+    if body.is_empty() {
         return Ok(Json(json!({ "accepted": 0 })));
     }
 
@@ -486,22 +574,119 @@ async fn positions(
         }
     };
 
-    let mut resolved = Vec::with_capacity(reports.len());
-    for r in &reports {
-        let cat = match &r.cat {
-            None => 0,
-            Some(CatVal::Num(n)) => *n,
-            Some(CatVal::Name(s)) => c.category(Some(s)).map_err(ApiError::bad)?.max(0) as u32,
-        };
-        resolved.push(Report {
-            id: &r.id,
-            lng: r.lng,
-            lat: r.lat,
-            cat,
-            props: r.props.as_deref(),
-        });
-    }
-    let n = c.upsert(&resolved).map_err(ApiError::bad)?;
+    let n = match &body {
+        PositionsBody::Compact(reports) => {
+            let mut resolved = Vec::with_capacity(reports.len());
+            for r in reports {
+                let cat = match &r.cat {
+                    None => 0,
+                    Some(CatVal::Num(n)) => *n,
+                    Some(CatVal::Name(s)) => {
+                        c.category(Some(s)).map_err(ApiError::bad)?.max(0) as u32
+                    }
+                };
+                resolved.push(Report {
+                    id: &r.id,
+                    lng: r.lng,
+                    lat: r.lat,
+                    cat,
+                    props: r.props.as_deref(),
+                });
+            }
+            c.upsert(&resolved).map_err(ApiError::bad)?
+        }
+        PositionsBody::Geo(feats) => {
+            let id_prop = q.get("id_property").map(|s| s.as_str());
+            let cat_prop = q.get("cat_property").map(|s| s.as_str());
+            let cat_keys: Vec<&str> = match cat_prop {
+                Some(k) => vec![k],
+                None => CAT_PROPERTIES.to_vec(),
+            };
+            // The peek is a second pass over the properties text, so it is only
+            // paid when something actually has to come out of there: an id the
+            // Feature did not carry, or a category this collection can use.
+            let want_cat = !c.config.categories.is_empty();
+
+            let mut peeked: Vec<(Option<String>, Option<CatVal>)> = Vec::with_capacity(feats.len());
+            for (i, f) in feats.iter().enumerate() {
+                let want_id = id_prop.is_some() || f.id.is_none();
+                if !(want_id || want_cat) {
+                    peeked.push((None, None));
+                    continue;
+                }
+                match &f.props {
+                    Some(p) => {
+                        let id_key = if want_id { id_prop.or(Some("id")) } else { None };
+                        let keys: &[&str] = if want_cat { &cat_keys } else { &[] };
+                        peeked.push(peek_props(p.get(), id_key, keys).map_err(|e| {
+                            ApiError::bad(format!("features[{i}]: properties are unreadable: {e}"))
+                        })?);
+                    }
+                    None => peeked.push((None, None)),
+                }
+            }
+
+            let mut resolved = Vec::with_capacity(feats.len());
+            for (i, f) in feats.iter().enumerate() {
+                let geom = f.geom.as_ref().ok_or_else(|| {
+                    ApiError::bad(format!(
+                        "features[{i}] has a null geometry, so it has no position to cluster"
+                    ))
+                    .code("bad_geojson")
+                })?;
+                // A GeoJSON coordinates array is positional, so the pair can be
+                // -- and often is -- written the wrong way round. Web Mercator
+                // clamps latitude, so without this the point silently lands at a
+                // pole instead of failing. Only catches a swap that puts a
+                // longitude past +-90 into the latitude slot; nothing can catch
+                // one where both numbers are in range. The compact form names its
+                // fields, so it needs none of this.
+                if !(-90.0..=90.0).contains(&geom.lat) {
+                    return Err(ApiError::bad(format!(
+                        "features[{i}] has latitude {}, outside [-90, 90]. GeoJSON coordinates are \
+                         [longitude, latitude] -- are yours the other way round?",
+                        geom.lat
+                    ))
+                    .code("bad_geojson"));
+                }
+                let id = match (id_prop, &peeked[i].0, &f.id) {
+                    // An explicitly named property wins outright: having asked for
+                    // it, silently falling back to feature.id would key half the
+                    // fleet one way and half the other.
+                    (Some(k), p, _) => p.as_deref().ok_or_else(|| {
+                        ApiError::bad(format!(
+                            "features[{i}] has no properties.{k}, which id_property named as the id"
+                        ))
+                        .code("bad_geojson")
+                    })?,
+                    (None, _, Some(v)) => v.as_str(),
+                    (None, p, None) => p.as_deref().ok_or_else(|| {
+                        ApiError::bad(format!(
+                            "features[{i}] has no id. Put it on the feature (\"id\": \"vehicle-7\", \
+                             where GeoJSON says it goes) or in properties.id, or name the property \
+                             with ?id_property="
+                        ))
+                        .code("bad_geojson")
+                    })?,
+                };
+                let cat = match &peeked[i].1 {
+                    None => 0,
+                    Some(CatVal::Num(n)) => *n,
+                    Some(CatVal::Name(s)) => {
+                        c.category(Some(s)).map_err(ApiError::bad)?.max(0) as u32
+                    }
+                };
+                resolved.push(Report {
+                    id,
+                    lng: geom.lng,
+                    lat: geom.lat,
+                    cat,
+                    props: f.props.as_deref(),
+                });
+            }
+            c.upsert(&resolved).map_err(ApiError::bad)?
+        }
+    };
     Ok(Json(json!({ "accepted": n, "devices": c.len() })))
 }
 

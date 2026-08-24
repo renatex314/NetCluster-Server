@@ -26,3 +26,9 @@ netcluster = { path = "../netcluster" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
+
+[dev-dependencies]
+# Already in the tree via axum, so this costs nothing to add and nothing to
+# ship: it is only here for `oneshot`, which drives the router in-process so the
+# route tests exercise real extractors and real status codes without a socket.
+tower = { version = "0.5", features = ["util"] }

@@ -255,6 +255,53 @@ export class NetClusterClient {
     return { accepted, devices: last?.devices };
   }
 
+  /**
+   * Report positions as GeoJSON. Same endpoint, same upsert semantics as
+   * `report` -- only the wire format differs.
+   *
+   * Takes a FeatureCollection, an array of Features, or one Feature. Chunked at
+   * `maxBatch` into smaller FeatureCollections, for the reason `report` is: one
+   * huge request holds the write lock for its whole duration. GeoJSON is roughly
+   * twice the bytes per point, so the same batch size is a larger body -- still
+   * comfortably inside the server's 2 MB limit at the default 1000.
+   *
+   * @param opts.idProperty which property holds the id, when a Feature has no
+   *        `id` of its own. Naming it is strict: a Feature missing that property
+   *        is rejected rather than falling back to `feature.id`.
+   * @param opts.catProperty which property holds the category. Defaults to `cat`,
+   *        then `category`.
+   */
+  async reportGeoJSON(name, geojson, { maxBatch = DEFAULT_MAX_BATCH, idProperty, catProperty } = {}) {
+    const features = Array.isArray(geojson)
+      ? geojson
+      : geojson && geojson.type === 'Feature'
+        ? [geojson]
+        : (geojson && geojson.features) || null;
+    if (!Array.isArray(features)) {
+      throw new TypeError(
+        'netcluster: reportGeoJSON takes a GeoJSON FeatureCollection, an array of Features, or one Feature'
+      );
+    }
+    if (features.length === 0) return { accepted: 0 };
+
+    const q = new URLSearchParams();
+    if (idProperty !== undefined) q.set('id_property', idProperty);
+    if (catProperty !== undefined) q.set('cat_property', catProperty);
+    const qs = q.toString();
+    const path = `/v1/collections/${enc(name)}/positions${qs ? `?${qs}` : ''}`;
+
+    let accepted = 0;
+    let last = null;
+    for (let i = 0; i < features.length; i += maxBatch) {
+      last = await this._write(path, {
+        method: 'POST',
+        body: { type: 'FeatureCollection', features: features.slice(i, i + maxBatch) },
+      });
+      accepted += last?.accepted ?? 0;
+    }
+    return { accepted, devices: last?.devices };
+  }
+
   remove(name, id) {
     return this._write(`/v1/collections/${enc(name)}/devices/${enc(id)}`, {
       method: 'DELETE',
@@ -375,6 +422,7 @@ export class NetClusterClient {
       verify: bind(this.verify),
       snapshot: bind(this.snapshot),
       report: bind(this.report),
+      reportGeoJSON: bind(this.reportGeoJSON),
       remove: bind(this.remove),
       has: bind(this.has),
       getDevice: bind(this.getDevice),

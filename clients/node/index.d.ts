@@ -198,6 +198,37 @@ export declare class Reporter {
   close(): Promise<void>;
 }
 
+/**
+ * A GeoJSON Feature accepted on ingest.
+ *
+ * Looser than what queries return: the id may sit on the feature (where GeoJSON
+ * says it goes) or in a property, `properties` may be null, and a third
+ * coordinate is allowed and ignored. The geometry must be a Point.
+ */
+export interface InputFeature {
+  type: 'Feature';
+  id?: string | number;
+  properties: Record<string, unknown> | null;
+  geometry: { type: 'Point'; coordinates: number[] };
+}
+
+export interface InputFeatureCollection {
+  type: 'FeatureCollection';
+  features: InputFeature[];
+}
+
+export interface ReportGeoJSONOptions {
+  maxBatch?: number;
+  /**
+   * Which property holds the id, when a Feature has no `id` of its own. Naming
+   * it is strict: a Feature missing that property is rejected rather than
+   * falling back to `feature.id`.
+   */
+  idProperty?: string;
+  /** Which property holds the category. Defaults to `cat`, then `category`. */
+  catProperty?: string;
+}
+
 /** A collection name bound into every call. */
 export interface BoundCollection {
   readonly name: string;
@@ -207,6 +238,11 @@ export interface BoundCollection {
   verify(): Promise<{ ok: boolean; detail?: string; violation?: string }>;
   snapshot(): Promise<{ snapshot: string; bytes: number }>;
   report(points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
+  /** Report positions as GeoJSON. Same endpoint and upsert semantics as `report`. */
+  reportGeoJSON(
+    geojson: InputFeatureCollection | InputFeature[] | InputFeature,
+    opts?: ReportGeoJSONOptions,
+  ): Promise<ReportResult>;
   remove(id: string): Promise<{ removed: boolean }>;
   has(id: string): Promise<boolean>;
   getDevice(id: string): Promise<DeviceInfo | null>;
@@ -234,6 +270,12 @@ export declare class NetClusterClient {
   snapshot(name: string): Promise<{ snapshot: string; bytes: number }>;
 
   report(name: string, points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
+  /** Report positions as GeoJSON. Same endpoint and upsert semantics as `report`. */
+  reportGeoJSON(
+    name: string,
+    geojson: InputFeatureCollection | InputFeature[] | InputFeature,
+    opts?: ReportGeoJSONOptions,
+  ): Promise<ReportResult>;
   remove(name: string, id: string): Promise<{ removed: boolean }>;
 
   /** Is a device with this id currently registered? Throws if the collection is unknown. */
