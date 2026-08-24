@@ -346,7 +346,7 @@ export class NetClusterClient {
   // --------------------------------------------------------------- query --
 
   /**
-   * Clusters in a bounding box, as GeoJSON in the shape supercluster emits.
+   * Clusters in a bounding box, as a GeoJSON FeatureCollection.
    * @param {[number,number,number,number]} opts.bbox [west, south, east, north]
    */
   getClusters(name, { bbox, zoom = 0, cat } = {}) {

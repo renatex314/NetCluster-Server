@@ -214,8 +214,8 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 
 ## GeoJSON
 
-`/clusters` has always emitted GeoJSON in supercluster's shape. It goes in too, on
-the same endpoint, with the same upsert semantics:
+GeoJSON goes both ways. `/clusters` has always emitted it; it goes in too, on the
+same endpoint, with the same upsert semantics:
 
 ```bash
 curl -X POST localhost:8080/v1/collections/fleet/positions \
