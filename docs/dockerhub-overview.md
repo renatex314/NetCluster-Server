@@ -84,8 +84,11 @@ Filters are declared up front and matched exactly. `categories` gives you one;
 `dimensions` plus `filters` gives you several that **combine**
 (`?f.client=7&f.status=enroute`), `multi` lets one device hold several values for
 a dimension, and a dimension declared with `capacity` instead of `values` interns
-them as they arrive, so you need not know the ids up front. Still out of reach: substring search, ranges, `OR` across values,
-and anything in `props`. Note too that `clusters` is not a device listing:
+them as they arrive, so you need not know the ids up front — the ceiling is how
+many can coexist, not how large an id can get. Still out of reach: substring
+search, ranges, `OR` across values, anything in `props`, and any field whose
+distinct values never stop growing (a per-trip id gives every device its own
+bucket). Note too that `clusters` is not a device listing:
 co-located devices come back as one cluster with no id and no props at every
 zoom.
 

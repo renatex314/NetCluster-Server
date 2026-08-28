@@ -362,7 +362,15 @@ moved: a status change never moves the vehicle.
 
 Each declared shape is a separate aggregate, which is what filtering costs. Still
 out of reach: substring search, ranges, `OR` across values, and anything read out
-of `props`. Sizing and the trade-offs are in the JavaScript library's
+of `props`.
+
+**A field whose distinct values never stop growing** is out too, at any capacity —
+a per-trip or per-order id. Every shape holds a running total per combination per
+device per tree level, so values that never repeat give each device its own
+bucket: the aggregates become a second copy of the fleet and any ceiling fills.
+That is a lookup, not a map filter — resolve it in your own database and ask the
+index about the ids it returns. Sizing and the trade-offs are in the JavaScript
+library's
 [`docs/FILTERING.md`](https://github.com/renatex314/NetCluster/blob/main/docs/FILTERING.md),
 which describes the same mechanism.
 
