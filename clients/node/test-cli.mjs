@@ -207,6 +207,70 @@ test('filtering by category reaches the server', () => {
   assert.ok(sum(one) > 0, 'the filter matched nothing');
 });
 
+test('dimensions, --dim and --filter work from the command line', () => {
+  const sum = (fc) => fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
+  const clusters = (...extra) =>
+    sum(JSON.parse(cli(['clusters', 'owners', '--zoom', '16', '--json', ...extra]).stdout));
+
+  let r = cli(['create', 'owners',
+    '--dimension', 'client=1,7,22:multi',
+    '--dimension', 'status=idle,enroute',
+    '--shape', 'client', '--shape', 'status', '--shape', 'client,status',
+    '--ttl', '0']);
+  assert.equal(r.status, 0, r.stderr);
+
+  // all three share one coordinate, so the filter has to reach inside a cluster
+  for (const [id, dims] of [
+    ['t1', ['client=1,7', 'status=enroute']],
+    ['t2', ['client=7', 'status=idle']],
+    ['t3', ['client=22', 'status=enroute']],
+  ]) {
+    r = cli(['report', 'owners', id, '-46.6333', '-23.5505',
+             ...dims.flatMap((d) => ['--dim', d])]);
+    assert.equal(r.status, 0, r.stderr);
+  }
+
+  assert.equal(clusters(), 3);
+  assert.equal(clusters('--filter', 'client=7'), 2);
+  assert.equal(clusters('--filter', 'status=enroute'), 2);
+  assert.equal(clusters('--filter', 'client=7', '--filter', 'status=enroute'), 1,
+    'a repeated --filter must combine, not overwrite');
+  assert.equal(clusters('--filter', 'client=22', '--filter', 'status=idle'), 0);
+
+  // a status change does not move the vehicle
+  r = cli(['report', 'owners', 't2', '-46.6333', '-23.5505', '--dim', 'client=7', '--dim', 'status=enroute']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(clusters('--filter', 'client=7', '--filter', 'status=enroute'), 2);
+
+  // and a bare position report leaves the values alone
+  r = cli(['report', 'owners', 't2', '-46.6334', '-23.5506']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(clusters('--filter', 'client=7', '--filter', 'status=enroute'), 2);
+
+  cli(['drop', 'owners', '--yes']);
+});
+
+test('a filter the collection cannot answer fails loudly', () => {
+  cli(['create', 'strict', '--dimension', 'client=1,7', '--dimension', 'status=idle', '--ttl', '0']);
+  cli(['report', 'strict', 'v', '0', '0', '--dim', 'client=7']);
+
+  // no ["client","status"] shape was declared
+  let r = cli(['clusters', 'strict', '--zoom', '16', '--filter', 'client=7', '--filter', 'status=idle']);
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /no declared filter combines/);
+
+  r = cli(['clusters', 'strict', '--zoom', '16', '--filter', 'nope=1']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /unknown filter/);
+
+  // a query names one value per dimension, not a set
+  r = cli(['clusters', 'strict', '--zoom', '16', '--filter', 'client=1,7']);
+  assert.equal(r.status, 2, 'a malformed flag is a usage error');
+  assert.match(r.stderr, /names one per dimension/);
+
+  cli(['drop', 'strict', '--yes']);
+});
+
 test('tile writes real MVT bytes with --out', () => {
   const f = join(tmpdir(), `cli-tile-${process.pid}.mvt`);
   const r = cli(['tile', 'fleet', '5', '11', '18', '--out', f]);

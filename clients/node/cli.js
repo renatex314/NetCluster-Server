@@ -37,6 +37,44 @@ class UsageError extends Error {}
  * `--flag value`, `--flag=value`, `--bool`, and positionals. Everything after a
  * bare `--` is positional, so an id that starts with a dash is still reachable.
  */
+/** Every occurrence of a repeatable flag, as an array. */
+function list(flags, name) {
+  const v = flags[name];
+  if (v === undefined) return [];
+  return (Array.isArray(v) ? v : [v]).map(String);
+}
+
+/** `--filter name=value` pairs, one value each: a query selects one, not a set. */
+function queryFilter(flags) {
+  const out = {};
+  for (const raw of list(flags, 'filter')) {
+    const eq = raw.indexOf('=');
+    if (eq < 1) throw new UsageError(`--filter wants name=value, got ${JSON.stringify(raw)}`);
+    const v = raw.slice(eq + 1).trim();
+    if (v.includes(',')) {
+      throw new UsageError(
+        `--filter ${JSON.stringify(raw)} lists several values; a query names one per dimension`);
+    }
+    if (!v) throw new UsageError(`--filter ${JSON.stringify(raw)} names no value`);
+    out[raw.slice(0, eq).trim()] = v;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** `name=a,b` pairs into an object of name -> values. */
+function pairs(flags, name, what) {
+  const out = {};
+  for (const raw of list(flags, name)) {
+    const eq = raw.indexOf('=');
+    if (eq < 1) throw new UsageError(`--${name} wants ${what}, got ${JSON.stringify(raw)}`);
+    const k = raw.slice(0, eq).trim();
+    const vals = raw.slice(eq + 1).split(',').map((x) => x.trim()).filter(Boolean);
+    if (!vals.length) throw new UsageError(`--${name} ${JSON.stringify(raw)} names no value`);
+    out[k] = vals;
+  }
+  return out;
+}
+
 function parseArgs(argv) {
   const flags = {};
   const positional = [];
@@ -49,13 +87,23 @@ function parseArgs(argv) {
       onlyPositional = true;
     } else if (a.startsWith('--')) {
       const eq = a.indexOf('=');
+      let name, value;
       if (eq !== -1) {
-        flags[a.slice(2, eq)] = a.slice(eq + 1);
+        name = a.slice(2, eq);
+        value = a.slice(eq + 1);
       } else {
-        const name = a.slice(2);
+        name = a.slice(2);
         const next = argv[i + 1];
-        if (next === undefined || next.startsWith('--')) flags[name] = true;
-        else flags[name] = argv[++i];
+        if (next === undefined || next.startsWith('--')) value = true;
+        else value = argv[++i];
+      }
+      // Repeats accumulate. A flag given once stays a plain string, so nothing
+      // that reads one changes; a flag given twice used to silently keep the
+      // last, which is never what was meant.
+      if (name in flags) {
+        flags[name] = Array.isArray(flags[name]) ? [...flags[name], value] : [flags[name], value];
+      } else {
+        flags[name] = value;
       }
     } else if (a === '-h') {
       flags.help = true;
@@ -242,7 +290,13 @@ cmd('collections', {
 
 cmd('create', {
   usage: 'create <name> [--radius 40] [--extent 512] [--max-zoom 16] [--hysteresis 0.25]\n' +
-         '                      [--ttl 300] [--categories idle,enroute] [--max-props-bytes 1024]',
+         '                      [--ttl 300] [--categories idle,enroute] [--max-props-bytes 1024]\n' +
+         '                      [--dimension client=1,7,22:multi] [--shape client,status]\n' +
+         '\n' +
+         '  --dimension and --shape may be repeated. A dimension is a property you filter\n' +
+         '  on; add :multi if one device can hold several of its values. A shape is a\n' +
+         '  combination a query may name -- each one is stored separately, so declare the\n' +
+         '  ones your UI offers and no more. Default: each dimension on its own.',
   blurb: 'create a collection (idempotent; 409 if the geometry differs)',
   async run(nc, [name], flags) {
     if (!name) throw new UsageError('create needs a collection name');
@@ -255,6 +309,24 @@ cmd('create', {
     if (flags['max-props-bytes'] !== undefined) cfg.maxPropsBytes = num(flags, 'max-props-bytes');
     if (flags.categories !== undefined) {
       cfg.categories = String(flags.categories).split(',').map((s) => s.trim()).filter(Boolean);
+    }
+    const dims = list(flags, 'dimension');
+    if (dims.length) {
+      cfg.dimensions = dims.map((raw) => {
+        const eq = raw.indexOf('=');
+        if (eq < 1) {
+          throw new UsageError(`--dimension wants name=v1,v2[:multi], got ${JSON.stringify(raw)}`);
+        }
+        let rest = raw.slice(eq + 1), multi = false;
+        if (rest.endsWith(':multi')) { multi = true; rest = rest.slice(0, -':multi'.length); }
+        const values = rest.split(',').map((x) => x.trim()).filter(Boolean);
+        if (!values.length) throw new UsageError(`--dimension ${JSON.stringify(raw)} declares no values`);
+        return { name: raw.slice(0, eq).trim(), values, multi };
+      });
+    }
+    const shapes = list(flags, 'shape');
+    if (shapes.length) {
+      cfg.filters = shapes.map((raw) => raw.split(',').map((x) => x.trim()).filter(Boolean));
     }
     const r = await nc.createCollection(name, cfg);
     if (out(r, flags)) return;
@@ -339,7 +411,10 @@ cmd('snapshot', {
 });
 
 cmd('report', {
-  usage: 'report <name> <id> <lng> <lat> [--cat X] [--props \'{"k":"v"}\']',
+  usage: 'report <name> <id> <lng> <lat> [--cat X] [--dim client=1,7] [--props \'{"k":"v"}\']\n' +
+         '\n' +
+         '  --dim may be repeated, once per dimension. Omit it and the device keeps the\n' +
+         '  values it already had -- a position report should not re-file a vehicle.',
   blurb: 'report one position',
   async run(nc, [name, id, lng, lat], flags) {
     if (!name || !id || lng === undefined || lat === undefined) {
@@ -350,6 +425,8 @@ cmd('report', {
       throw new UsageError('lng and lat must be numbers');
     }
     if (flags.cat !== undefined) p.cat = flags.cat;
+    const dims = pairs(flags, 'dim', 'name=value[,value]');
+    if (Object.keys(dims).length) p.dims = dims;
     const props = parseProps(flags.props);
     if (props !== undefined) p.props = props;
     const r = await nc.report(name, [p]);
@@ -479,12 +556,17 @@ cmd('has', {
 });
 
 cmd('clusters', {
-  usage: 'clusters <name> [--zoom 8] [--bbox w,s,e,n] [--cat X] [--limit 20]',
+  usage: 'clusters <name> [--zoom 8] [--bbox w,s,e,n] [--cat X] [--filter client=7] [--limit 20]\n' +
+         '\n' +
+         '  --filter may be repeated, and must name exactly the dimensions of one declared\n' +
+         '  shape. An undeclared combination is an error, not an empty map.',
   blurb: 'what would be drawn on the map at this zoom',
   async run(nc, [name], flags) {
     if (!name) throw new UsageError('clusters needs a collection name');
     const zoom = num(flags, 'zoom', 8);
-    const fc = await nc.getClusters(name, { zoom, bbox: parseBbox(flags.bbox), cat: flags.cat });
+    const fc = await nc.getClusters(name, {
+      zoom, bbox: parseBbox(flags.bbox), cat: flags.cat, filter: queryFilter(flags),
+    });
     if (out(fc, flags)) return;
     const total = fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
     const limit = num(flags, 'limit', 20);
@@ -556,7 +638,7 @@ cmd('leaves', {
 });
 
 cmd('tile', {
-  usage: 'tile <name> <z> <x> <y> [--cat X] [--out file.mvt]',
+  usage: 'tile <name> <z> <x> <y> [--cat X] [--filter client=7] [--out file.mvt]',
   blurb: 'fetch one vector tile; --out writes the raw MVT bytes',
   async run(nc, [name, z, x, y], flags) {
     if (!name || z === undefined || x === undefined || y === undefined) {
@@ -564,13 +646,13 @@ cmd('tile', {
     }
     const args = [name, Number(z), Number(x), Number(y)];
     if (flags.out) {
-      const buf = await nc.getTile(...args, { cat: flags.cat });
+      const buf = await nc.getTile(...args, { cat: flags.cat, filter: queryFilter(flags) });
       const { writeFileSync } = await import('node:fs');
       writeFileSync(String(flags.out), buf);
       console.log(`  ${green('wrote')} ${n(buf.length)} bytes to ${flags.out}`);
       return;
     }
-    const j = await nc.getTile(...args, { cat: flags.cat, format: 'json' });
+    const j = await nc.getTile(...args, { cat: flags.cat, filter: queryFilter(flags), format: 'json' });
     if (out(j, flags)) return;
     table(
       j.features.map((f) => [

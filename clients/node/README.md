@@ -17,6 +17,7 @@ netcluster create fleet --categories idle,enroute,delivering --ttl 300
 netcluster seed fleet --count 50000          # a simulated fleet, for demos and load tests
 netcluster load fleet points.geojson         # bulk-load GeoJSON
 netcluster clusters fleet --zoom 6           # what the map would draw
+netcluster clusters fleet --zoom 6 --filter client=7 --filter status=enroute
 netcluster where fleet v42 --zoom 10         # which marker holds this device
 netcluster watch                             # live devices, ingest rate, memory, snapshot age
 ```
@@ -71,6 +72,11 @@ const { features } = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom:
 // only the delivering ones -- precomputed, not scanned
 const busy = await fleet.getClusters({ bbox: [-47, -24, -46, -23], zoom: 12, cat: 'delivering' });
 
+// filters combine, and a device may hold several values -- see "Filtering"
+const mine = await fleet.getClusters({
+  bbox: [-47, -24, -46, -23], zoom: 12, filter: { client: 7, status: 'enroute' },
+});
+
 // raw MVT bytes, for serving straight to MapLibre or Leaflet
 const tile = await fleet.getTile(12, 1517, 2323);   // Uint8Array
 ```
@@ -106,43 +112,125 @@ Single points return their props as the GeoJSON `properties`; the device id is o
 the feature itself (`feature.id`). Clusters carry none. In vector tiles, top-level
 scalars become MVT tags so you can style by them.
 
-Capped by `maxPropsBytes` (default 1024). Anything you filter or group by belongs
-in `categories` instead.
+Capped by `maxPropsBytes` (default 1024). `props` is payload, never indexed —
+anything you filter or group by belongs in a [dimension](#filtering) instead.
 
-Filters are declared up front and matched exactly, and they combine:
+## Filtering
+
+A map usually needs more than one filter at a time: *which client owns this
+vehicle* **and** *what is it doing*. A vehicle can also belong to several clients
+at once. Declare the properties you filter on, and the combinations a query may
+name.
 
 ```js
 await fleet.create({
   dimensions: [
+    // `multi`: one vehicle can be operated for several clients
     { name: 'client', values: ['1', '7', '22'], multi: true },
     { name: 'status', values: ['idle', 'enroute'] },
   ],
+  // the combinations a query may name -- see "What it costs" below
   filters: [['client'], ['status'], ['client', 'status']],
 });
-
-await fleet.report([
-  { id: 'v1', lng, lat, dims: { client: ['1', '7'], status: 'enroute' } },
-]);
-
-await fleet.getClusters({ bbox, zoom, filter: { client: 7, status: 'enroute' } });
 ```
 
-`multi` lets one device hold several values for a dimension — a vehicle owned by
-three clients — which a single category cannot express. Re-reporting a device with
-different `dims` **re-files it** even if it has not moved, which is what a status
-change looks like; omitting `dims` leaves its values alone, exactly as omitting
-`props` leaves its properties.
+### Reporting values
 
-Each declared shape is a separate aggregate, which is what filtering costs. Naming
-an undeclared combination, dimension or value is a 400, never an empty result.
-Still out of reach: substring search, ranges, `OR` across values, and anything in
-`props`.
+Values ride alongside the position, in `dims`:
 
-Do not reach for the whole fleet and filter it yourself. `getClusters` clusters at
-every zoom, so it is not a device listing: zoom is clamped to `maxZoom`, and
-vehicles parked closer than the radius at that zoom (~44 m at the defaults) come
-back as a single cluster with no id and no props, which a filter of your own
-silently skips. Use `getLeaves(clusterId)` to reach the members.
+```js
+await fleet.report([
+  { id: 'truck-1', lng: -46.6333, lat: -23.5505,
+    dims: { client: ['1', '7'], status: 'enroute' } },
+]);
+```
+
+or, in GeoJSON, under each dimension's own name in `properties`:
+
+```js
+await fleet.reportGeoJSON({
+  type: 'FeatureCollection',
+  features: [{
+    type: 'Feature', id: 'truck-1',
+    geometry: { type: 'Point', coordinates: [-46.6333, -23.5505] },
+    properties: { client: [1, 7], status: 'enroute', plate: 'ABC-1234' },
+  }],
+});
+```
+
+`plate` there is ordinary payload: stored, handed back, never indexed.
+
+| `dims` | effect |
+|---|---|
+| omitted | unchanged — the ordinary position update |
+| `{...}` | re-files the device, even if it has not moved |
+
+Both directions matter. A GPS ping every two seconds must not re-file a vehicle
+into whatever sits at the first value; and **a status change does not move the
+vehicle**, so re-reporting it where it already is *is* the whole update:
+
+```js
+await fleet.report([{ id: 'truck-1', lng, lat, dims: { status: 'idle' } }]);
+```
+
+### Querying
+
+```js
+await fleet.getClusters({ bbox, zoom, filter: { client: 7 } });
+await fleet.getClusters({ bbox, zoom, filter: { client: 7, status: 'enroute' } });
+await fleet.getClusters({ bbox, zoom });                    // everything
+```
+
+Tiles take the same `filter`. A query names **one value per dimension** — a device
+may hold several, but "client 7" is a question with an answer and "client 7 or 9"
+is two.
+
+The combination must match a declared shape exactly. Anything else is a 400 naming
+what is declared, never an empty result: a filter that silently matched nothing
+looks exactly like a fleet that has gone quiet.
+
+```
+unknown filter "plate"; this collection has client, status
+no declared filter combines [client, status]; this collection allows [client], [status]
+```
+
+### From the CLI
+
+```bash
+netcluster create fleet --dimension 'client=1,7,22:multi'                         --dimension 'status=idle,enroute'                         --shape client --shape status --shape client,status
+
+netcluster report fleet truck-1 -46.6333 -23.5505 --dim client=1,7 --dim status=enroute
+netcluster clusters fleet --zoom 12 --filter client=7 --filter status=enroute
+```
+
+`--dimension`, `--shape`, `--dim` and `--filter` may each be repeated.
+
+### What it costs
+
+Each declared shape carries its own running total, because a conjunction cannot be
+assembled from its parts — knowing how many vehicles are `client 7`, and how many
+are `enroute`, says nothing about how many are both. So `[['client'], ['status'],
+['client','status']]` costs about three times what `[['client']]` does. Declare the
+combinations your UI offers and no more; leaving `filters` out gives each dimension
+on its own, which is the cheapest useful setting.
+
+Reads stay fast either way — a filtered query is typically *faster* than an
+unfiltered one, since a subtree holding none of the requested value is skipped
+whole. Sizing and the measured numbers are in the JavaScript library's
+[`docs/FILTERING.md`][filtering], which documents the same mechanism.
+
+### What it cannot do
+
+Substring search, ranges, `OR` across values, and anything read out of `props`.
+A plate box is a registry lookup rather than a map query — keep the text in your
+own database, resolve it to ids there, and ask the index only about those.
+
+And **do not reach for the whole fleet and filter it yourself.** `getClusters`
+clusters at every zoom, so it is not a device listing: zoom is clamped to
+`maxZoom`, and vehicles parked closer than the radius at that zoom (~44 m at the
+defaults) come back as a single cluster with no id and no props, which a filter of
+your own silently skips — a depot disappears. Use `getLeaves(clusterId)` to reach
+the members.
 
 ## Tuning the clustering
 
@@ -247,16 +335,16 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 
 | | |
 |---|---|
-| `createCollection(name, config)` | idempotent; rejects 409 on a different geometry |
+| `createCollection(name, config)` | idempotent; rejects 409 on a different geometry. `dimensions` / `filters` declare what you can [filter](#filtering) on |
 | `dropCollection(name)` | |
 | `listCollections()` / `stats(name)` | |
-| `report(name, points, { maxBatch })` | upserts; chunked |
+| `report(name, points, { maxBatch })` | upserts; chunked. A point may carry `dims` and `props` |
 | `reportGeoJSON(name, geojson, { maxBatch, idProperty, catProperty })` | the same, with GeoJSON on the wire |
 | `remove(name, id)` | |
 | `has(name, id)` | is this device registered? |
 | `getDevice(name, id)` | position, category and staleness, or `null` |
 | `getClusters(name, { bbox, zoom, cat, filter })` | GeoJSON `FeatureCollection` |
-| `getTile(name, z, x, y, { cat, format })` | `Uint8Array` of MVT, or `format: 'json'` |
+| `getTile(name, z, x, y, { cat, filter, format })` | `Uint8Array` of MVT, or `format: 'json'` |
 | `getChildren(name, clusterId)` | one expansion step, plus `expansion_zoom` |
 | `getLeaves(name, clusterId, { limit, offset })` | the individual devices |
 | `deviceCluster(name, id, zoom)` | which marker contains this device |
@@ -371,4 +459,5 @@ npm test                                        # spawns the real server
 MIT
 
 [netcluster-server]: https://github.com/renatex314/NetCluster-Server
+[filtering]: https://github.com/renatex314/NetCluster/blob/main/docs/FILTERING.md
 [docs/DEPLOY.md]: https://github.com/renatex314/NetCluster-Server/blob/master/docs/DEPLOY.md

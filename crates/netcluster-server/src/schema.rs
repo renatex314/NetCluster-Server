@@ -275,9 +275,12 @@ impl Schema {
             .collect::<Vec<_>>()
             .join(",");
         let Some(&si) = self.by_key.get(&key) else {
+            // Named in declaration order rather than the map's, so the message is
+            // the same every time it is produced -- it ends up in logs and tests.
+            let named: Vec<&str> = idx.iter().map(|&i| self.dims[i].name.as_str()).collect();
             return Err(format!(
-                "no declared filter combines {:?}; this collection allows {}",
-                sel.keys().collect::<Vec<_>>(),
+                "no declared filter combines [{}]; this collection allows {}",
+                named.join(", "),
                 self.describe_shapes()
             ));
         };
