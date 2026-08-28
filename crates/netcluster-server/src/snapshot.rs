@@ -357,6 +357,7 @@ mod tests {
             categories: vec!["idle".into(), "enroute".into()],
             dimensions: Vec::new(),
             filters: Vec::new(),
+            text: Vec::new(),
             max_props_bytes: 1024,
             ttl_seconds: 120,
         }

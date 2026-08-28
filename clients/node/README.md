@@ -257,14 +257,53 @@ unfiltered one, since a subtree holding none of the requested value is skipped
 whole. Sizing and the measured numbers are in the JavaScript library's
 [`docs/FILTERING.md`][filtering], which documents the same mechanism.
 
+### Searching text
+
+A substring cannot be precomputed — there is nothing to keep a running count of —
+so it gets its own query, which **scans**. Declare the fields it may search:
+
+```js
+await fleet.create({ text: ['plate', 'driver'] });
+```
+
+They are extracted from `props` at ingest and lowercased once, so a search never
+parses JSON and never allocates per device:
+
+```js
+await fleet.getClusters({ bbox, zoom, where: { plate: 'abc' } });          // substring
+await fleet.getClusters({ bbox, zoom, where: { driver: { eq: 'Ana' } } }); // whole value
+await fleet.getClusters({ bbox, zoom, where: 'plate~abc,driver~ana' });    // string form
+await fleet.getClusters({ bbox, zoom, where: { plate: 'abc' }, filter: { client: 7 } });
+```
+
+Terms are ANDed, matching ignores case, and the results cluster exactly as an
+unfiltered query would — restricted to the matches — so two matching vehicles
+parked in the same yard come back as one marker of 2 rather than disappearing.
+
+**It costs `O(devices)`, not `O(markers)`.** Measured on a 180,000-device fleet,
+the scan itself is about **1.5 ms**; the declared filters above are a lookup and
+stay flat however large the fleet grows. That is the whole trade, and it is why
+this is `where` and not another key in `filter` — reach for a dimension whenever
+the values can be declared, and keep `where` for the search box.
+
+A cluster of matches is not a node of the tree, so it carries **no `cluster_id`**
+and reports `expandable: false` instead — expanding it would answer about the
+whole cluster, including the vehicles that did not match. Zoom in and re-run the
+search rather than calling `getChildren`.
+
+Each searchable field costs one string per device; `stats().text_bytes` reports
+what yours are actually costing. Fields are fixed at creation, since they are
+extracted on the way in. `where` is not available on tiles — a tile request
+carrying one is refused rather than served unfiltered.
+
 ### What it cannot do
 
-Substring search, ranges, `OR` across values, and anything read out of `props`.
-A plate box is a registry lookup rather than a map query — keep the text in your
-own database, resolve it to ids there, and ask the index only about those.
+Ranges, `OR` across values, and anything in `props` that is not a declared text
+field.
 
 **A field whose distinct values never stop growing** — a per-trip or per-order id
-— should not be a dimension either, at any capacity. Every declared shape holds a
+— should not be a *dimension* either, at any capacity (search it with `where`
+instead if you need to). Every declared shape holds a
 running total per combination per device per tree level, so values that never
 repeat give each device its own bucket: the aggregates become a second copy of the
 fleet and any ceiling fills. That is a different question from "which client owns

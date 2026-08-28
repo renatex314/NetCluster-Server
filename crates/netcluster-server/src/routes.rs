@@ -7,7 +7,7 @@
 //! all*, and because a tile key is stable, an HTTP cache in front of this actually
 //! hits. At coarse zooms one query serves every viewer looking at that region.
 
-use crate::collection::{Collection, Config, OutFeature, Report, NO_MATCH};
+use crate::collection::{Collection, Config, OutFeature, Report, TextPred, NO_MATCH};
 use crate::geojson::{peek_dims, peek_props, CatVal, DimVal, GeoFeature};
 use crate::mvt;
 use crate::schema::Dimension;
@@ -290,6 +290,8 @@ pub struct ConfigBody {
     /// Filterable properties, each with its values. `multi` lets one device hold
     /// several at once. Set this or `categories`, never both.
     pub dimensions: Option<Vec<Dimension>>,
+    /// Property fields searchable with `?where=`. See `Config::text`.
+    pub text: Option<Vec<String>>,
     /// Which combinations of dimensions a query may name. Empty means each on its
     /// own. This is what filtering costs -- one aggregate entry per device per
     /// shape per tree level.
@@ -310,6 +312,7 @@ impl ConfigBody {
             categories: self.categories.unwrap_or(d.categories),
             dimensions: self.dimensions.unwrap_or(d.dimensions),
             filters: self.filters.unwrap_or(d.filters),
+            text: self.text.unwrap_or(d.text),
             max_props_bytes: self.max_props_bytes.unwrap_or(d.max_props_bytes),
             ttl_seconds: self.ttl_seconds.unwrap_or(d.ttl_seconds),
         }
@@ -605,6 +608,57 @@ fn parse_filter(c: &Collection, q: &HashMap<String, String>) -> ApiResult<i32> {
     }
     c.category(q.get("cat").map(|s| s.as_str()))
         .map_err(|e| ApiError::bad(e).code("bad_filter"))
+}
+
+/// `?where=plate~abc` terms.
+///
+/// `~` is a substring match and `=` is the whole value; both ignore case, because
+/// the searchable fields are lowercased once at ingest rather than per query. May
+/// be repeated, and the terms are ANDed.
+///
+/// Only declared fields are searchable. Anything else is a 400 naming what is
+/// declared -- the alternative is scanning for a field no device has, which
+/// always returns nothing and always looks like a quiet fleet.
+fn parse_where(c: &Collection, q: &HashMap<String, String>) -> ApiResult<Vec<TextPred>> {
+    let mut out = Vec::new();
+    for raw in q.get("where").into_iter() {
+        for term in raw.split(',').filter(|t| !t.trim().is_empty()) {
+            let (field, contains, value) = match term.find('~') {
+                Some(i) => (&term[..i], true, &term[i + 1..]),
+                None => match term.find('=') {
+                    Some(i) => (&term[..i], false, &term[i + 1..]),
+                    None => {
+                        return Err(ApiError::bad(format!(
+                            "where term {term:?} needs `field~substring` or `field=value`"
+                        ))
+                        .code("bad_where"))
+                    }
+                },
+            };
+            let field = field.trim();
+            let Some(idx) = c.config.text.iter().position(|f| f == field) else {
+                return Err(ApiError::bad(format!(
+                    "{field:?} is not searchable; this collection declares {:?}. \
+                     Searchable fields are extracted from props at ingest, so adding \
+                     one means recreating the collection.",
+                    c.config.text
+                ))
+                .code("bad_where"));
+            };
+            if value.is_empty() {
+                return Err(
+                    ApiError::bad(format!("where term {term:?} has nothing to match"))
+                        .code("bad_where"),
+                );
+            }
+            out.push(TextPred {
+                field: idx,
+                contains,
+                needle: value.to_lowercase(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// The filter cells one compact report belongs to.
@@ -940,12 +994,28 @@ fn geojson(f: &OutFeature) -> Value {
             "properties": properties,
             "geometry": { "type": "Point", "coordinates": [f.lng, f.lat] }
         })
-    } else {
+    } else if let Some(cluster_id) = f.cluster_id {
         json!({
             "type": "Feature",
             "properties": {
                 "cluster": true,
-                "cluster_id": f.cluster_id,
+                "cluster_id": cluster_id,
+                "point_count": f.count,
+                "point_count_abbreviated": abbrev(f.count),
+            },
+            "geometry": { "type": "Point", "coordinates": [f.lng, f.lat] }
+        })
+    } else {
+        // A group of `?where=` matches is not a node of the tree, so there is
+        // nothing to expand: getChildren would answer about the whole cluster,
+        // including everything that did not match. `cluster_id` is left out
+        // rather than sent as null -- a caller that reads it and passes it on
+        // should get `undefined` and fail on the spot, not send null and wonder.
+        json!({
+            "type": "Feature",
+            "properties": {
+                "cluster": true,
+                "expandable": false,
                 "point_count": f.count,
                 "point_count_abbreviated": abbrev(f.count),
             },
@@ -968,7 +1038,16 @@ async fn clusters(
 ) -> ApiResult<Json<Value>> {
     let c = s.get(&name)?;
     let cat = parse_filter(&c, &q)?;
-    let fs = c.clusters(parse_bbox(&q)?, parse_zoom(&q)?, cat);
+    let preds = parse_where(&c, &q)?;
+    let (bbox, zoom) = (parse_bbox(&q)?, parse_zoom(&q)?);
+    // Two paths on purpose. Without `?where=` this reads precomputed aggregates
+    // and costs what it always did; with one it scans, and that is the only way a
+    // substring can be answered exactly.
+    let fs = if preds.is_empty() {
+        c.clusters(bbox, zoom, cat)
+    } else {
+        c.search(bbox, zoom, cat, &preds)
+    };
     Ok(Json(collection_json(&fs)))
 }
 
@@ -1042,6 +1121,15 @@ async fn tile(
         )));
     }
     let c = s.get(&name)?;
+    // Refused rather than ignored. Serving an unfiltered tile for a query that
+    // asked for a search is the failure mode this whole feature exists to remove.
+    if q.contains_key("where") {
+        return Err(ApiError::bad(
+            "?where= is not supported on tiles; use /clusters, which returns the              matching markers as GeoJSON"
+                .to_string(),
+        )
+        .code("where_not_supported"));
+    }
     let cat = parse_filter(&c, &q)?;
     let feats = c.tile(z, x, y, cat);
 

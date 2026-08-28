@@ -83,6 +83,14 @@ pub struct Config {
     /// not a formality: at a million devices, every kilobyte allowed here is a
     /// gigabyte you have promised to have.
     pub max_props_bytes: usize,
+    /// Property fields that can be searched with `?where=`.
+    ///
+    /// A substring cannot be pre-aggregated -- there is nothing to keep a running
+    /// count of -- so a `where` query scans. Each declared field costs one string
+    /// per device, extracted from `props` at ingest so the scan never parses JSON,
+    /// and lowercased once so matching never allocates.
+    #[serde(default)]
+    pub text: Vec<String>,
     /// Drop a device that has not reported for this long. 0 disables expiry.
     ///
     /// You almost always want this set. A vehicle that stops reporting does not
@@ -100,6 +108,7 @@ impl Default for Config {
             categories: Vec::new(),
             dimensions: Vec::new(),
             filters: Vec::new(),
+            text: Vec::new(),
             max_props_bytes: 1024,
             ttl_seconds: 300,
         }
@@ -122,6 +131,13 @@ struct IdMap {
     /// max zoom a viewport can return tens of thousands of single points, and
     /// cloning each blob would dominate the query.
     props: Vec<Option<Arc<Box<RawValue>>>>,
+    /// Searchable fields, `device * fields + field`, lowercased.
+    ///
+    /// Held apart from `props` so a scan touches a compact array of short strings
+    /// rather than parsing a JSON blob per device, and lowercased at ingest so a
+    /// query allocates nothing per device it rejects.
+    text: Vec<Option<Box<str>>>,
+    fields: usize,
 }
 
 impl IdMap {
@@ -133,6 +149,9 @@ impl IdMap {
         self.to_str.push(id.to_string());
         self.last_seen.push(u64::MAX);
         self.props.push(None);
+        for _ in 0..self.fields {
+            self.text.push(None);
+        }
         self.to_num.insert(id.to_string(), n);
         n
     }
@@ -148,6 +167,30 @@ impl IdMap {
 struct Inner {
     index: NetCluster,
     ids: IdMap,
+}
+
+/// One `?where=` term: a field, how to match, and what to match against.
+#[derive(Debug, Clone)]
+pub struct TextPred {
+    pub field: usize,
+    pub contains: bool,
+    /// Already lowercased, like the values it is tested against.
+    pub needle: String,
+}
+
+impl TextPred {
+    fn test(&self, v: Option<&str>) -> bool {
+        match v {
+            None => false, // a device without the field cannot match
+            Some(t) => {
+                if self.contains {
+                    t.contains(&self.needle)
+                } else {
+                    t == self.needle
+                }
+            }
+        }
+    }
 }
 
 pub struct Collection {
@@ -278,6 +321,8 @@ pub struct CollectionStats {
     /// part of the index whose size you control from outside.
     pub props_bytes: usize,
     pub max_props_bytes: usize,
+    /// What the searchable fields cost, so a `?where=` collection can be sized.
+    pub text_bytes: usize,
 }
 
 impl Config {
@@ -325,6 +370,7 @@ impl Collection {
             max_cells_per_device: schema.max_cells_per_device,
             ..Default::default()
         });
+        let text_fields = config.text.len();
         let mut interner = Interner::new(&schema);
         let mut default_cells = Vec::new();
         schema
@@ -345,7 +391,10 @@ impl Collection {
             config,
             state: RwLock::new(Inner {
                 index,
-                ids: IdMap::default(),
+                ids: IdMap {
+                    fields: text_fields,
+                    ..IdMap::default()
+                },
             }),
             created_ms: now_ms(),
             ingested: AtomicU64::new(0),
@@ -599,9 +648,32 @@ impl Collection {
                 }
             }
         }
+        // Extracted out here: parsing JSON while holding the write lock would
+        // stall every reporter for the duration of the batch.
+        let names: Vec<&str> = self.config.text.iter().map(|s| s.as_str()).collect();
+        let mut text: Vec<Vec<Option<String>>> = Vec::new();
+        if !names.is_empty() {
+            text.reserve(reports.len());
+            for r in reports {
+                match r.props {
+                    Some(p) => {
+                        let mut got = crate::geojson::peek_text(p.get(), &names).map_err(|e| {
+                            format!("device {:?}: properties are unreadable: {e}", r.id)
+                        })?;
+                        // lowercased once here rather than per device per query
+                        for t in got.iter_mut().flatten() {
+                            *t = t.to_lowercase();
+                        }
+                        text.push(got);
+                    }
+                    None => text.push(Vec::new()),
+                }
+            }
+        }
+
         let now = now_ms();
         let mut st = self.state.write().unwrap();
-        for r in reports {
+        for (i, r) in reports.iter().enumerate() {
             let n = st.ids.intern(r.id);
             if st.index.contains(n) {
                 // `r.cells` of None leaves the device's filter values alone; Some
@@ -621,6 +693,15 @@ impl Collection {
                 // validated raw text and handed straight to the serialiser.
                 st.ids.props[n as usize] =
                     RawValue::from_string(p.get().to_owned()).ok().map(Arc::new);
+                // Searchable fields follow the properties they came from: a report
+                // that replaces `props` replaces these, and one that omits it
+                // leaves both alone.
+                if !names.is_empty() {
+                    let base = n as usize * st.ids.fields;
+                    for (f, v) in text[i].iter().enumerate() {
+                        st.ids.text[base + f] = v.as_deref().map(Box::from);
+                    }
+                }
             }
         }
         self.ingested
@@ -755,6 +836,103 @@ impl Collection {
     }
 
     /// Which cluster is this device drawn as, at this zoom?
+    /// Clusters matching a text search, which is a scan rather than a lookup.
+    ///
+    /// A substring has nothing to keep a running count of, so this cannot read a
+    /// precomputed aggregate the way a declared filter does. Instead every live
+    /// device is tested and the survivors are grouped by the marker they would be
+    /// drawn as -- `representative_slot` answers that from the tree, so the
+    /// grouping is exactly the one an unfiltered query produces, restricted to
+    /// the matches. Counts and centroids are therefore exact.
+    ///
+    /// The cost is `O(devices)`, not `O(markers)`. That is the whole trade and it
+    /// is why this is a separate entry point rather than another argument to
+    /// `clusters`: nobody should reach it by accident.
+    pub fn search(
+        &self,
+        bbox: [f64; 4],
+        zoom: f64,
+        cat: i32,
+        preds: &[TextPred],
+    ) -> Vec<OutFeature> {
+        self.queries.fetch_add(1, Ordering::Relaxed);
+        if cat == NO_MATCH {
+            return Vec::new();
+        }
+        let st = self.state.read().unwrap();
+        let z = (zoom.floor() as i32).clamp(0, self.config.max_zoom as i32);
+        let (x0, y0) = netcluster::project(bbox[0], bbox[3]);
+        let (x1, y1) = netcluster::project(bbox[2], bbox[1]);
+        let (x0, x1) = (x0.min(x1), x0.max(x1));
+        let (y0, y1) = (y0.min(y1), y0.max(y1));
+
+        // marker slot -> (count, sum x, sum y, one member)
+        let mut groups: HashMap<u32, (u32, i64, i64, u64)> = HashMap::new();
+        let fields = st.ids.fields;
+        for n in 0..st.ids.to_str.len() {
+            if st.ids.last_seen[n] == u64::MAX {
+                continue; // interned once, not currently live
+            }
+            let base = n * fields;
+            if !preds
+                .iter()
+                .all(|p| p.test(st.ids.text[base + p.field].as_deref()))
+            {
+                continue;
+            }
+            let id = n as u64;
+            if cat >= 0 {
+                match st.index.cells_of(id) {
+                    Some(cells) if cells.contains(&(cat as u32)) => {}
+                    _ => continue,
+                }
+            }
+            let (Some(rep), Some((x, y))) =
+                (st.index.representative_slot(id, z), st.index.position(id))
+            else {
+                continue;
+            };
+            let e = groups.entry(rep).or_insert((0, 0, 0, id));
+            e.0 += 1;
+            e.1 += x as i64;
+            e.2 += y as i64;
+        }
+
+        let mut out = Vec::with_capacity(groups.len());
+        for (_, (count, sx, sy, member)) in groups {
+            let (mx, my) = (sx / count as i64, sy / count as i64);
+            // The marker is placed at the centroid of the matches, so the viewport
+            // test has to be against that and not the unfiltered centre.
+            if mx < x0 as i64 || mx > x1 as i64 || my < y0 as i64 || my > y1 as i64 {
+                continue;
+            }
+            let (lng, lat) = netcluster::unproject(mx as f64, my as f64);
+            out.push(if count == 1 {
+                OutFeature {
+                    lng,
+                    lat,
+                    count: 1,
+                    device: Some(st.ids.to_str[member as usize].clone()),
+                    cluster_id: None,
+                    props: st.ids.props[member as usize].clone(),
+                }
+            } else {
+                OutFeature {
+                    lng,
+                    lat,
+                    count,
+                    // A cluster of *matches* is not a node of the tree, so it has
+                    // no id to expand: getChildren would answer about the whole
+                    // cluster, including everything that did not match.
+                    device: None,
+                    cluster_id: None,
+                    props: None,
+                }
+            });
+        }
+        out
+    }
+
     pub fn device_cluster(&self, id: &str, zoom: i32) -> Option<OutFeature> {
         let st = self.state.read().unwrap();
         let &n = st.ids.to_num.get(id)?;
@@ -864,6 +1042,12 @@ impl Collection {
                 .filter_map(|p| p.as_ref().map(|v| v.get().len()))
                 .sum(),
             max_props_bytes: self.config.max_props_bytes,
+            text_bytes: st
+                .ids
+                .text
+                .iter()
+                .map(|t| t.as_ref().map_or(0, |v| v.len() + 16))
+                .sum(),
         }
     }
 

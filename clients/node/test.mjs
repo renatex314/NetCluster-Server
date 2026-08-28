@@ -631,6 +631,47 @@ await test('values can be discovered as they arrive, not declared', async () => 
   await fleet.drop();
 });
 
+await test('where searches text, and scans to do it', async () => {
+  const fleet = nc.collection('search');
+  await fleet.create({ text: ['plate', 'driver'], ttlSeconds: 0 });
+  await fleet.report([
+    // the first two share a coordinate, so they cluster at every zoom
+    { id: 's1', lng: -46.6333, lat: -23.5505, props: { plate: 'ABC-1234', driver: 'Ana' } },
+    { id: 's2', lng: -46.6333, lat: -23.5505, props: { plate: 'ABC-9999', driver: 'Bruno' } },
+    { id: 's3', lng: -46.7000, lat: -23.6000, props: { plate: 'XYZ-0001', driver: 'Ana' } },
+  ]);
+
+  const bbox = [-180, -85, 180, 85];
+  const total = (fc) => fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
+  const get = (where) => fleet.getClusters({ bbox, zoom: 16, where });
+
+  assert.equal(total(await get('plate~abc')), 2);
+  assert.equal(total(await get({ plate: 'abc' })), 2, 'the object form');
+  assert.equal(total(await get({ plate: 'ABC' })), 2, 'matching ignores case');
+  assert.equal(total(await get({ driver: { eq: 'Ana' } })), 2, 'eq is the whole value');
+  assert.equal(total(await get({ driver: { eq: 'An' } })), 0);
+  assert.equal(total(await get({ plate: 'abc', driver: 'bru' })), 1, 'terms are ANDed');
+
+  // co-located matches come back as one marker, not dropped
+  const fc = await get('plate~abc');
+  assert.equal(fc.features.length, 1);
+  assert.equal(fc.features[0].properties.point_count, 2);
+
+  // a single match names the device and keeps its props
+  const one = await get('plate~xyz');
+  assert.equal(one.features[0].id, 's3');
+  assert.equal(one.features[0].properties.plate, 'XYZ-0001');
+
+  // an undeclared field is an error, not an empty map
+  await assert.rejects(
+    () => get('vin~123'),
+    (e) => e instanceof NetClusterError && /not searchable/.test(e.message));
+
+  const st = await fleet.stats();
+  assert.ok(st.text_bytes > 0, 'stats should report what the text costs');
+  await fleet.drop();
+});
+
 await test('example.mjs exercises every public method', async () => {
   const { status, stdout, stderr } = spawnSync(
     process.execPath,

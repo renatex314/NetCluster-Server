@@ -56,6 +56,30 @@ const enc = encodeURIComponent;
  * hold several values for a `multi` dimension, but a query picks one of them --
  * "client 7" has an answer, "client 7 or 9" is two questions.
  */
+/**
+ * `where` into the query string.
+ *
+ * Accepts the string form (`'plate~abc'`) or an object; in an object, a bare
+ * value is a substring match and `{ eq: 'ABC-1234' }` is the whole value.
+ *
+ *   { plate: 'abc' }                 -> plate~abc
+ *   { plate: { eq: 'ABC-1234' } }    -> plate=ABC-1234
+ *
+ * Unlike `filter`, this scans: it is the only way to answer a substring, and it
+ * costs O(devices) rather than O(markers). See the README.
+ */
+function whereTerms(where) {
+  if (where === undefined || where === null || where === '') return null;
+  if (typeof where === 'string') return where;
+  const parts = [];
+  for (const [field, v] of Object.entries(where)) {
+    if (v === undefined || v === null || v === '') continue;
+    if (typeof v === 'object' && v.eq !== undefined) parts.push(`${field}=${v.eq}`);
+    else parts.push(`${field}~${v}`);
+  }
+  return parts.length ? parts.join(',') : null;
+}
+
 function applyFilter(q, filter) {
   if (filter === undefined || filter === null) return;
   for (const [k, v] of Object.entries(filter)) {
@@ -222,6 +246,7 @@ export class NetClusterClient {
     if (config.categories !== undefined) body.categories = config.categories;
     if (config.dimensions !== undefined) body.dimensions = config.dimensions;
     if (config.filters !== undefined) body.filters = config.filters;
+    if (config.text !== undefined) body.text = config.text;
     if (config.ttlSeconds !== undefined) body.ttl_seconds = config.ttlSeconds;
     if (config.maxPropsBytes !== undefined) body.max_props_bytes = config.maxPropsBytes;
     return this._write(`/v1/collections/${enc(name)}`, { method: 'PUT', body });
@@ -370,11 +395,13 @@ export class NetClusterClient {
    * Clusters in a bounding box, as a GeoJSON FeatureCollection.
    * @param {[number,number,number,number]} opts.bbox [west, south, east, north]
    */
-  getClusters(name, { bbox, zoom = 0, cat, filter } = {}) {
+  getClusters(name, { bbox, zoom = 0, cat, filter, where } = {}) {
     const q = new URLSearchParams({ zoom: String(zoom) });
     if (bbox) q.set('bbox', bbox.join(','));
     if (cat !== undefined && cat !== null && cat !== '') q.set('cat', String(cat));
     applyFilter(q, filter);
+    const w = whereTerms(where);
+    if (w) q.set('where', w);
     return this._read(`/v1/collections/${enc(name)}/clusters?${q}`);
   }
 

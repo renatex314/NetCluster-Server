@@ -299,7 +299,7 @@ cmd('create', {
   usage: 'create <name> [--radius 40] [--extent 512] [--max-zoom 16] [--hysteresis 0.25]\n' +
          '                      [--ttl 300] [--categories idle,enroute] [--max-props-bytes 1024]\n' +
          '                      [--dimension client=1,7,22:multi] [--dimension client=cap:4096:multi]\n' +
-         '                      [--shape client,status]\n' +
+         '                      [--shape client,status] [--text plate,driver]\n' +
          '\n' +
          '  --dimension and --shape may be repeated. A dimension is a property you filter\n' +
          '  on; add :multi if one device can hold several of its values. Use cap:N instead\n' +
@@ -341,6 +341,9 @@ cmd('create', {
         if (!values.length) throw new UsageError(`--dimension ${JSON.stringify(raw)} declares no values`);
         return { name, values, multi };
       });
+    }
+    if (flags.text !== undefined) {
+      cfg.text = String(flags.text).split(',').map((x) => x.trim()).filter(Boolean);
     }
     const shapes = list(flags, 'shape');
     if (shapes.length) {
@@ -574,22 +577,33 @@ cmd('has', {
 });
 
 cmd('clusters', {
-  usage: 'clusters <name> [--zoom 8] [--bbox w,s,e,n] [--cat X] [--filter client=7] [--limit 20]\n' +
+  usage: 'clusters <name> [--zoom 8] [--bbox w,s,e,n] [--cat X] [--filter client=7]\n' +
+         '                      [--where plate~abc] [--limit 20]\n' +
          '\n' +
          '  --filter may be repeated, and must name exactly the dimensions of one declared\n' +
-         '  shape. An undeclared combination is an error, not an empty map.',
+         '  shape. An undeclared combination is an error, not an empty map.\n' +
+         '\n' +
+         '  --where searches a declared text field: field~substring or field=value, both\n' +
+         '  ignoring case. It may be repeated, and it SCANS -- O(devices), not O(markers) --\n' +
+         '  because a substring cannot be precomputed. Use --filter where you can.',
   blurb: 'what would be drawn on the map at this zoom',
   async run(nc, [name], flags) {
     if (!name) throw new UsageError('clusters needs a collection name');
     const zoom = num(flags, 'zoom', 8);
+    const where = list(flags, 'where').join(',');
     const fc = await nc.getClusters(name, {
       zoom, bbox: parseBbox(flags.bbox), cat: flags.cat, filter: queryFilter(flags),
+      where: where || undefined,
     });
     if (out(fc, flags)) return;
     const total = fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
     const limit = num(flags, 'limit', 20);
     const rows = fc.features.slice(0, limit).map((f) => [
-      f.properties.cluster ? `cluster ${f.properties.cluster_id}` : f.id,
+      f.properties.cluster
+        ? (f.properties.cluster_id !== undefined
+            ? `cluster ${f.properties.cluster_id}`
+            : 'matches')          // a ?where= group is not a tree node; see README
+        : f.id,
       f.properties.cluster ? n(f.properties.point_count) : '1',
       f.geometry.coordinates[0].toFixed(4),
       f.geometry.coordinates[1].toFixed(4),

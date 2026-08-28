@@ -704,3 +704,115 @@ mod dim_tests {
         assert!(peek_dims(r#"{"client":1.5}"#, None, &["client"]).is_err());
     }
 }
+
+/// Pull named fields out of a properties object as plain text.
+///
+/// Separate from [`peek_dims`] because the rules differ: a dimension value must be
+/// a whole number or a label, while a searchable field is whatever it says --
+/// `1.5`, `true` and `"ABC-1234"` are all just text once you are matching
+/// substrings. Same single skip-scan, so a field nobody declared is stepped over
+/// rather than materialised.
+pub fn peek_text(raw: &str, names: &[&str]) -> Result<Vec<Option<String>>, serde_json::Error> {
+    struct Text(Option<String>);
+    impl<'de> Deserialize<'de> for Text {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Text;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    f.write_str("any scalar")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Text, E> {
+                    Ok(Text(Some(v.to_owned())))
+                }
+                fn visit_u64<E: de::Error>(self, v: u64) -> Result<Text, E> {
+                    Ok(Text(Some(v.to_string())))
+                }
+                fn visit_i64<E: de::Error>(self, v: i64) -> Result<Text, E> {
+                    Ok(Text(Some(v.to_string())))
+                }
+                fn visit_f64<E: de::Error>(self, v: f64) -> Result<Text, E> {
+                    Ok(Text(Some(v.to_string())))
+                }
+                fn visit_bool<E: de::Error>(self, v: bool) -> Result<Text, E> {
+                    Ok(Text(Some(v.to_string())))
+                }
+                fn visit_unit<E: de::Error>(self) -> Result<Text, E> {
+                    Ok(Text(None))
+                }
+                fn visit_none<E: de::Error>(self) -> Result<Text, E> {
+                    Ok(Text(None))
+                }
+                // An object or array is not something a substring search means
+                // anything over, so it reads as absent rather than as its JSON.
+                fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Text, A::Error> {
+                    while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                    Ok(Text(None))
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Text, A::Error> {
+                    while a.next_element::<IgnoredAny>()?.is_some() {}
+                    Ok(Text(None))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+
+    struct Peek<'k> {
+        names: &'k [&'k str],
+    }
+    impl<'de, 'k> DeserializeSeed<'de> for Peek<'k> {
+        type Value = Vec<Option<String>>;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+    impl<'de, 'k> Visitor<'de> for Peek<'k> {
+        type Value = Vec<Option<String>>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a properties object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
+            let mut out: Vec<Option<String>> = vec![None; self.names.len()];
+            while let Some(which) = m.next_key_seed(DimKeySeed {
+                id_key: None,
+                names: self.names,
+            })? {
+                match which {
+                    Which::Cat(i) => out[i] = m.next_value::<Text>()?.0,
+                    _ => {
+                        m.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+    let mut d = serde_json::Deserializer::from_str(raw);
+    let out = Peek { names }.deserialize(&mut d)?;
+    d.end()?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    #[test]
+    fn any_scalar_becomes_text_and_containers_do_not() {
+        let raw = r#"{"plate":"ABC-1234","speed":88.5,"n":3,"ok":true,"tags":["a"],"o":{"k":1}}"#;
+        let v = peek_text(raw, &["plate", "speed", "n", "ok", "tags", "o", "missing"]).unwrap();
+        assert_eq!(v[0].as_deref(), Some("ABC-1234"));
+        assert_eq!(v[1].as_deref(), Some("88.5"));
+        assert_eq!(v[2].as_deref(), Some("3"));
+        assert_eq!(v[3].as_deref(), Some("true"));
+        assert_eq!(v[4], None, "an array is not searchable text");
+        assert_eq!(v[5], None, "an object is not searchable text");
+        assert_eq!(v[6], None);
+    }
+
+    #[test]
+    fn a_null_reads_as_absent() {
+        assert_eq!(peek_text(r#"{"plate":null}"#, &["plate"]).unwrap()[0], None);
+    }
+}

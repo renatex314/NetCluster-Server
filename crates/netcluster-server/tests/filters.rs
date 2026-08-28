@@ -665,3 +665,263 @@ async fn values_and_capacity_are_mutually_exclusive() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
     assert!(v["error"].as_str().unwrap().contains("neither"), "{v}");
 }
+
+// ------------------------------------------------ substring search (?where=) --
+//
+// A substring has nothing to keep a running count of, so this path scans rather
+// than reading an aggregate. What it must still get right is the clustering: the
+// markers are the ones an unfiltered query would draw, restricted to the matches,
+// so counts and centroids stay exact and co-located matches stay reachable.
+
+fn searchable() -> Config {
+    Config {
+        dimensions: vec![Dimension {
+            name: "client".into(),
+            values: vec![],
+            capacity: Some(64),
+            multi: true,
+        }],
+        filters: vec![vec!["client".into()]],
+        text: vec!["plate".into(), "driver".into()],
+        ttl_seconds: 0,
+        ..Default::default()
+    }
+}
+
+async fn seed_searchable(s: &Arc<AppState>) {
+    let (st, v) = call(
+        s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": [
+            // t1 and t2 share a coordinate, so they cluster at every zoom
+            {"id":"t1","lng":-46.6333,"lat":-23.5505,"dims":{"client":["7"]},
+             "props":{"plate":"ABC-1234","driver":"Ana"}},
+            {"id":"t2","lng":-46.6333,"lat":-23.5505,"dims":{"client":["7"]},
+             "props":{"plate":"ABC-9999","driver":"Bruno"}},
+            {"id":"t3","lng":-46.7000,"lat":-23.6000,"dims":{"client":["9"]},
+             "props":{"plate":"XYZ-0001","driver":"Ana"}},
+            {"id":"t4","lng":-46.8000,"lat":-23.7000,"dims":{"client":["7"]},
+             "props":{"plate":"QQQ-5555"}},
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}
+
+#[tokio::test]
+async fn a_substring_search_finds_matches_including_co_located_ones() {
+    let s = state_with(searchable());
+    seed_searchable(&s).await;
+
+    assert_eq!(count(&s, "where=plate~abc").await, 2, "both ABC plates");
+    assert_eq!(
+        count(&s, "where=plate~ABC").await,
+        2,
+        "matching ignores case"
+    );
+    assert_eq!(count(&s, "where=plate~9999").await, 1);
+    assert_eq!(count(&s, "where=plate~nothing").await, 0);
+    assert_eq!(count(&s, "").await, 4);
+
+    // the two ABC vehicles share a coordinate, so they must come back as one
+    // marker of 2 rather than being dropped or split
+    let (_, v) = call(
+        &s,
+        "GET",
+        &format!("/v1/collections/fleet/clusters?{WORLD}&where=plate~abc"),
+        None,
+    )
+    .await;
+    let fs = v["features"].as_array().unwrap();
+    assert_eq!(fs.len(), 1, "{v}");
+    assert_eq!(fs[0]["properties"]["point_count"], 2);
+    // A group of matches is not a node of the tree, so it carries no cluster_id
+    // to expand -- and says so rather than sending null for one.
+    assert!(fs[0]["properties"].get("cluster_id").is_none(), "{v}");
+    assert_eq!(fs[0]["properties"]["expandable"], false, "{v}");
+
+    // an ordinary cluster still has one
+    let (_, v) = call(
+        &s,
+        "GET",
+        &format!("/v1/collections/fleet/clusters?{WORLD}"),
+        None,
+    )
+    .await;
+    let cluster = v["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["properties"]["cluster"] == true)
+        .expect("something should have clustered");
+    assert!(cluster["properties"]["cluster_id"].is_number(), "{cluster}");
+}
+
+#[tokio::test]
+async fn terms_combine_with_each_other_and_with_a_declared_filter() {
+    let s = state_with(searchable());
+    seed_searchable(&s).await;
+
+    assert_eq!(count(&s, "where=plate~abc,driver~bru").await, 1, "t2 only");
+    assert_eq!(
+        count(&s, "where=driver=ana").await,
+        2,
+        "exact, case-insensitive"
+    );
+    assert_eq!(
+        count(&s, "where=driver=an").await,
+        0,
+        "= is the whole value"
+    );
+
+    // a scan combined with a precomputed filter
+    assert_eq!(count(&s, "where=plate~abc&f.client=7").await, 2);
+    assert_eq!(count(&s, "where=plate~abc&f.client=9").await, 0);
+    assert_eq!(count(&s, "where=plate~xyz&f.client=9").await, 1);
+}
+
+#[tokio::test]
+async fn a_single_match_names_the_device_and_carries_its_props() {
+    let s = state_with(searchable());
+    seed_searchable(&s).await;
+    let (_, v) = call(
+        &s,
+        "GET",
+        &format!("/v1/collections/fleet/clusters?{WORLD}&where=plate~xyz"),
+        None,
+    )
+    .await;
+    let fs = v["features"].as_array().unwrap();
+    assert_eq!(fs.len(), 1);
+    assert_eq!(fs[0]["id"], "t3");
+    assert_eq!(fs[0]["properties"]["plate"], "XYZ-0001");
+}
+
+#[tokio::test]
+async fn a_device_missing_the_field_never_matches() {
+    let s = state_with(searchable());
+    seed_searchable(&s).await;
+    // t4 has a plate but no driver
+    assert_eq!(count(&s, "where=driver~a").await, 2, "Ana and Ana, not t4");
+    assert_eq!(count(&s, "where=plate~qqq").await, 1);
+    assert_eq!(count(&s, "where=plate~qqq,driver~a").await, 0);
+}
+
+#[tokio::test]
+async fn replacing_props_replaces_what_is_searchable() {
+    let s = state_with(searchable());
+    seed_searchable(&s).await;
+    assert_eq!(count(&s, "where=plate~abc").await, 2);
+
+    // re-plate t2
+    call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": [
+            {"id":"t2","lng":-46.6333,"lat":-23.5505,"props":{"plate":"DEF-0000"}}
+        ]})),
+    )
+    .await;
+    assert_eq!(
+        count(&s, "where=plate~abc").await,
+        1,
+        "t2 kept its old plate"
+    );
+    assert_eq!(count(&s, "where=plate~def").await, 1);
+    // props replaces wholesale, so the driver went with it
+    assert_eq!(count(&s, "where=driver~bru").await, 0);
+
+    // a position report that carries no props leaves the text alone
+    call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": [{"id":"t2","lng":-46.6334,"lat":-23.5506}]})),
+    )
+    .await;
+    assert_eq!(count(&s, "where=plate~def").await, 1);
+}
+
+#[tokio::test]
+async fn an_undeclared_field_is_refused_rather_than_silently_empty() {
+    let s = state_with(searchable());
+    seed_searchable(&s).await;
+    for (q, needle) in [
+        ("where=vin~123", "is not searchable"),
+        ("where=plate", "needs `field~substring`"),
+        ("where=plate~", "nothing to match"),
+    ] {
+        let (st, v) = call(
+            &s,
+            "GET",
+            &format!("/v1/collections/fleet/clusters?{WORLD}&{q}"),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{q}: {v}");
+        assert_eq!(v["code"], "bad_where", "{q}: {v}");
+        assert!(v["error"].as_str().unwrap().contains(needle), "{q}: {v}");
+    }
+}
+
+#[tokio::test]
+async fn tiles_refuse_a_search_rather_than_serving_it_unfiltered() {
+    let s = state_with(searchable());
+    seed_searchable(&s).await;
+    let (st, v) = call(
+        &s,
+        "GET",
+        "/v1/collections/fleet/tiles/10/379/580.json?where=plate~abc",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "where_not_supported", "{v}");
+}
+
+#[tokio::test]
+async fn a_search_agrees_with_brute_force_at_every_zoom() {
+    // The grouping has to be the one an unfiltered query would produce, restricted
+    // to the matches -- so the totals must equal a direct count of the matching
+    // devices, whatever the zoom does to the markers.
+    let s = state_with(searchable());
+    let mut pts = Vec::new();
+    for i in 0..400 {
+        pts.push(json!({
+            "id": format!("v{i}"),
+            "lng": -46.63 + ((i % 20) as f64) * 0.01,
+            "lat": -23.55 + ((i / 20) as f64) * 0.01,
+            "props": {"plate": format!("{}{:04}", if i % 3 == 0 { "ABC" } else { "XYZ" }, i)}
+        }));
+    }
+    let (st, _) = call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({ "points": pts })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let want = (0..400).filter(|i| i % 3 == 0).count() as i64;
+    for z in [0, 4, 8, 12, 16] {
+        let (_, v) = call(
+            &s,
+            "GET",
+            &format!(
+                "/v1/collections/fleet/clusters?bbox=-180,-85,180,85&zoom={z}&where=plate~abc"
+            ),
+            None,
+        )
+        .await;
+        let got: i64 = v["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["properties"]["point_count"].as_i64().unwrap_or(1))
+            .sum();
+        assert_eq!(got, want, "zoom {z}");
+    }
+}

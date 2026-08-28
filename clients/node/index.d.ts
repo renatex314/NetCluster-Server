@@ -60,6 +60,12 @@ export interface CollectionConfig {
    * declared shape is a 400, never a silent scan.
    */
   filters?: string[][];
+  /**
+   * Property fields that `where` can search. Each costs one string per device,
+   * extracted from `props` at ingest, so a scan never parses JSON. Adding one
+   * later means recreating the collection.
+   */
+  text?: string[];
   /** Drop a device that has not reported for this long. 0 disables expiry. */
   ttlSeconds?: number;
   /**
@@ -224,6 +230,20 @@ export interface QueryOptions {
    * caller cannot know which values exist.
    */
   filter?: Record<string, string | number>;
+  /**
+   * Substring search over a declared text field. `'plate~abc'`, or an object
+   * where a bare value is a substring and `{ eq }` is the whole value:
+   *
+   * ```ts
+   * { plate: 'abc' }                // plate~abc
+   * { plate: { eq: 'ABC-1234' } }   // plate=ABC-1234
+   * ```
+   *
+   * Matching ignores case. Unlike `filter`, this **scans**: a substring has
+   * nothing to keep a running count of, so it costs O(devices) rather than
+   * O(markers). Reach for `filter` whenever the values can be declared.
+   */
+  where?: string | Record<string, string | number | { eq: string | number }>;
 }
 
 /** The filter half of {@link QueryOptions}, for tiles. */

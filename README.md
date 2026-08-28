@@ -203,7 +203,7 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson) |
 | `DELETE /v1/collections/{name}/devices/{id}` | remove one device |
 | `GET .../devices/{id}` | is it registered? 200 with position, category and staleness, or 404 (`HEAD` for a bare check) |
-| `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON; `?f.<name>=` for declared dimensions |
+| `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON; `?f.<name>=` for declared dimensions, `?where=` to search text |
 | `GET .../tiles/{z}/{x}/{y}.mvt` | vector tile (`.json` for tile-space GeoJSON) |
 | `GET .../devices/{id}/cluster?zoom=` | which marker contains this device |
 | `GET .../clusters/{id}/children` | one expansion step, plus `expansion_zoom` |
@@ -360,9 +360,29 @@ the compact form, or in `properties` under the dimension's own name in GeoJSON,
 and re-reporting a device with different values **re-files it** even if it has not
 moved: a status change never moves the vehicle.
 
-Each declared shape is a separate aggregate, which is what filtering costs. Still
-out of reach: substring search, ranges, `OR` across values, and anything read out
-of `props`.
+Each declared shape is a separate aggregate, which is what filtering costs.
+
+A **substring** cannot be precomputed, so it gets its own query, which scans.
+Declare the fields it may search and they are extracted from `props` at ingest:
+
+```bash
+curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/json' \
+  -d '{"text": ["plate", "driver"]}'
+
+curl 'localhost:8080/v1/collections/fleet/clusters?bbox=…&zoom=12&where=plate~abc'
+curl 'localhost:8080/v1/collections/fleet/clusters?bbox=…&zoom=12&where=plate~abc,driver=ana&f.client=7'
+```
+
+`~` is a substring and `=` the whole value, both ignoring case; terms are ANDed
+and combine with `?f.`. Results cluster exactly as an unfiltered query would,
+restricted to the matches. **It costs `O(devices)`, not `O(markers)`** — about
+1.5 ms over a 180,000-device fleet, against a lookup that stays flat however large
+the fleet grows. Use a dimension whenever the values can be declared and keep
+`where` for the search box. Not available on tiles, which refuse it rather than
+serving an unfiltered one.
+
+Still out of reach: ranges, `OR` across values, and anything in `props` that is
+not a declared text field.
 
 **A field whose distinct values never stop growing** is out too, at any capacity —
 a per-trip or per-order id. Every shape holds a running total per combination per
@@ -396,6 +416,7 @@ curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/js
 | `hysteresis` | `0.25` | how far an assignment stretches before a point is re-homed |
 | `categories` | `[]` | filter labels; a label's position in the list is its index. Shorthand for one dimension named `cat` |
 | `dimensions` | `[]` | properties you can filter on: `{"name", "values" \| "capacity", "multi"}`. Set this or `categories`, never both |
+| `text` | `[]` | property fields `?where=` may search; each costs one string per device |
 | `filters` | one per dimension | combinations a query may name, e.g. `[["client"],["status"],["client","status"]]` |
 | `max_props_bytes` | `1024` | largest per-device `props` blob; 0 refuses properties |
 | `ttl_seconds` | `300` | drop a device that has not reported for this long |
