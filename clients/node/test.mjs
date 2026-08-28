@@ -595,6 +595,42 @@ await test('GeoJSON ingest reads the same values out of properties', async () =>
   assert.equal(d.props.plate, 'ABC1234');
 });
 
+await test('values can be discovered as they arrive, not declared', async () => {
+  // Client ids are auto-increment and run into the millions; only a handful of
+  // clients are live. `capacity` interns them on first sight, so the ceiling is
+  // how many coexist, not how large an id can get.
+  const fleet = nc.collection('dyn');
+  await fleet.create({
+    dimensions: [
+      { name: 'client', capacity: 64, multi: true },
+      { name: 'status', values: ['idle', 'enroute'] },
+    ],
+    filters: [['client'], ['status'], ['client', 'status']],
+    ttlSeconds: 0,
+  });
+  await fleet.report([
+    { id: 'a', lng: -46.63, lat: -23.55, dims: { client: ['3', '1284339'], status: 'enroute' } },
+    { id: 'b', lng: -46.64, lat: -23.56, dims: { client: ['1284339'], status: 'idle' } },
+  ]);
+
+  const bbox = [-180, -85, 180, 85];
+  const total = (fc) => fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 1284339 } })), 2);
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 3 } })), 1);
+  assert.equal(
+    total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 1284339, status: 'idle' } })), 1);
+
+  // a client nothing has reported is an empty map, not an error and not the fleet
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 999 } })), 0);
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16 })), 2);
+
+  // a declared dimension still rejects an unknown value
+  await assert.rejects(
+    () => fleet.getClusters({ bbox, zoom: 16, filter: { status: 'exploded' } }),
+    (e) => e instanceof NetClusterError && /unknown value/.test(e.message));
+  await fleet.drop();
+});
+
 await test('example.mjs exercises every public method', async () => {
   const { status, stdout, stderr } = spawnSync(
     process.execPath,

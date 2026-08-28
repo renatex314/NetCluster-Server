@@ -72,11 +72,20 @@ export interface CollectionConfig {
   maxPropsBytes?: number;
 }
 
-/** One filterable property, and the values it can take. */
+/**
+ * One filterable property, and the values it can take.
+ *
+ * Give it `values` when you know them, or `capacity` when you do not. With
+ * `capacity` the values are interned as they arrive, so the ceiling is how many
+ * distinct ones may coexist rather than how large an id may get — auto-increment
+ * client ids running into the millions are fine behind `capacity: 4096`.
+ */
 export interface Dimension {
   name: string;
   /** Value labels; a label's position in this list is its value index. */
-  values: string[];
+  values?: string[];
+  /** How many distinct values may exist, when they are not known up front. */
+  capacity?: number;
   /** May one device hold several of these at once? Default false. */
   multi?: boolean;
 }
@@ -209,8 +218,10 @@ export interface QueryOptions {
    * `{ client: 7, status: 'enroute' }`. Sent as `?f.client=7&f.status=enroute`.
    *
    * A device may hold several values for a `multi` dimension, but a query names
-   * one of them. Naming an undeclared combination, dimension or value is a 400,
-   * not an empty result.
+   * one of them. An undeclared combination or dimension is a 400. A *value* is
+   * a 400 only on a dimension whose values were declared: on one with a
+   * `capacity`, a value nothing has reported yet is an empty result, because the
+   * caller cannot know which values exist.
    */
   filter?: Record<string, string | number>;
 }

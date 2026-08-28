@@ -7,7 +7,7 @@
 //! all*, and because a tile key is stable, an HTTP cache in front of this actually
 //! hits. At coarse zooms one query serves every viewer looking at that region.
 
-use crate::collection::{Collection, Config, OutFeature, Report};
+use crate::collection::{Collection, Config, OutFeature, Report, NO_MATCH};
 use crate::geojson::{peek_dims, peek_props, CatVal, DimVal, GeoFeature};
 use crate::mvt;
 use crate::schema::Dimension;
@@ -598,7 +598,10 @@ fn parse_filter(c: &Collection, q: &HashMap<String, String>) -> ApiResult<i32> {
         }
         return c
             .filter_cell(&sel)
-            .map_err(|e| ApiError::bad(e).code("bad_filter"));
+            .map_err(|e| ApiError::bad(e).code("bad_filter"))
+            // A value nothing has ever reported: a legitimate empty answer, so it
+            // becomes a cell no device can be in rather than an error.
+            .map(|cell| cell.unwrap_or(NO_MATCH));
     }
     c.category(q.get("cat").map(|s| s.as_str()))
         .map_err(|e| ApiError::bad(e).code("bad_filter"))
@@ -638,7 +641,7 @@ fn compact_cells(
         return Ok(None);
     }
     let mut out = Vec::new();
-    c.schema.cells_for(vals, &mut out)?;
+    c.cells_for_report(vals, &mut out)?;
     Ok(Some(out))
 }
 
@@ -791,7 +794,7 @@ async fn positions(
                     continue;
                 }
                 let mut out = Vec::new();
-                c.schema.cells_for(&vals, &mut out).map_err(|e| {
+                c.cells_for_report(&vals, &mut out).map_err(|e| {
                     ApiError::bad(format!("features[{i}]: {e}")).code("bad_geojson")
                 })?;
                 cell_store.push(Some(out));

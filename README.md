@@ -347,6 +347,13 @@ curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/js
 curl 'localhost:8080/v1/collections/fleet/clusters?bbox=-47,-24,-46,-23&zoom=12&f.client=7&f.status=enroute'
 ```
 
+A dimension takes either `values` (the labels) or `capacity` (how many distinct
+ones may exist), so you do not have to know every client id up front — with a
+capacity they are interned as they arrive, and the ceiling is how many can coexist
+rather than how large an id can get. On such a dimension a value nothing has
+reported yet is an empty result rather than a 400, since the server cannot tell it
+from a client that has not started reporting.
+
 `multi` lets one device hold several values for a dimension — a vehicle owned by
 three clients — which a single category cannot express. Values ride in `dims` on
 the compact form, or in `properties` under the dimension's own name in GeoJSON,
@@ -380,7 +387,7 @@ curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/js
 | `max_zoom` | `16` | finest zoom the index resolves; queries are clamped to it, so points closer than the radius at this zoom (~44 m at the defaults) always return as a cluster |
 | `hysteresis` | `0.25` | how far an assignment stretches before a point is re-homed |
 | `categories` | `[]` | filter labels; a label's position in the list is its index. Shorthand for one dimension named `cat` |
-| `dimensions` | `[]` | properties you can filter on: `{"name", "values", "multi"}`. Set this or `categories`, never both |
+| `dimensions` | `[]` | properties you can filter on: `{"name", "values" \| "capacity", "multi"}`. Set this or `categories`, never both |
 | `filters` | one per dimension | combinations a query may name, e.g. `[["client"],["status"],["client","status"]]` |
 | `max_props_bytes` | `1024` | largest per-device `props` blob; 0 refuses properties |
 | `ttl_seconds` | `300` | drop a device that has not reported for this long |

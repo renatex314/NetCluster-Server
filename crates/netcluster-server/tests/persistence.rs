@@ -7,6 +7,7 @@
 
 use netcluster_server::collection::{Collection, Config, Report};
 use netcluster_server::snapshot;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -20,6 +21,11 @@ fn tmpdir(tag: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// No dynamic dimensions in these tests, so nothing was interned to carry over.
+fn meta_labels() -> Vec<Vec<String>> {
+    Vec::new()
 }
 
 fn cfg(categories: &[&str], ttl: u64) -> Config {
@@ -92,7 +98,8 @@ fn a_restored_collection_holds_the_same_devices() {
     assert_eq!(meta.config, cfg(&cats, 0), "config must survive");
     assert_eq!(records.len(), expected.len());
 
-    let (restored, skipped) = Collection::restore(&meta.name, meta.config, &records);
+    let (restored, skipped) =
+        Collection::restore(&meta.name, meta.config, &meta_labels(), &records);
     assert_eq!(skipped, 0, "ttl is 0, nothing should be skipped");
     assert_eq!(restored.len(), expected.len());
 
@@ -152,7 +159,7 @@ fn repeated_restores_do_not_drift() {
         let path = snapshot::path_for(&dir, "fleet");
         c.snapshot_to(&path).unwrap();
         let (meta, records) = snapshot::read(&path).unwrap();
-        c = Collection::restore(&meta.name, meta.config, &records).0;
+        c = Collection::restore(&meta.name, meta.config, &meta_labels(), &records).0;
         let d = c.device("still").unwrap();
         assert_eq!(d.lng, first.lng, "longitude drifted by round {round}");
         assert_eq!(d.lat, first.lat, "latitude drifted by round {round}");
@@ -198,13 +205,13 @@ fn records_past_the_ttl_are_not_restored() {
             props: None,
         },
     ];
-    let (c, skipped) = Collection::restore("fleet", cfg(&[], 60), &records);
+    let (c, skipped) = Collection::restore("fleet", cfg(&[], 60), &meta_labels(), &records);
     assert_eq!(skipped, 2, "stale and ancient should have been dropped");
     assert!(c.contains("fresh") && c.contains("recent"));
     assert!(!c.contains("stale") && !c.contains("ancient"));
 
     // ttl 0 disables expiry, so everything comes back
-    let (c2, skipped2) = Collection::restore("fleet", cfg(&[], 0), &records);
+    let (c2, skipped2) = Collection::restore("fleet", cfg(&[], 0), &meta_labels(), &records);
     assert_eq!(skipped2, 0);
     assert_eq!(c2.len(), 4);
 }
@@ -233,7 +240,7 @@ fn a_shrunken_category_list_does_not_take_the_process_down() {
             props: None,
         },
     ];
-    let (c, _) = Collection::restore("fleet", cfg(&["only-one"], 0), &records);
+    let (c, _) = Collection::restore("fleet", cfg(&["only-one"], 0), &meta_labels(), &records);
     assert_eq!(c.len(), 2, "both devices should still be here");
     assert_eq!(
         c.device("b").unwrap().cat_index,
@@ -243,7 +250,7 @@ fn a_shrunken_category_list_does_not_take_the_process_down() {
     c.verify().unwrap();
 
     // and with categories removed entirely
-    let (c2, _) = Collection::restore("fleet", cfg(&[], 0), &records);
+    let (c2, _) = Collection::restore("fleet", cfg(&[], 0), &meta_labels(), &records);
     assert_eq!(c2.len(), 2);
     c2.verify().unwrap();
 }
@@ -318,7 +325,7 @@ fn snapshots_during_heavy_writes_stay_consistent() {
         c.snapshot_to(&path).unwrap();
         let (meta, records) = snapshot::read(&path).unwrap();
         assert_eq!(records.len(), 5000, "round {round}: lost devices mid-write");
-        let (restored, _) = Collection::restore(&meta.name, meta.config, &records);
+        let (restored, _) = Collection::restore(&meta.name, meta.config, &meta_labels(), &records);
         restored
             .verify()
             .unwrap_or_else(|e| panic!("round {round}: restored index is broken: {e}"));
@@ -360,7 +367,7 @@ fn properties_survive_a_snapshot_and_a_v1_file_still_loads() {
     let path = snapshot::path_for(&dir, "fleet");
     c.snapshot_to(&path).unwrap();
     let (meta, records) = snapshot::read(&path).unwrap();
-    let (restored, _) = Collection::restore(&meta.name, meta.config, &records);
+    let (restored, _) = Collection::restore(&meta.name, meta.config, &meta_labels(), &records);
 
     let d = restored.device("truck-1").unwrap();
     let got: serde_json::Value = serde_json::from_str(d.props.unwrap().get()).unwrap();
@@ -376,6 +383,7 @@ fn properties_survive_a_snapshot_and_a_v1_file_still_loads() {
     buf.extend_from_slice(b"NCSNAP");
     buf.extend_from_slice(&1u16.to_le_bytes());
     let meta_json = serde_json::to_vec(&snapshot::Meta {
+        labels: Vec::new(),
         name: "legacy".into(),
         config: cfg(&[], 0),
     })
@@ -402,4 +410,103 @@ fn properties_survive_a_snapshot_and_a_v1_file_still_loads() {
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].id, "old");
     assert_eq!(r[0].props, None, "version 1 has no properties to report");
+}
+
+#[test]
+fn interned_values_survive_a_snapshot() {
+    // Records carry cell integers. On a dynamic dimension those integers mean
+    // nothing without the table that handed them out, so if the snapshot loses it
+    // every device comes back filed under whichever client reported first --
+    // silently, and wrong in exactly the way nobody notices until a customer sees
+    // another customer's vehicles.
+    let dir = tmpdir("interned");
+    let cfg = Config {
+        dimensions: vec![
+            netcluster_server::schema::Dimension {
+                name: "client".into(),
+                values: vec![],
+                capacity: Some(64),
+                multi: true,
+            },
+            netcluster_server::schema::Dimension {
+                name: "status".into(),
+                values: vec!["idle".into(), "enroute".into()],
+                capacity: None,
+                multi: false,
+            },
+        ],
+        filters: vec![
+            vec!["client".into()],
+            vec!["status".into()],
+            vec!["client".into(), "status".into()],
+        ],
+        ttl_seconds: 0,
+        ..Default::default()
+    };
+    let c = Collection::new("fleet", cfg.clone());
+
+    // ids nowhere near their indices, and interned in a deliberate order
+    let ids = ["900001", "12", "44417", "7"];
+    for (i, cid) in ids.iter().enumerate() {
+        let mut vals = HashMap::new();
+        vals.insert("client".to_string(), vec![cid.to_string()]);
+        vals.insert("status".to_string(), vec!["enroute".to_string()]);
+        let mut cells = Vec::new();
+        c.cells_for_report(&vals, &mut cells).unwrap();
+        c.upsert(&[Report {
+            id: &format!("v{i}"),
+            lng: -46.63 + i as f64 * 0.01,
+            lat: -23.55,
+            props: None,
+            cells: Some(&cells),
+        }])
+        .unwrap();
+    }
+
+    let counts = |c: &Collection| -> Vec<usize> {
+        ids.iter()
+            .map(|cid| {
+                let mut sel = HashMap::new();
+                sel.insert("client".to_string(), cid.to_string());
+                let cell = c.filter_cell(&sel).unwrap().expect("value was reported");
+                c.clusters([-180.0, -85.0, 180.0, 85.0], 16.0, cell).len()
+            })
+            .collect()
+    };
+    assert_eq!(counts(&c), vec![1, 1, 1, 1]);
+
+    let path = snapshot::path_for(&dir, "fleet");
+    c.snapshot_to(&path).unwrap();
+    let (meta, records) = snapshot::read(&path).unwrap();
+    assert!(
+        !meta.labels.is_empty() && meta.labels[0].len() == 4,
+        "the snapshot must carry the interned labels, got {:?}",
+        meta.labels
+    );
+
+    let (restored, _) = Collection::restore(&meta.name, meta.config, &meta.labels, &records);
+    assert_eq!(restored.len(), 4);
+    assert_eq!(
+        counts(&restored),
+        vec![1, 1, 1, 1],
+        "a client's vehicles moved"
+    );
+
+    // each client still finds its own vehicle, not somebody else's
+    for (i, cid) in ids.iter().enumerate() {
+        let mut sel = HashMap::new();
+        sel.insert("client".to_string(), cid.to_string());
+        let cell = restored.filter_cell(&sel).unwrap().unwrap();
+        let fs = restored.clusters([-180.0, -85.0, 180.0, 85.0], 16.0, cell);
+        assert_eq!(
+            fs[0].device.as_deref(),
+            Some(format!("v{i}").as_str()),
+            "client {cid} came back holding the wrong vehicle"
+        );
+    }
+
+    // a value nobody reported is empty, not everything
+    let mut sel = HashMap::new();
+    sel.insert("client".to_string(), "555".to_string());
+    assert!(restored.filter_cell(&sel).unwrap().is_none());
 }

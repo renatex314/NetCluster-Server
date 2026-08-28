@@ -1,6 +1,6 @@
 {
   "name": "netcluster-client",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Node client and CLI for netcluster-server: report moving positions, read clustered vector tiles.",
   "type": "module",
   "main": "./index.js",

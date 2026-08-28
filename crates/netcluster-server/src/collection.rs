@@ -23,8 +23,12 @@
 //! are wrong. Shard by collection (fleet A, fleet B), never by region, and size a
 //! process so that one collection fits in it.
 
-use crate::schema::{Dimension, Schema};
+use crate::schema::{Dimension, Interner, Interning, Looking, Schema};
 use crate::snapshot::DeviceRecord;
+
+/// The cell of a query that cannot match anything. Distinct from -1, which means
+/// "no filter at all" -- confusing the two would show the whole fleet.
+pub const NO_MATCH: i32 = -2;
 use netcluster::{Feature, NetCluster, Options};
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -157,6 +161,13 @@ pub struct Collection {
     /// this a device reported without values would hold no cells and vanish from
     /// every filter while still appearing unfiltered.
     default_cells: Vec<u32>,
+    /// Value indices for dimensions declared with a `capacity` rather than a list.
+    ///
+    /// Its own lock rather than the index's: interning happens while resolving a
+    /// batch, before the index is touched at all, and a query needs it for a few
+    /// microseconds before taking the read lock. The two are never held together,
+    /// and always in this order.
+    interner: RwLock<Interner>,
     state: RwLock<Inner>,
     pub created_ms: u64,
     pub ingested: AtomicU64,
@@ -288,6 +299,7 @@ impl Config {
                 vec![Dimension {
                     name: "cat".into(),
                     values: self.categories.clone(),
+                    capacity: None,
                     multi: false,
                 }]
             }
@@ -313,14 +325,23 @@ impl Collection {
             max_cells_per_device: schema.max_cells_per_device,
             ..Default::default()
         });
+        let mut interner = Interner::new(&schema);
         let mut default_cells = Vec::new();
         schema
-            .cells_for(&HashMap::new(), &mut default_cells)
+            .cells_for(
+                &HashMap::new(),
+                &mut default_cells,
+                &mut Interning {
+                    schema: &schema,
+                    interner: &mut interner,
+                },
+            )
             .expect("value 0 exists in every declared dimension");
         Collection {
             name: name.to_string(),
             schema,
             default_cells,
+            interner: RwLock::new(interner),
             config,
             state: RwLock::new(Inner {
                 index,
@@ -346,8 +367,16 @@ impl Collection {
     /// Returns the collection and how many records were dropped for being older
     /// than the TTL -- a snapshot from long enough ago restores nothing, which is
     /// correct: those devices went quiet and would be swept within seconds anyway.
-    pub fn restore(name: &str, config: Config, records: &[DeviceRecord]) -> (Self, usize) {
+    pub fn restore(
+        name: &str,
+        config: Config,
+        labels: &[Vec<String>],
+        records: &[DeviceRecord],
+    ) -> (Self, usize) {
         let c = Collection::new(name, config);
+        // Before any record: the cells about to be restored are indices into this
+        // table, so it has to be the one that produced them.
+        *c.interner.write().unwrap() = Interner::restore(&c.schema, labels);
         let cutoff = if c.config.ttl_seconds > 0 {
             now_ms().saturating_sub(c.config.ttl_seconds * 1000)
         } else {
@@ -430,6 +459,7 @@ impl Collection {
         let meta = crate::snapshot::Meta {
             name: self.name.clone(),
             config: self.config.clone(),
+            labels: self.interner.read().unwrap().labels(),
         };
         match crate::snapshot::write(path, &meta, &records) {
             Ok(n) => {
@@ -465,17 +495,57 @@ impl Collection {
         // Reworded rather than passed through: `?cat=` is the published spelling
         // and its error text is what clients match on. The schema underneath calls
         // the same thing a dimension value.
-        self.schema.query_cell(&one).map_err(|_| {
-            format!(
+        match self.filter_cell(&one) {
+            Ok(Some(c)) => Ok(c),
+            // `categories` are always declared, so "never seen" cannot arise here
+            Ok(None) => Ok(NO_MATCH),
+            Err(_) => Err(format!(
                 "unknown category {sel:?}; this collection has {:?}",
                 self.config.categories
-            )
-        })
+            )),
+        }
     }
 
-    /// The cell a `?f.name=value` selection picks, or -1 for everything.
-    pub fn filter_cell(&self, sel: &HashMap<String, String>) -> Result<i32, String> {
-        self.schema.query_cell(sel)
+    /// The cell a `?f.name=value` selection picks.
+    ///
+    /// `Ok(None)` means no device can match: the query named a value on a dynamic
+    /// dimension that nothing has ever reported. That is an empty map rather than
+    /// an error -- on a dimension whose values are discovered as devices arrive,
+    /// a caller cannot know which exist yet.
+    pub fn filter_cell(&self, sel: &HashMap<String, String>) -> Result<Option<i32>, String> {
+        let interner = self.interner.read().unwrap();
+        self.schema.query_cell(
+            sel,
+            &mut Looking {
+                schema: &self.schema,
+                interner: &interner,
+            },
+        )
+    }
+
+    /// Resolve a report's values to cells, interning any that are new.
+    pub fn cells_for_report(
+        &self,
+        vals: &HashMap<String, Vec<String>>,
+        out: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        let mut interner = self.interner.write().unwrap();
+        self.schema.cells_for(
+            vals,
+            out,
+            &mut Interning {
+                schema: &self.schema,
+                interner: &mut interner,
+            },
+        )
+    }
+
+    /// How many distinct values each dynamic dimension has seen.
+    pub fn interned(&self) -> Vec<usize> {
+        let interner = self.interner.read().unwrap();
+        (0..self.schema.dims.len())
+            .map(|d| interner.len(d))
+            .collect()
     }
 
     pub fn upsert(&self, reports: &[Report<'_>]) -> Result<usize, String> {
@@ -615,6 +685,12 @@ impl Collection {
 
     pub fn clusters(&self, bbox: [f64; 4], zoom: f64, cat: i32) -> Vec<OutFeature> {
         self.queries.fetch_add(1, Ordering::Relaxed);
+        // The index reads any negative cell as "no filter", so NO_MATCH has to be
+        // caught here. Letting it through would answer "which vehicles belong to
+        // this client nobody has heard of" with the entire fleet.
+        if cat == NO_MATCH {
+            return Vec::new();
+        }
         let st = self.state.read().unwrap();
         st.index
             .get_clusters(bbox, zoom, cat)
@@ -652,6 +728,9 @@ impl Collection {
 
     pub fn tile(&self, z: i32, x: i64, y: i64, cat: i32) -> Vec<OutTileFeature> {
         self.queries.fetch_add(1, Ordering::Relaxed);
+        if cat == NO_MATCH {
+            return Vec::new(); // see clusters()
+        }
         let st = self.state.read().unwrap();
         st.index
             .get_tile(z, x, y, cat)

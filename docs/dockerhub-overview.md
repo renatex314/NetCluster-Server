@@ -82,8 +82,9 @@ in `categories` instead, which is indexed.
 
 Filters are declared up front and matched exactly. `categories` gives you one;
 `dimensions` plus `filters` gives you several that **combine**
-(`?f.client=7&f.status=enroute`), and `multi` lets one device hold several values
-for a dimension. Still out of reach: substring search, ranges, `OR` across values,
+(`?f.client=7&f.status=enroute`), `multi` lets one device hold several values for
+a dimension, and a dimension declared with `capacity` instead of `values` interns
+them as they arrive, so you need not know the ids up front. Still out of reach: substring search, ranges, `OR` across values,
 and anything in `props`. Note too that `clusters` is not a device listing:
 co-located devices come back as one cluster with no id and no props at every
 zoom.

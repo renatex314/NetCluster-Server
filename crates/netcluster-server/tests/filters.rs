@@ -19,6 +19,7 @@ fn dim(name: &str, values: &[&str], multi: bool) -> Dimension {
     Dimension {
         name: name.into(),
         values: values.iter().map(|s| s.to_string()).collect(),
+        capacity: None,
         multi,
     }
 }
@@ -471,4 +472,196 @@ async fn tiles_take_the_same_filter() {
         })
         .unwrap_or(0);
     assert_eq!(n, 1, "only the client-7 vehicle: {v}");
+}
+
+// ---------------------------------------- values discovered as they arrive --
+//
+// Client ids are auto-increment and run into the millions, but only a few
+// thousand clients are ever live. Declaring `capacity` interns them on first
+// sight, so the ceiling is how many can coexist rather than how large an id can
+// get -- 1284339 is a perfectly ordinary value here.
+
+fn dynamic_config(capacity: usize) -> Config {
+    Config {
+        dimensions: vec![
+            Dimension {
+                name: "client".into(),
+                values: vec![],
+                capacity: Some(capacity),
+                multi: true,
+            },
+            dim("status", &["idle", "enroute"], false),
+        ],
+        filters: vec![
+            vec!["client".into()],
+            vec!["status".into()],
+            vec!["client".into(), "status".into()],
+        ],
+        ttl_seconds: 0,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn values_are_interned_on_first_sight_and_ids_may_be_huge() {
+    let s = state_with(dynamic_config(64));
+    let (st, v) = call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": [
+            {"id":"a","lng":-46.63,"lat":-23.55,"dims":{"client":["3","1284339"],"status":"enroute"}},
+            {"id":"b","lng":-46.64,"lat":-23.56,"dims":{"client":["1284339"],"status":"idle"}},
+            {"id":"c","lng":-46.65,"lat":-23.57,"dims":{"client":["99999999"],"status":"enroute"}},
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    assert_eq!(count(&s, "f.client=1284339").await, 2);
+    assert_eq!(count(&s, "f.client=3").await, 1);
+    assert_eq!(count(&s, "f.client=99999999").await, 1);
+    assert_eq!(count(&s, "f.client=1284339&f.status=enroute").await, 1);
+    assert_eq!(count(&s, "").await, 3);
+}
+
+#[tokio::test]
+async fn a_value_nothing_has_reported_is_an_empty_map_not_the_whole_fleet() {
+    // The dangerous one. The index reads any negative cell as "no filter", so a
+    // never-seen value that fell through would answer "which vehicles belong to
+    // this client I have never heard of" with every vehicle there is.
+    let s = state_with(dynamic_config(64));
+    call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": [
+            {"id":"a","lng":-46.63,"lat":-23.55,"dims":{"client":["7"],"status":"idle"}},
+            {"id":"b","lng":-46.64,"lat":-23.56,"dims":{"client":["7"],"status":"idle"}},
+        ]})),
+    )
+    .await;
+    assert_eq!(count(&s, "").await, 2);
+    assert_eq!(count(&s, "f.client=7").await, 2);
+
+    for q in [
+        "f.client=404",
+        "f.client=404&f.status=idle",
+        "f.status=idle&f.client=404",
+    ] {
+        let (st, v) = call(
+            &s,
+            "GET",
+            &format!("/v1/collections/fleet/clusters?{WORLD}&{q}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "{q} should be a legitimate empty answer: {v}"
+        );
+        assert_eq!(
+            v["features"].as_array().unwrap().len(),
+            0,
+            "{q} returned {v}"
+        );
+    }
+
+    // and a tile for the same query is empty rather than the whole tile
+    let (st, v) = call(
+        &s,
+        "GET",
+        "/v1/collections/fleet/tiles/10/379/580.json?f.client=404",
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["features"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn exhausting_the_capacity_is_loud() {
+    let s = state_with(dynamic_config(3));
+    let pts: Vec<_> = (0..3)
+        .map(|i| {
+            json!({"id": format!("v{i}"), "lng": -46.63, "lat": -23.55,
+                        "dims": {"client": [format!("{}", i * 1000)]}})
+        })
+        .collect();
+    let (st, v) = call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": pts})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    let (st, v) = call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": [
+            {"id":"one-too-many","lng":-46.63,"lat":-23.55,"dims":{"client":["4000"]}}
+        ]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("capacity"), "{v}");
+    // and the batch was refused rather than half-applied
+    assert_eq!(count(&s, "").await, 3);
+}
+
+#[tokio::test]
+async fn a_known_value_keeps_working_after_the_cap_is_hit() {
+    let s = state_with(dynamic_config(2));
+    call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": [
+            {"id":"a","lng":-46.63,"lat":-23.55,"dims":{"client":["10"]}},
+            {"id":"b","lng":-46.64,"lat":-23.56,"dims":{"client":["20"]}},
+        ]})),
+    )
+    .await;
+    // full, but the values already interned still resolve, and still ingest
+    let (st, _) = call(
+        &s,
+        "POST",
+        "/v1/collections/fleet/positions",
+        Some(json!({"points": [{"id":"c","lng":-46.65,"lat":-23.57,"dims":{"client":["10"]}}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(count(&s, "f.client=10").await, 2);
+}
+
+#[tokio::test]
+async fn values_and_capacity_are_mutually_exclusive() {
+    let s = state_with(Config::default());
+    let (st, v) = call(
+        &s,
+        "PUT",
+        "/v1/collections/bad",
+        Some(json!({"dimensions": [{"name": "client", "values": ["1"], "capacity": 10}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("not both"), "{v}");
+
+    let (st, v) = call(
+        &s,
+        "PUT",
+        "/v1/collections/bad2",
+        Some(json!({"dimensions": [{"name": "client"}]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("neither"), "{v}");
 }

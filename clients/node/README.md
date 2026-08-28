@@ -134,6 +134,43 @@ await fleet.create({
 });
 ```
 
+### When you don't know the values
+
+You rarely know every client id up front, and auto-increment ids climb far past
+however many clients you have. Give a `capacity` instead of a list and the values
+are **interned** — each one seen for the first time takes the next free index:
+
+```js
+{ name: 'client', capacity: 4096, multi: true }
+```
+
+The ceiling is how many distinct values can *coexist*, not how large an id can
+get, so ids in the millions are unremarkable:
+
+```js
+await fleet.report([
+  { id: 'truck-1', lng, lat, dims: { client: ['1284339'], status: 'enroute' } },
+]);
+await fleet.getClusters({ bbox, zoom, filter: { client: 1284339 } });
+```
+
+Two consequences worth knowing:
+
+- **A value nothing has reported yet is an empty result, not an error.** On a
+  declared list a bad value is a 400 and catches your typo; on a `capacity`
+  dimension the server cannot tell a typo from a client whose first vehicle has
+  not reported. Dimension *names* are still checked either way.
+- **Running out is loud.** The device that would need value 4097 is refused by
+  name rather than quietly bucketed with someone else. Size it generously — an
+  unused ceiling costs nothing, because memory tracks the values that actually
+  occur.
+
+Interning is per-process: two replicas fed the same stream may give a client
+different internal indices, which is harmless (a name is resolved against the same
+table that answers the query) and is why snapshots carry the table. A field whose
+distinct values *never stop growing* — a per-trip id — should not be a dimension
+at all; see [What it cannot do](#what-it-cannot-do).
+
 ### Reporting values
 
 Values ride alongside the position, in `dims`:
@@ -203,7 +240,8 @@ netcluster report fleet truck-1 -46.6333 -23.5505 --dim client=1,7 --dim status=
 netcluster clusters fleet --zoom 12 --filter client=7 --filter status=enroute
 ```
 
-`--dimension`, `--shape`, `--dim` and `--filter` may each be repeated.
+`--dimension`, `--shape`, `--dim` and `--filter` may each be repeated. A dimension
+takes either a value list (`client=1,7,22`) or a ceiling (`client=cap:4096`).
 
 ### What it costs
 
@@ -224,6 +262,13 @@ whole. Sizing and the measured numbers are in the JavaScript library's
 Substring search, ranges, `OR` across values, and anything read out of `props`.
 A plate box is a registry lookup rather than a map query — keep the text in your
 own database, resolve it to ids there, and ask the index only about those.
+
+**A field whose distinct values never stop growing** — a per-trip or per-order id
+— should not be a dimension either, at any capacity. Every declared shape holds a
+running total per combination per device per tree level, so values that never
+repeat give each device its own bucket: the aggregates become a second copy of the
+fleet and any ceiling fills. That is a different question from "which client owns
+this", and it belongs in the same place as the plate search.
 
 And **do not reach for the whole fleet and filter it yourself.** `getClusters`
 clusters at every zoom, so it is not a device listing: zoom is clamped to

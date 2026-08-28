@@ -298,12 +298,15 @@ cmd('collections', {
 cmd('create', {
   usage: 'create <name> [--radius 40] [--extent 512] [--max-zoom 16] [--hysteresis 0.25]\n' +
          '                      [--ttl 300] [--categories idle,enroute] [--max-props-bytes 1024]\n' +
-         '                      [--dimension client=1,7,22:multi] [--shape client,status]\n' +
+         '                      [--dimension client=1,7,22:multi] [--dimension client=cap:4096:multi]\n' +
+         '                      [--shape client,status]\n' +
          '\n' +
          '  --dimension and --shape may be repeated. A dimension is a property you filter\n' +
-         '  on; add :multi if one device can hold several of its values. A shape is a\n' +
-         '  combination a query may name -- each one is stored separately, so declare the\n' +
-         '  ones your UI offers and no more. Default: each dimension on its own.',
+         '  on; add :multi if one device can hold several of its values. Use cap:N instead\n' +
+         '  of a value list when you do not know the values -- they are then interned as\n' +
+         '  they arrive, and N is how many distinct ones may coexist, not how large an id\n' +
+         '  may get. A shape is a combination a query may name; each is stored separately,\n' +
+         '  so declare the ones your UI offers and no more. Default: each on its own.',
   blurb: 'create a collection (idempotent; 409 if the geometry differs)',
   async run(nc, [name], flags) {
     if (!name) throw new UsageError('create needs a collection name');
@@ -326,9 +329,17 @@ cmd('create', {
         }
         let rest = raw.slice(eq + 1), multi = false;
         if (rest.endsWith(':multi')) { multi = true; rest = rest.slice(0, -':multi'.length); }
+        const name = raw.slice(0, eq).trim();
+        if (rest.startsWith('cap:')) {
+          const capacity = Number(rest.slice(4));
+          if (!Number.isInteger(capacity) || capacity < 1) {
+            throw new UsageError(`--dimension ${JSON.stringify(raw)} wants cap:<a positive integer>`);
+          }
+          return { name, capacity, multi };
+        }
         const values = rest.split(',').map((x) => x.trim()).filter(Boolean);
         if (!values.length) throw new UsageError(`--dimension ${JSON.stringify(raw)} declares no values`);
-        return { name: raw.slice(0, eq).trim(), values, multi };
+        return { name, values, multi };
       });
     }
     const shapes = list(flags, 'shape');

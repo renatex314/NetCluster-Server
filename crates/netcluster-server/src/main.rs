@@ -113,7 +113,8 @@ fn restore_all(dir: &Path) -> Vec<Arc<Collection>> {
         match snapshot::read(&path) {
             Ok((meta, records)) => {
                 let total = records.len();
-                let (c, skipped) = Collection::restore(&meta.name, meta.config, &records);
+                let (c, skipped) =
+                    Collection::restore(&meta.name, meta.config, &meta.labels, &records);
                 let age = collection::now_ms()
                     .saturating_sub(records.iter().map(|r| r.last_seen_ms).max().unwrap_or(0));
                 eprintln!(

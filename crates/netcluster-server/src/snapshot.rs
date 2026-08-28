@@ -57,6 +57,14 @@ const FNV_PRIME: u64 = 1_099_511_628_211;
 pub struct Meta {
     pub name: String,
     pub config: Config,
+    /// Value labels for dimensions declared with a `capacity`, by index.
+    ///
+    /// The records store cell integers, and on a dynamic dimension those integers
+    /// mean nothing without the table that assigned them -- restore without this
+    /// and every device comes back filed under whichever client happens to report
+    /// first. Defaulted, so snapshots written before dynamic values still load.
+    #[serde(default)]
+    pub labels: Vec<Vec<String>>,
 }
 
 /// One device, as stored. Coordinates are fixed-point Web Mercator, not degrees:
@@ -334,6 +342,7 @@ mod tests {
 
     fn meta() -> Meta {
         Meta {
+            labels: Vec::new(),
             name: "fleet".into(),
             config: cfg(),
         }
