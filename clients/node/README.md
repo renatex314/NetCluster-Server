@@ -109,6 +109,41 @@ scalars become MVT tags so you can style by them.
 Capped by `maxPropsBytes` (default 1024). Anything you filter or group by belongs
 in `categories` instead.
 
+Filters are declared up front and matched exactly, and they combine:
+
+```js
+await fleet.create({
+  dimensions: [
+    { name: 'client', values: ['1', '7', '22'], multi: true },
+    { name: 'status', values: ['idle', 'enroute'] },
+  ],
+  filters: [['client'], ['status'], ['client', 'status']],
+});
+
+await fleet.report([
+  { id: 'v1', lng, lat, dims: { client: ['1', '7'], status: 'enroute' } },
+]);
+
+await fleet.getClusters({ bbox, zoom, filter: { client: 7, status: 'enroute' } });
+```
+
+`multi` lets one device hold several values for a dimension — a vehicle owned by
+three clients — which a single category cannot express. Re-reporting a device with
+different `dims` **re-files it** even if it has not moved, which is what a status
+change looks like; omitting `dims` leaves its values alone, exactly as omitting
+`props` leaves its properties.
+
+Each declared shape is a separate aggregate, which is what filtering costs. Naming
+an undeclared combination, dimension or value is a 400, never an empty result.
+Still out of reach: substring search, ranges, `OR` across values, and anything in
+`props`.
+
+Do not reach for the whole fleet and filter it yourself. `getClusters` clusters at
+every zoom, so it is not a device listing: zoom is clamped to `maxZoom`, and
+vehicles parked closer than the radius at that zoom (~44 m at the defaults) come
+back as a single cluster with no id and no props, which a filter of your own
+silently skips. Use `getLeaves(clusterId)` to reach the members.
+
 ## Tuning the clustering
 
 ```js
@@ -220,7 +255,7 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 | `remove(name, id)` | |
 | `has(name, id)` | is this device registered? |
 | `getDevice(name, id)` | position, category and staleness, or `null` |
-| `getClusters(name, { bbox, zoom, cat })` | GeoJSON `FeatureCollection` |
+| `getClusters(name, { bbox, zoom, cat, filter })` | GeoJSON `FeatureCollection` |
 | `getTile(name, z, x, y, { cat, format })` | `Uint8Array` of MVT, or `format: 'json'` |
 | `getChildren(name, clusterId)` | one expansion step, plus `expansion_zoom` |
 | `getLeaves(name, clusterId, { limit, offset })` | the individual devices |

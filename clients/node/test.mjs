@@ -424,20 +424,27 @@ await test('reportGeoJSON: FeatureCollection, array and lone Feature all ingest'
   await g.reportGeoJSON([f('a', 1.5, 1.5, {})]);
   assert.deepEqual((await g.getDevice('a')).props, {}, 'an explicit {} should clear them');
 
-  // the category came from properties.cat
+  // the category came from properties.cat. `a` picked one up at line 420, so two
+  // devices are busy by now.
   await g.reportGeoJSON([f('e', 5, 5, { cat: 'busy' })]);
   const busy = await g.getClusters({ zoom: 20, cat: 'busy' });
-  assert.equal(busy.features.length, 1);
-  assert.equal(busy.features[0].id, 'e');
+  assert.equal(busy.features.length, 2);
+  assert.deepEqual(busy.features.map((x) => x.id).sort(), ['a', 'e']);
 
-  // A device's category is fixed when it is first seen. A later report moves it
-  // and replaces its properties but does not re-file it, so this stays 'busy'.
-  // Not a GeoJSON quirk -- the compact path behaves the same way, because
-  // move_to carries no category.
+  // A category change on an existing device now re-files it. It used to be
+  // ignored -- the category was frozen at first insert, because move_to carried
+  // none -- which meant a vehicle's status could never change, and a status
+  // change does not move the vehicle, so nothing else would have noticed.
   await g.reportGeoJSON([f('e', 5.001, 5.001, { cat: 'idle' })]);
   assert.equal((await g.getClusters({ zoom: 20, cat: 'busy' })).features.length, 1,
-    'a category change on an existing device should be ignored');
-  assert.equal((await g.getClusters({ zoom: 20, cat: 'idle' })).features.length, 4);
+    'e should have left the busy filter');
+  assert.equal((await g.getClusters({ zoom: 20, cat: 'idle' })).features.length, 4,
+    'and joined the idle one: b, c, d, e');
+
+  // A report that names no category still leaves the device where it is.
+  await g.reportGeoJSON([f('e', 5.002, 5.002, { plate: 'XYZ' })]);
+  assert.equal((await g.getClusters({ zoom: 20, cat: 'idle' })).features.length, 4,
+    'a report carrying no category must not re-file the device');
   await g.drop();
 });
 
@@ -498,6 +505,96 @@ await test('reportGeoJSON rejects bad input in this API error shape', async () =
 // The example's last section asserts it called every public method. Running it
 // here is what keeps that assertion meaningful: add a method to the client and
 // forget to demonstrate it, and this fails.
+// ------------------------------------- filtering on several properties -----
+
+await test('a conjunction over two dimensions is exact, through the client', async () => {
+  const fleet = nc.collection('owners');
+  await fleet.create({
+    dimensions: [
+      { name: 'client', values: ['1', '7', '22'], multi: true },
+      { name: 'status', values: ['idle', 'enroute'] },
+    ],
+    filters: [['client'], ['status'], ['client', 'status']],
+    ttlSeconds: 0,
+  });
+  await fleet.report([
+    { id: 'a', lng: -46.63, lat: -23.55, dims: { client: ['1', '7'], status: 'enroute' } },
+    { id: 'b', lng: -46.64, lat: -23.56, dims: { client: ['7'], status: 'idle' } },
+    { id: 'c', lng: -46.65, lat: -23.57, dims: { client: ['22'], status: 'enroute' } },
+  ]);
+
+  const bbox = [-180, -85, 180, 85];
+  const total = (fc) => fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
+
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 7 } })), 2);
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { status: 'enroute' } })), 2);
+  assert.equal(
+    total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 7, status: 'enroute' } })),
+    1,
+    'the conjunction is not the product of the marginals');
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16 })), 3);
+});
+
+await test('a vehicle that only changes status still moves between filters', async () => {
+  const fleet = nc.collection('owners');
+  const bbox = [-180, -85, 180, 85];
+  const total = (fc) => fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
+  // same position, different status
+  await fleet.report([
+    { id: 'b', lng: -46.64, lat: -23.56, dims: { client: ['7'], status: 'enroute' } },
+  ]);
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 7, status: 'idle' } })), 0);
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 7, status: 'enroute' } })), 2);
+
+  // a bare position report must not re-file it
+  await fleet.report([{ id: 'b', lng: -46.60, lat: -23.50 }]);
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 7, status: 'enroute' } })), 2);
+});
+
+await test('an undeclared combination is an error, not an empty map', async () => {
+  const fleet = nc.collection('owners');
+  const bbox = [-180, -85, 180, 85];
+  await assert.rejects(
+    () => fleet.getClusters({ bbox, zoom: 16, filter: { nope: 1 } }),
+    (e) => e instanceof NetClusterError && /unknown filter/.test(e.message));
+  await assert.rejects(
+    () => fleet.getClusters({ bbox, zoom: 16, filter: { client: 999 } }),
+    (e) => e instanceof NetClusterError && /unknown value/.test(e.message));
+  // a list is two questions, not one
+  assert.throws(
+    () => fleet.getClusters({ bbox, zoom: 16, filter: { client: [1, 7] } }),
+    /takes one value/);
+});
+
+await test('GeoJSON ingest reads the same values out of properties', async () => {
+  const fleet = nc.collection('gj-owners');
+  await fleet.create({
+    dimensions: [
+      { name: 'client', values: ['1', '7'], multi: true },
+      { name: 'status', values: ['idle', 'enroute'] },
+    ],
+    filters: [['client'], ['status'], ['client', 'status']],
+    ttlSeconds: 0,
+  });
+  await fleet.reportGeoJSON({
+    type: 'FeatureCollection',
+    features: [
+      { type: 'Feature', id: 'g1', geometry: { type: 'Point', coordinates: [-46.63, -23.55] },
+        properties: { client: [1, 7], status: 'enroute', plate: 'ABC1234' } },
+      { type: 'Feature', id: 'g2', geometry: { type: 'Point', coordinates: [-46.64, -23.56] },
+        properties: { client: [7], status: 'idle' } },
+    ],
+  });
+  const bbox = [-180, -85, 180, 85];
+  const total = (fc) => fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
+  assert.equal(total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 7 } })), 2);
+  assert.equal(
+    total(await fleet.getClusters({ bbox, zoom: 16, filter: { client: 7, status: 'enroute' } })), 1);
+  // and the properties are still there, untouched
+  const d = await fleet.getDevice('g1');
+  assert.equal(d.props.plate, 'ABC1234');
+});
+
 await test('example.mjs exercises every public method', async () => {
   const { status, stdout, stderr } = spawnSync(
     process.execPath,

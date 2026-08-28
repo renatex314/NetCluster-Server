@@ -203,7 +203,7 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson) |
 | `DELETE /v1/collections/{name}/devices/{id}` | remove one device |
 | `GET .../devices/{id}` | is it registered? 200 with position, category and staleness, or 404 (`HEAD` for a bare check) |
-| `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON |
+| `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON; `?f.<name>=` for declared dimensions |
 | `GET .../tiles/{z}/{x}/{y}.mvt` | vector tile (`.json` for tile-space GeoJSON) |
 | `GET .../devices/{id}/cluster?zoom=` | which marker contains this device |
 | `GET .../clusters/{id}/children` | one expansion step, plus `expansion_zoom` |
@@ -211,6 +211,13 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `POST .../snapshot` | write a snapshot now (persistence must be on) |
 | `GET .../verify` | full invariant check — admin only, `O(N²)` |
 | `GET /healthz`, `GET /metrics` | liveness, Prometheus |
+
+`clusters` is a clustering query at every zoom, so **it is not a way to list
+devices.** Zoom is clamped to `max_zoom`, and points closer than the cluster radius
+at that zoom come back as one cluster carrying `point_count` — no device id, no
+`props`. Filtering that response in your own code silently drops every device
+inside such a cluster, and a depot full of parked vehicles is exactly that case. To
+reach members, use `/clusters/{id}/leaves`.
 
 ## GeoJSON
 
@@ -325,6 +332,33 @@ curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: app
 Anything you want to **filter or group by** belongs in `categories` instead — that
 is indexed and costs nothing per update, whereas `props` are opaque payload.
 
+Filters are declared up front and matched exactly. Declare `dimensions` when you
+need more than one, and they **combine**:
+
+```bash
+curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/json' -d '{
+  "dimensions": [
+    {"name": "client", "values": ["1", "7", "22"], "multi": true},
+    {"name": "status", "values": ["idle", "enroute"]}
+  ],
+  "filters": [["client"], ["status"], ["client", "status"]]
+}'
+
+curl 'localhost:8080/v1/collections/fleet/clusters?bbox=-47,-24,-46,-23&zoom=12&f.client=7&f.status=enroute'
+```
+
+`multi` lets one device hold several values for a dimension — a vehicle owned by
+three clients — which a single category cannot express. Values ride in `dims` on
+the compact form, or in `properties` under the dimension's own name in GeoJSON,
+and re-reporting a device with different values **re-files it** even if it has not
+moved: a status change never moves the vehicle.
+
+Each declared shape is a separate aggregate, which is what filtering costs. Still
+out of reach: substring search, ranges, `OR` across values, and anything read out
+of `props`. Sizing and the trade-offs are in the JavaScript library's
+[`docs/FILTERING.md`](https://github.com/renatex314/NetCluster/blob/main/docs/FILTERING.md),
+which describes the same mechanism.
+
 Unknown top-level fields are **rejected** with 422 rather than ignored: a stray
 `"plate"` outside `props` is a mistake, and silently discarding it means finding
 out weeks later that nothing was ever stored.
@@ -343,9 +377,11 @@ curl -X PUT localhost:8080/v1/collections/fleet -H 'content-type: application/js
 |---|---|---|
 | `radius` | `40` | cluster radius in screen pixels |
 | `extent` | `512` | tile extent those pixels are measured against |
-| `max_zoom` | `16` | finest zoom at which points still cluster; beyond it every point stands alone |
+| `max_zoom` | `16` | finest zoom the index resolves; queries are clamped to it, so points closer than the radius at this zoom (~44 m at the defaults) always return as a cluster |
 | `hysteresis` | `0.25` | how far an assignment stretches before a point is re-homed |
-| `categories` | `[]` | filter labels; a label's position in the list is its index |
+| `categories` | `[]` | filter labels; a label's position in the list is its index. Shorthand for one dimension named `cat` |
+| `dimensions` | `[]` | properties you can filter on: `{"name", "values", "multi"}`. Set this or `categories`, never both |
+| `filters` | one per dimension | combinations a query may name, e.g. `[["client"],["status"],["client","status"]]` |
 | `max_props_bytes` | `1024` | largest per-device `props` blob; 0 refuses properties |
 | `ttl_seconds` | `300` | drop a device that has not reported for this long |
 

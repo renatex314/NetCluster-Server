@@ -170,25 +170,56 @@ impl NetCluster {
             }
         }
 
-        // ---- 4b. category slices sum to the totals they slice
-        let k = self.categories;
-        if k > 0 {
+        // ---- 4b. every stored (node, cell) triple equals its subtree's sum
+        //
+        // Summing the slices and comparing against the total -- what this checked
+        // when a device belonged to exactly one category -- no longer holds: a
+        // device occupies one cell per declared shape, and several at once when a
+        // dimension is multi-valued, so the cells deliberately over-count the
+        // total. Each cell has to be checked against its own brute-force sum
+        // instead, which is also the stronger statement.
+        if self.table.enabled() {
+            let mut per_cell: HashMap<(Slot, u32), (i32, i64, i64)> = HashMap::new();
             for &s in &live {
+                // walk from each device up to the root, crediting its own cells
                 let si = s as usize;
-                let (mut c, mut ax, mut ay) = (0i32, 0i64, 0i64);
-                for i in 0..k {
-                    c += self.ccnt[si * k + i];
-                    ax += self.csx[si * k + i];
-                    ay += self.csy[si * k + i];
+                let n = self.dcell_n[si] as usize;
+                let (x, y) = (self.qx[si] as i64, self.qy[si] as i64);
+                for i in 0..n {
+                    let cell = self.dcell[si * self.mc + i];
+                    let mut t = s;
+                    while t != NONE {
+                        let e = per_cell.entry((t, cell)).or_insert((0, 0, 0));
+                        e.0 += 1;
+                        e.1 += x;
+                        e.2 += y;
+                        t = self.par[t as usize];
+                    }
                 }
-                if c != self.cnt[si] || ax != self.sx[si] || ay != self.sy[si] {
-                    bail!(
-                        "category slices of {s} sum to ({c},{ax},{ay}), totals are ({},{},{})",
-                        self.cnt[si],
-                        self.sx[si],
-                        self.sy[si]
-                    );
+            }
+            for (&(s, cell), &(c, ax, ay)) in &per_cell {
+                match self.table.find(s, cell) {
+                    None => bail!("node {s} holds no entry for cell {cell}, expected count {c}"),
+                    Some(e) => {
+                        let got = self.table.at(e);
+                        if got != (c, ax, ay) {
+                            bail!(
+                                "node {s} cell {cell} is ({},{},{}), subtree says ({c},{ax},{ay})",
+                                got.0,
+                                got.1,
+                                got.2
+                            );
+                        }
+                    }
                 }
+            }
+            // and nothing else is held: a stale cell over-counts a filter forever
+            let held = self.table.entries();
+            if held != per_cell.len() {
+                bail!(
+                    "the aggregate table holds {held} entries, {} occur in the tree",
+                    per_cell.len()
+                );
             }
         }
 

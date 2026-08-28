@@ -530,3 +530,177 @@ mod tests {
         assert!(f.props.is_none());
     }
 }
+
+/// One dimension's value(s) as written in `properties`: a scalar, or a list of
+/// them when the dimension is multi-valued.
+///
+/// Everything is normalised to strings because the schema resolves labels and
+/// numeric indices the same way, and a plate-shaped `"7"` and a JSON `7` must
+/// select the same value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DimVal(pub Vec<String>);
+
+impl<'de> Deserialize<'de> for DimVal {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = DimVal;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a filter value, or a list of them")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<DimVal, E> {
+                Ok(DimVal(vec![v.to_owned()]))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<DimVal, E> {
+                Ok(DimVal(vec![v.to_string()]))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<DimVal, E> {
+                Ok(DimVal(vec![v.to_string()]))
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<DimVal, E> {
+                Ok(DimVal(vec![v.to_string()]))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<DimVal, E> {
+                if v.fract() != 0.0 {
+                    return Err(E::custom(format!("{v} is not a whole number")));
+                }
+                Ok(DimVal(vec![(v as i64).to_string()]))
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<DimVal, E> {
+                Ok(DimVal(Vec::new()))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<DimVal, E> {
+                Ok(DimVal(Vec::new()))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<DimVal, A::Error> {
+                let mut out = Vec::new();
+                while let Some(v) = a.next_element::<DimVal>()? {
+                    out.extend(v.0);
+                }
+                Ok(DimVal(out))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+struct DimKeySeed<'k> {
+    id_key: Option<&'k str>,
+    names: &'k [&'k str],
+}
+
+impl<'de, 'k> DeserializeSeed<'de> for DimKeySeed<'k> {
+    type Value = Which;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Which, D::Error> {
+        d.deserialize_str(self)
+    }
+}
+
+impl<'k> Visitor<'_> for DimKeySeed<'k> {
+    type Value = Which;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a property name")
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Which, E> {
+        if self.id_key == Some(v) {
+            return Ok(Which::Id);
+        }
+        match self.names.iter().position(|c| *c == v) {
+            Some(i) => Ok(Which::Cat(i)),
+            None => Ok(Which::Other),
+        }
+    }
+}
+
+/// Pull an id and one value per named dimension out of a properties object.
+///
+/// The same single skip-scan `peek_props` does, but over N distinct dimensions
+/// rather than a preference-ordered list of aliases for one. Result `i`
+/// corresponds to `names[i]`; `None` means the property was absent.
+pub fn peek_dims(
+    raw: &str,
+    id_key: Option<&str>,
+    names: &[&str],
+) -> Result<(Option<String>, Vec<Option<DimVal>>), serde_json::Error> {
+    struct Peek<'k> {
+        id_key: Option<&'k str>,
+        names: &'k [&'k str],
+    }
+    impl<'de, 'k> DeserializeSeed<'de> for Peek<'k> {
+        type Value = (Option<String>, Vec<Option<DimVal>>);
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+    impl<'de, 'k> Visitor<'de> for Peek<'k> {
+        type Value = (Option<String>, Vec<Option<DimVal>>);
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a properties object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
+            let mut id = None;
+            let mut out: Vec<Option<DimVal>> = vec![None; self.names.len()];
+            while let Some(which) = m.next_key_seed(DimKeySeed {
+                id_key: self.id_key,
+                names: self.names,
+            })? {
+                match which {
+                    Which::Id => id = m.next_value::<Option<IdString>>()?.map(|v| v.0),
+                    Which::Cat(i) => out[i] = m.next_value::<Option<DimVal>>()?,
+                    Which::Other => {
+                        m.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok((id, out))
+        }
+    }
+    let mut d = serde_json::Deserializer::from_str(raw);
+    let out = Peek { id_key, names }.deserialize(&mut d)?;
+    d.end()?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod dim_tests {
+    use super::*;
+
+    #[test]
+    fn scalars_lists_and_absences() {
+        let raw = r#"{"plate":"ABC","client":[1,7],"status":"enroute","n":3}"#;
+        let (id, vals) = peek_dims(raw, None, &["client", "status", "missing"]).unwrap();
+        assert_eq!(id, None);
+        assert_eq!(
+            vals[0],
+            Some(DimVal(vec!["1".to_string(), "7".to_string()]))
+        );
+        assert_eq!(vals[1], Some(DimVal(vec!["enroute".to_string()])));
+        assert_eq!(vals[2], None);
+    }
+
+    #[test]
+    fn an_id_comes_out_of_the_same_scan() {
+        let raw = r#"{"id":"v-1","client":2}"#;
+        let (id, vals) = peek_dims(raw, Some("id"), &["client"]).unwrap();
+        assert_eq!(id.as_deref(), Some("v-1"));
+        assert_eq!(vals[0], Some(DimVal(vec!["2".to_string()])));
+    }
+
+    #[test]
+    fn a_null_value_is_an_absence_not_a_zero() {
+        let raw = r#"{"client":null}"#;
+        let (_, vals) = peek_dims(raw, None, &["client"]).unwrap();
+        // serde maps a JSON null through Option, so the property reads as absent
+        assert!(vals[0].is_none() || vals[0] == Some(DimVal(Vec::new())));
+    }
+
+    #[test]
+    fn trailing_junk_is_rejected() {
+        assert!(peek_dims(r#"{"a":1} nonsense"#, None, &["a"]).is_err());
+    }
+
+    #[test]
+    fn a_fractional_value_is_refused_rather_than_truncated() {
+        assert!(peek_dims(r#"{"client":1.5}"#, None, &["client"]).is_err());
+    }
+}

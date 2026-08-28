@@ -6,7 +6,10 @@ use crate::project::{project, unproject, PREC};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+mod cells;
 mod verify;
+use cells::CellTable;
+pub use cells::MAX_CELLS;
 pub use verify::Verification;
 
 /// A node handle. Slots are dense indices into the parallel arrays and are
@@ -48,7 +51,24 @@ pub struct Options {
     ///
     /// Cost note: a point belongs to exactly one category, so it touches exactly
     /// one slice per level. Update cost does **not** grow with this number.
+    ///
+    /// A shorthand for `cells`, kept because it is the published spelling. Set
+    /// one or the other, never both.
     pub categories: usize,
+    /// Size of the filter cell space, when the caller encodes its own cells --
+    /// combinations of several properties, say. A device may occupy more than one.
+    ///
+    /// `categories: k` is exactly `cells: k` with one cell per device. Naming and
+    /// resolving values to cell indices is the caller's business; the index only
+    /// ever sees integers.
+    pub cells: usize,
+    /// Largest number of cells one device may occupy. 0 means "one", which is
+    /// what a plain category is.
+    pub max_cells_per_device: usize,
+    /// Cell count at or below which aggregates are stored densely rather than in
+    /// a hash. Dense is faster and costs 20 bytes per device per cell whether or
+    /// not the cell occurs; see [`index::cells`]. Default 32.
+    pub dense_cells: usize,
 }
 
 impl Default for Options {
@@ -60,6 +80,9 @@ impl Default for Options {
             extent: 512.0,
             hysteresis: 0.25,
             categories: 0,
+            cells: 0,
+            max_cells_per_device: 0,
+            dense_cells: 32,
         }
     }
 }
@@ -136,6 +159,18 @@ pub struct NetCluster {
     hysteresis: f64,
     categories: usize,
 
+    /// Filter aggregates, in whichever layout the cell space fits.
+    table: CellTable,
+    /// Each device's cells, at a fixed stride of `mc`. Held rather than
+    /// recomputed: properties are stored by reference, so a caller mutating one
+    /// after the fact would otherwise desynchronise the table from the tree.
+    dcell: Vec<u32>,
+    dcell_n: Vec<u32>,
+    mc: usize,
+    /// Reusable ancestor chain, so aggregate walks allocate nothing.
+    chain: Vec<Slot>,
+    cellbuf: Vec<u32>,
+
     /// Cluster scale per level, in fixed-point units. `r[leaf] = -1` so nothing
     /// can ever be covered at the leaf level, which terminates the descent.
     r: Vec<f64>,
@@ -167,11 +202,6 @@ pub struct NetCluster {
     tz: Vec<i8>,
     ext: Vec<u64>,
 
-    cat: Vec<u32>,
-    ccnt: Vec<i32>,
-    csx: Vec<i64>,
-    csy: Vec<i64>,
-
     n: u32,
     free_head: Slot,
 
@@ -201,6 +231,25 @@ impl NetCluster {
             opts.max_zoom
         );
 
+        assert!(
+            opts.categories == 0 || opts.cells == 0,
+            "set either `categories` or `cells`, not both"
+        );
+        let cells = if opts.cells > 0 {
+            opts.cells
+        } else {
+            opts.categories
+        };
+        assert!(
+            cells <= MAX_CELLS,
+            "{cells} cells exceeds the {MAX_CELLS} the aggregate key can address"
+        );
+        let mc = if cells == 0 {
+            0
+        } else {
+            opts.max_cells_per_device.max(1)
+        };
+
         let leaf = opts.max_zoom as usize + 1; // index of the "not a center anywhere" level
         let mut r = vec![0.0f64; leaf + 1];
         let mut r2 = vec![0.0f64; leaf + 1];
@@ -222,7 +271,13 @@ impl NetCluster {
             radius: opts.radius,
             extent: opts.extent,
             hysteresis: opts.hysteresis,
-            categories: opts.categories,
+            categories: cells,
+            table: CellTable::new(cells, opts.dense_cells),
+            dcell: Vec::new(),
+            dcell_n: Vec::new(),
+            mc,
+            chain: Vec::new(),
+            cellbuf: Vec::new(),
             r,
             r2,
             cs,
@@ -244,10 +299,6 @@ impl NetCluster {
             psib: Vec::new(),
             tz: Vec::new(),
             ext: Vec::new(),
-            cat: Vec::new(),
-            ccnt: Vec::new(),
-            csx: Vec::new(),
-            csy: Vec::new(),
             n: 0,
             free_head: NONE,
             cand: vec![NONE; 256],
@@ -279,11 +330,10 @@ impl NetCluster {
         self.psib.resize(cap, NONE);
         self.tz.resize(cap, DEAD);
         self.ext.resize(cap, 0);
-        if self.categories > 0 {
-            self.cat.resize(cap, 0);
-            self.ccnt.resize(cap * self.categories, 0);
-            self.csx.resize(cap * self.categories, 0);
-            self.csy.resize(cap * self.categories, 0);
+        if self.table.enabled() {
+            self.dcell.resize(cap * self.mc, 0);
+            self.dcell_n.resize(cap, 0);
+            self.table.grow(cap);
         }
     }
 
@@ -306,16 +356,8 @@ impl NetCluster {
         self.sib[si] = NONE;
         self.psib[si] = NONE;
         self.par[si] = NONE;
-        // A recycled slot must not inherit stale slices.
-        let k = self.categories;
-        if k > 0 {
-            let b = si * k;
-            for i in 0..k {
-                self.ccnt[b + i] = 0;
-                self.csx[b + i] = 0;
-                self.csy[b + i] = 0;
-            }
-        }
+        // A recycled slot cannot inherit stale aggregates: free_slot cleared
+        // them, and self_mass clears again before writing this device's own mass.
         s
     }
 
@@ -326,26 +368,54 @@ impl NetCluster {
         self.cnt[si] = 1;
         self.sx[si] = x;
         self.sy[si] = y;
-        let k = self.categories;
-        if k > 0 {
-            let b = si * k;
-            for i in 0..k {
-                self.ccnt[b + i] = 0;
-                self.csx[b + i] = 0;
-                self.csy[b + i] = 0;
-            }
-            let c = self.cat[si] as usize;
-            self.ccnt[b + c] = 1;
-            self.csx[b + c] = x;
-            self.csy[b + c] = y;
+        if self.table.enabled() {
+            let n = self.dcell_n[si] as usize;
+            let cells = &self.dcell[si * self.mc..si * self.mc + n];
+            self.table.set_self(s, cells, x, y);
         }
     }
 
     fn free_slot(&mut self, s: Slot) {
         let si = s as usize;
+        // unlink left `s` holding its own mass; without this the table keeps a
+        // row per removed device forever
+        if self.table.enabled() {
+            self.table.drop_slot(s);
+            self.dcell_n[si] = 0;
+        }
         self.par[si] = self.free_head;
         self.free_head = s;
         self.tz[si] = DEAD;
+    }
+
+    /// Re-file a device that is still where it was: take its own mass out of its
+    /// old cells along the whole ancestor chain, adopt the new ones, put it back.
+    /// Totals are untouched, because nothing about the point moved.
+    fn recell(&mut self, s: Slot, cells: &[u32]) {
+        let si = s as usize;
+        let (x, y) = (self.qx[si] as i64, self.qy[si] as i64);
+        self.ancestors(s);
+        let chain = std::mem::take(&mut self.chain);
+        let n = self.dcell_n[si] as usize;
+        let old = std::mem::take(&mut self.cellbuf);
+        let mut old = old;
+        old.clear();
+        old.extend_from_slice(&self.dcell[si * self.mc..si * self.mc + n]);
+        self.table.walk(&chain, &old, -1, -x, -y);
+        self.cellbuf = old;
+        self.store_cells(si, cells);
+        self.table.walk(&chain, cells, 1, x, y);
+        self.chain = chain;
+    }
+
+    /// The ancestor chain from `from` upward, into the reusable buffer.
+    fn ancestors(&mut self, from: Slot) {
+        self.chain.clear();
+        let mut s = from;
+        while s != NONE {
+            self.chain.push(s);
+            s = self.par[s as usize];
+        }
     }
 
     // ---------------------------------------------------------------- grid --
@@ -627,23 +697,24 @@ impl NetCluster {
 
     /// Add the mass of ONE point to `s` and every ancestor.
     ///
-    /// This is the hot path. A point belongs to a single category, so it touches
-    /// a single slice, and the work is independent of how many categories exist.
-    fn agg(&mut self, mut s: Slot, dc: i32, dx: i64, dy: i64, k: Option<usize>) {
-        let kk = self.categories;
-        if kk > 0 {
-            if let Some(k) = k {
-                while s != NONE {
-                    let si = s as usize;
-                    self.cnt[si] += dc;
-                    self.sx[si] += dx;
-                    self.sy[si] += dy;
-                    let b = si * kk + k;
-                    self.ccnt[b] += dc;
-                    self.csx[b] += dx;
-                    self.csy[b] += dy;
-                    s = self.par[si];
+    /// This is the hot path. A device touches one cell per declared shape per
+    /// level, so the work is independent of how many combinations exist.
+    fn agg(&mut self, mut s: Slot, dc: i32, dx: i64, dy: i64, dev: Option<Slot>) {
+        if self.table.enabled() {
+            if let Some(dev) = dev {
+                self.ancestors(s);
+                let di = dev as usize;
+                let n = self.dcell_n[di] as usize;
+                for &t in &self.chain {
+                    let ti = t as usize;
+                    self.cnt[ti] += dc;
+                    self.sx[ti] += dx;
+                    self.sy[ti] += dy;
                 }
+                let chain = std::mem::take(&mut self.chain);
+                let cells = &self.dcell[di * self.mc..di * self.mc + n];
+                self.table.walk(&chain, cells, dc, dx, dy);
+                self.chain = chain;
                 return;
             }
         }
@@ -656,17 +727,17 @@ impl NetCluster {
         }
     }
 
-    /// Move a whole subtree's mass (all slices) on or off an ancestor chain.
+    /// Move a whole subtree's mass on or off an ancestor chain.
     ///
-    /// Only re-homing does this, about 3.3 times per removal, so the
-    /// category factor lands on the cold path rather than on every move.
+    /// Only re-homing does this, about 3.3 times per removal, so it stays a cold
+    /// path -- and it costs the cells that subtree actually holds rather than
+    /// every declared combination.
     fn agg_sub(&mut self, mut target: Slot, node: Slot, sign: i32) {
         let ni = node as usize;
         let dc = sign * self.cnt[ni];
         let dx = sign as i64 * self.sx[ni];
         let dy = sign as i64 * self.sy[ni];
-        let kk = self.categories;
-        if kk == 0 {
+        if !self.table.enabled() {
             while target != NONE {
                 let ti = target as usize;
                 self.cnt[ti] += dc;
@@ -676,20 +747,16 @@ impl NetCluster {
             }
             return;
         }
-        let nb = ni * kk;
-        while target != NONE {
-            let ti = target as usize;
+        self.ancestors(target);
+        for &t in &self.chain {
+            let ti = t as usize;
             self.cnt[ti] += dc;
             self.sx[ti] += dx;
             self.sy[ti] += dy;
-            let tb = ti * kk;
-            for k in 0..kk {
-                self.ccnt[tb + k] += sign * self.ccnt[nb + k];
-                self.csx[tb + k] += sign as i64 * self.csx[nb + k];
-                self.csy[tb + k] += sign as i64 * self.csy[nb + k];
-            }
-            target = self.par[ti];
         }
+        let chain = std::mem::take(&mut self.chain);
+        self.table.move_subtree(&chain, node, sign);
+        self.chain = chain;
     }
 
     /// Children are kept sorted by level so a viewport query can stop early.
@@ -779,28 +846,81 @@ impl NetCluster {
     /// that projects independently on each side can diverge for reasons that have
     /// nothing to do with the algorithm.
     pub fn insert_projected(&mut self, id: u64, x: i32, y: i32, cat: u32) -> Slot {
-        if self.ids.contains_key(&id) {
-            return self.move_to_projected(id, x, y);
+        if self.table.enabled() {
+            self.insert_projected_cells(id, x, y, &[cat])
+        } else {
+            self.insert_projected_cells(id, x, y, &[])
         }
-        assert!(
-            self.categories == 0 || (cat as usize) < self.categories,
-            "netcluster: category {} outside [0, {})",
-            cat,
-            self.categories
-        );
+    }
+
+    /// Insert with an explicit set of filter cells, projecting first.
+    pub fn insert_with_cells(&mut self, id: u64, lng: f64, lat: f64, cells: &[u32]) -> Slot {
+        let (x, y) = project(lng, lat);
+        self.insert_projected_cells(id, x, y, cells)
+    }
+
+    /// Move, re-filing the device when `cells` is `Some` and differs.
+    pub fn move_to_cells(&mut self, id: u64, lng: f64, lat: f64, cells: Option<&[u32]>) -> Slot {
+        let (x, y) = project(lng, lat);
+        self.move_to_projected_cells(id, x, y, cells)
+    }
+
+    /// Insert with an explicit set of filter cells.
+    ///
+    /// A device may occupy several -- one per declared filter shape, times any
+    /// value it holds more than one of. Re-inserting a known id re-files it, so
+    /// this is also how a device's values change.
+    pub fn insert_projected_cells(&mut self, id: u64, x: i32, y: i32, cells: &[u32]) -> Slot {
+        if self.ids.contains_key(&id) {
+            return self.move_to_projected_cells(id, x, y, Some(cells));
+        }
+        self.check_cells(cells);
         let s = self.alloc_slot();
         let si = s as usize;
         self.qx[si] = x;
         self.qy[si] = y;
-        if self.categories > 0 {
-            self.cat[si] = cat;
-        }
+        self.store_cells(si, cells);
         self.self_mass(s);
         self.ext[si] = id;
         self.ids.insert(id, s);
         self.link(s, None);
         self.stats.inserts += 1;
         s
+    }
+
+    fn check_cells(&self, cells: &[u32]) {
+        if !self.table.enabled() {
+            return;
+        }
+        assert!(
+            cells.len() <= self.mc,
+            "netcluster: a device lands in {} filter cells, over the {} limit",
+            cells.len(),
+            self.mc
+        );
+        for &c in cells {
+            assert!(
+                (c as usize) < self.table.cells,
+                "netcluster: cell {} outside [0, {})",
+                c,
+                self.table.cells
+            );
+        }
+    }
+
+    fn store_cells(&mut self, si: usize, cells: &[u32]) {
+        if !self.table.enabled() {
+            return;
+        }
+        let base = si * self.mc;
+        self.dcell[base..base + cells.len()].copy_from_slice(cells);
+        self.dcell_n[si] = cells.len() as u32;
+    }
+
+    /// Do this device's stored cells differ from `cells`?
+    fn cells_changed(&self, si: usize, cells: &[u32]) -> bool {
+        let n = self.dcell_n[si] as usize;
+        n != cells.len() || self.dcell[si * self.mc..si * self.mc + n] != *cells
     }
 
     pub fn remove(&mut self, id: u64) -> bool {
@@ -822,13 +942,8 @@ impl NetCluster {
         self.grid_del(s); // must vanish before any child is re-homed
         let up = self.par[si];
         // 1. this point's own mass leaves the ancestor chain
-        let k = if self.categories > 0 {
-            Some(self.cat[si] as usize)
-        } else {
-            None
-        };
         let (nx, ny) = (-(self.qx[si] as i64), -(self.qy[si] as i64));
-        self.agg(up, -1, nx, ny, k);
+        self.agg(up, -1, nx, ny, Some(s));
 
         // 2. every child subtree is re-homed elsewhere
         let mut kids = std::mem::take(&mut self.kids);
@@ -904,12 +1019,40 @@ impl NetCluster {
     /// actually breaks: a device that moves less than `r_maxZoom` does `O(depth)`
     /// integer adds and `O(log Δ)` hash probes and nothing else.
     pub fn move_to_projected(&mut self, id: u64, x: i32, y: i32) -> Slot {
+        self.move_to_projected_cells(id, x, y, None)
+    }
+
+    /// Move, and re-file the device if `cells` differ from what it holds.
+    ///
+    /// `None` leaves the filter values alone, which is what a bare position
+    /// report means.
+    pub fn move_to_projected_cells(
+        &mut self,
+        id: u64,
+        x: i32,
+        y: i32,
+        cells: Option<&[u32]>,
+    ) -> Slot {
         let s = match self.ids.get(&id) {
             Some(&s) => s,
-            None => return self.insert_projected(id, x, y, 0),
+            None => {
+                return self.insert_projected_cells(id, x, y, cells.unwrap_or(&[]));
+            }
         };
         let si = s as usize;
         let (ox, oy) = (self.qx[si], self.qy[si]);
+        // A value change is not a move, and must be applied before the
+        // unchanged-position shortcut below: a parked vehicle whose status
+        // changes has to leave one filter and join another, and it never moves
+        // while it does it.
+        if self.table.enabled() {
+            if let Some(cells) = cells {
+                if self.cells_changed(si, cells) {
+                    self.check_cells(cells);
+                    self.recell(s, cells);
+                }
+            }
+        }
         if x == ox && y == oy {
             return s;
         }
@@ -951,12 +1094,7 @@ impl NetCluster {
 
         if ok {
             self.grid_move(s, x, y);
-            let k = if self.categories > 0 {
-                Some(self.cat[si] as usize)
-            } else {
-                None
-            };
-            self.agg(s, 0, (x - ox) as i64, (y - oy) as i64, k);
+            self.agg(s, 0, (x - ox) as i64, (y - oy) as i64, Some(s));
             self.stats.moves_fast += 1;
             return s;
         }
@@ -1003,7 +1141,14 @@ impl NetCluster {
             radius: self.radius,
             extent: self.extent,
             hysteresis: self.hysteresis,
-            categories: self.categories,
+            categories: 0,
+            cells: self.categories,
+            max_cells_per_device: self.mc,
+            dense_cells: if self.table.dense {
+                self.table.cells
+            } else {
+                0
+            },
         }
     }
 
@@ -1015,24 +1160,26 @@ impl NetCluster {
 
     /// Aggregate of the cluster represented by center `s` at level `z`.
     ///
-    /// With `cat >= 0` the same subtraction runs over that category's slice, so a
-    /// filtered cluster costs exactly what an unfiltered one costs.
+    /// With `cat >= 0` the same subtraction runs over that cell, so a filtered
+    /// cluster costs what an unfiltered one costs.
     pub(crate) fn cluster_at(&self, s: Slot, z: i32, cat: i32) -> (i32, i64, i64) {
-        let kk = self.categories;
-        if kk > 0 && cat >= 0 {
-            let c0 = s as usize * kk + cat as usize;
-            let mut c = self.ccnt[c0];
-            let mut ax = self.csx[c0];
-            let mut ay = self.csy[c0];
+        if self.table.enabled() && cat >= 0 {
+            let cell = cat as u32;
+            let (mut c, mut ax, mut ay) = match self.table.find(s, cell) {
+                Some(e) => self.table.at(e),
+                None => (0, 0, 0),
+            };
             let mut b = self.kid[s as usize];
             while b != NONE {
                 if self.tz[b as usize] as i32 > z {
                     break;
                 }
-                let bi = b as usize * kk + cat as usize;
-                c -= self.ccnt[bi];
-                ax -= self.csx[bi];
-                ay -= self.csy[bi];
+                if let Some(e) = self.table.find(b, cell) {
+                    let (bc, bx, by) = self.table.at(e);
+                    c -= bc;
+                    ax -= bx;
+                    ay -= by;
+                }
                 b = self.sib[b as usize];
             }
             return (c, ax, ay);
@@ -1055,19 +1202,29 @@ impl NetCluster {
         (c, ax, ay)
     }
 
-    /// How many points of `cat` sit anywhere under `s`.
+    /// How many points of cell `cat` sit anywhere under `s`.
     #[inline]
     pub(crate) fn subtree_count(&self, s: Slot, cat: i32) -> i32 {
-        if self.categories > 0 && cat >= 0 {
-            self.ccnt[s as usize * self.categories + cat as usize]
+        if self.table.enabled() && cat >= 0 {
+            self.table.count(s, cat as u32)
         } else {
             self.cnt[s as usize]
         }
     }
 
-    /// The one member of category `cat` in cluster `(s, z)`.
+    /// Is the device at `s` itself in cell `cell`?
+    fn in_cell(&self, s: Slot, cell: i32) -> bool {
+        if !self.table.enabled() || cell < 0 {
+            return false;
+        }
+        let si = s as usize;
+        let n = self.dcell_n[si] as usize;
+        self.dcell[si * self.mc..si * self.mc + n].contains(&(cell as u32))
+    }
+
+    /// The one member of cell `cat` in cluster `(s, z)`.
     fn find_single(&self, s: Slot, z: i32, cat: i32) -> Slot {
-        if self.cat[s as usize] as i32 == cat {
+        if self.in_cell(s, cat) {
             return s;
         }
         let mut b = self.kid[s as usize];
@@ -1082,7 +1239,7 @@ impl NetCluster {
 
     /// Same, once the whole subtree is known to be inside the cluster.
     fn find_single_in(&self, s: Slot, cat: i32) -> Slot {
-        if self.cat[s as usize] as i32 == cat {
+        if self.in_cell(s, cat) {
             return s;
         }
         let mut b = self.kid[s as usize];
@@ -1420,15 +1577,29 @@ impl NetCluster {
         self.ids.contains_key(&id)
     }
 
-    /// The category a point was inserted under, or `None` if it is not in the
-    /// index. Always `Some(0)` when categories are disabled.
+    /// The first cell a point occupies, or `None` if it is not in the index.
+    /// Always `Some(0)` when filtering is disabled.
+    ///
+    /// With a single category that *is* the category, which is what this has
+    /// always meant. A device in several cells reports the first, so prefer
+    /// [`NetCluster::cells_of`] whenever more than one shape is declared.
     pub fn category_of(&self, id: u64) -> Option<u32> {
-        let s = *self.ids.get(&id)?;
-        Some(if self.categories > 0 {
-            self.cat[s as usize]
-        } else {
-            0
-        })
+        Some(self.cells_of(id)?.first().copied().unwrap_or(0))
+    }
+
+    /// Every filter cell a point occupies, or `None` if it is not in the index.
+    pub fn cells_of(&self, id: u64) -> Option<&[u32]> {
+        let s = *self.ids.get(&id)? as usize;
+        if !self.table.enabled() {
+            return Some(&[]);
+        }
+        let n = self.dcell_n[s] as usize;
+        Some(&self.dcell[s * self.mc..s * self.mc + n])
+    }
+
+    /// Live filter aggregate entries -- what filtering is actually costing.
+    pub fn agg_entries(&self) -> usize {
+        self.table.entries()
     }
 
     /// Position of a point as longitude/latitude, or `None` if it is not in the
@@ -1448,12 +1619,16 @@ impl NetCluster {
     pub fn memory_bytes(&self) -> usize {
         let cap = self.cap();
         let per_slot = 2 * 4 + 2 * 8 + 4 + 4 * 4 + 1 + 8; // qx qy sx sy cnt par/kid/sib/psib tz ext
-        let cat_bytes = if self.categories > 0 {
-            cap * self.categories * (4 + 8 + 8) + cap * 4
+        let filter_bytes = if self.table.enabled() {
+            self.table.bytes() + cap * (4 + 4 * self.mc)
         } else {
             0
         };
-        cap * per_slot + cat_bytes + self.e_slot.len() * 8 + self.grid.bytes() + self.ids.len() * 40
+        cap * per_slot
+            + filter_bytes
+            + self.e_slot.len() * 8
+            + self.grid.bytes()
+            + self.ids.len() * 40
     }
 
     /// `Σ_z |C_z|`: how many (center, level) pairs the grid holds.

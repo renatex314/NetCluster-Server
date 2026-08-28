@@ -342,6 +342,45 @@ p(`ok=${v.ok} · ${v.detail ?? v.violation}`);
 // Re-derives every structural invariant from scratch. A staging tool, not a
 // dashboard: it walks every pair of centers.
 
+// -- 16c. filtering on several properties --------------------------------------
+h('16c. filters that combine');
+// One category answers "only the trucks". A monitoring map usually needs two at
+// once -- which client owns the vehicle, and what it is doing -- and a vehicle
+// can belong to several clients, which a single category cannot express.
+const owners = nc.collection('example-owners');
+await owners.create({
+  dimensions: [
+    { name: 'client', values: ['1', '7', '22'], multi: true },
+    { name: 'status', values: ['idle', 'enroute'] },
+  ],
+  // The combinations a query may name. Each is stored separately, so declare the
+  // ones the UI actually offers and no more.
+  filters: [['client'], ['status'], ['client', 'status']],
+  ttlSeconds: 0,
+});
+await owners.report([
+  { id: 'truck-1', lng: -46.6333, lat: -23.5505, dims: { client: ['7', '22'], status: 'enroute' } },
+  { id: 'truck-2', lng: -46.6340, lat: -23.5510, dims: { client: ['7'], status: 'idle' } },
+  { id: 'truck-3', lng: -46.6350, lat: -23.5520, dims: { client: ['1'], status: 'enroute' } },
+]);
+const box = [-47, -24, -46, -23];
+const devices = (fc) => fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
+p(`everything            ${devices(await owners.getClusters({ bbox: box, zoom: 16 }))}`);
+p(`client 7              ${devices(await owners.getClusters({ bbox: box, zoom: 16, filter: { client: 7 } }))}`);
+p(`en route              ${devices(await owners.getClusters({ bbox: box, zoom: 16, filter: { status: 'enroute' } }))}`);
+p(`client 7 AND en route ${devices(await owners.getClusters({ bbox: box, zoom: 16, filter: { client: 7, status: 'enroute' } }))}`);
+
+// A status change does not move the vehicle: report it where it already is.
+await owners.report([
+  { id: 'truck-2', lng: -46.6340, lat: -23.5510, dims: { client: ['7'], status: 'enroute' } },
+]);
+p(`after truck-2 departs ${devices(await owners.getClusters({ bbox: box, zoom: 16, filter: { client: 7, status: 'enroute' } }))}`);
+
+// A bare position report keeps the values it already had.
+await owners.report([{ id: 'truck-2', lng: -46.6341, lat: -23.5511 }]);
+p(`after it moves again  ${devices(await owners.getClusters({ bbox: box, zoom: 16, filter: { client: 7, status: 'enroute' } }))}`);
+await owners.drop();
+
 // -- 17. clean up -------------------------------------------------------------
 h('17. dropCollection()');
 p(JSON.stringify(await fleet.drop()));

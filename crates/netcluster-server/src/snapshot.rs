@@ -38,10 +38,13 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 6] = b"NCSNAP";
-/// Bumped to 2 when per-device properties were added. Version 1 files are still
+/// Bumped to 2 when per-device properties were added, and to 3 when a device
+/// gained a *set* of filter cells rather than one category. Older files are still
 /// read -- a format that cannot load its predecessor forces data loss on upgrade,
-/// which is a poor trade for one field.
-const VERSION: u16 = 2;
+/// which is a poor trade for one field -- and a version-1 or -2 record's single
+/// category is exactly a one-element cell set, because a lone dimension encodes
+/// its values as cells 0..n.
+const VERSION: u16 = 3;
 const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
 const FNV_PRIME: u64 = 1_099_511_628_211;
 
@@ -64,7 +67,9 @@ pub struct DeviceRecord {
     pub id: String,
     pub x: i32,
     pub y: i32,
-    pub cat: u32,
+    /// Every filter cell this device occupied. One entry per declared filter
+    /// shape, times any value it holds more than one of.
+    pub cells: Vec<u32>,
     pub last_seen_ms: u64,
     /// Raw JSON object, exactly as it arrived. Kept as text rather than a parsed
     /// value so neither writing a snapshot nor answering a query re-parses it.
@@ -160,7 +165,10 @@ pub fn write(path: &Path, meta: &Meta, records: &[DeviceRecord]) -> io::Result<u
             w.write_all(id)?;
             w.write_all(&r.x.to_le_bytes())?;
             w.write_all(&r.y.to_le_bytes())?;
-            w.write_all(&r.cat.to_le_bytes())?;
+            w.write_all(&(r.cells.len() as u16).to_le_bytes())?;
+            for &c in &r.cells {
+                w.write_all(&c.to_le_bytes())?;
+            }
             w.write_all(&r.last_seen_ms.to_le_bytes())?;
             let props = r.props.as_deref().unwrap_or("");
             w.write_all(&(props.len() as u32).to_le_bytes())?;
@@ -237,7 +245,17 @@ pub fn read(path: &Path) -> io::Result<(Meta, Vec<DeviceRecord>)> {
             .map_err(|_| bad("device id is not valid UTF-8"))?;
         let x = i32::from_le_bytes(take(4)?.try_into().unwrap());
         let y = i32::from_le_bytes(take(4)?.try_into().unwrap());
-        let cat = u32::from_le_bytes(take(4)?.try_into().unwrap());
+        let cells = if version >= 3 {
+            let n = u16::from_le_bytes(take(2)?.try_into().unwrap()) as usize;
+            let mut v = Vec::with_capacity(n.min(64));
+            for _ in 0..n {
+                v.push(u32::from_le_bytes(take(4)?.try_into().unwrap()));
+            }
+            v
+        } else {
+            // one category is one cell, by construction
+            vec![u32::from_le_bytes(take(4)?.try_into().unwrap())]
+        };
         let last_seen_ms = u64::from_le_bytes(take(8)?.try_into().unwrap());
         let props = if has_props {
             let n = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
@@ -257,7 +275,7 @@ pub fn read(path: &Path) -> io::Result<(Meta, Vec<DeviceRecord>)> {
             id,
             x,
             y,
-            cat,
+            cells,
             last_seen_ms,
             props,
         });
@@ -328,6 +346,8 @@ mod tests {
             extent: 512.0,
             hysteresis: 0.3,
             categories: vec!["idle".into(), "enroute".into()],
+            dimensions: Vec::new(),
+            filters: Vec::new(),
             max_props_bytes: 1024,
             ttl_seconds: 120,
         }
@@ -338,7 +358,7 @@ mod tests {
             id: id.to_string(),
             x,
             y: x / 2,
-            cat: (x as u32) % 2,
+            cells: vec![(x as u32) % 2],
             last_seen_ms: 1_700_000_000_000 + x as u64,
             props: if x % 3 == 0 {
                 Some(format!(r#"{{"plate":"ABC-{x}","battery":{}}}"#, x % 100))

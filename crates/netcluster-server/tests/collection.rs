@@ -14,13 +14,15 @@ fn cfg(categories: &[&str], ttl: u64) -> Config {
     }
 }
 
-fn report<'a>(id: &'a str, lng: f64, lat: f64, cat: u32) -> Report<'a> {
+fn report<'a>(id: &'a str, lng: f64, lat: f64, cells: &'a [u32]) -> Report<'a> {
     Report {
         id,
         lng,
         lat,
-        cat,
         props: None,
+        // an empty list is "this report names no filter values", which is the
+        // only thing that means anything on a collection with none declared
+        cells: if cells.is_empty() { None } else { Some(cells) },
     }
 }
 
@@ -28,9 +30,9 @@ fn report<'a>(id: &'a str, lng: f64, lat: f64, cat: u32) -> Report<'a> {
 fn string_ids_survive_the_round_trip() {
     let c = Collection::new("t", cfg(&[], 0));
     c.upsert(&[
-        report("truck-1", -46.6333, -23.5505, 0),
-        report("ônibus-2", -46.6340, -23.5510, 0),
-        report("", -43.1729, -22.9068, 0),
+        report("truck-1", -46.6333, -23.5505, &[]),
+        report("ônibus-2", -46.6340, -23.5510, &[]),
+        report("", -43.1729, -22.9068, &[]),
     ])
     .unwrap();
     assert_eq!(c.len(), 3);
@@ -43,11 +45,11 @@ fn string_ids_survive_the_round_trip() {
 #[test]
 fn reinterning_a_removed_id_reuses_its_slot() {
     let c = Collection::new("t", cfg(&[], 0));
-    c.upsert(&[report("a", 0.0, 0.0, 0)]).unwrap();
+    c.upsert(&[report("a", 0.0, 0.0, &[])]).unwrap();
     assert!(c.remove("a"));
     assert_eq!(c.len(), 0);
     assert!(!c.remove("a"), "removing twice must report false");
-    c.upsert(&[report("a", 1.0, 1.0, 0)]).unwrap();
+    c.upsert(&[report("a", 1.0, 1.0, &[])]).unwrap();
     assert_eq!(c.len(), 1);
     let f = &c.clusters([-10.0, -10.0, 10.0, 10.0], 16.0, -1)[0];
     assert_eq!(f.device.as_deref(), Some("a"));
@@ -79,17 +81,22 @@ fn category_labels_resolve_by_name_and_by_index() {
 #[test]
 fn a_category_out_of_range_is_rejected_at_ingest() {
     let c = Collection::new("t", cfg(&["a", "b"], 0));
-    let e = c.upsert(&[report("x", 0.0, 0.0, 5)]).unwrap_err();
-    assert!(e.contains("category"), "{e}");
+    let e = c.upsert(&[report("x", 0.0, 0.0, &[5])]).unwrap_err();
+    // `Report` speaks in filter cells now; the category wording lives at the HTTP
+    // edge, where a name is resolved against the declared labels.
+    assert!(e.contains("filter cell 5"), "{e}");
     assert_eq!(c.len(), 0, "a rejected batch must not be partially applied");
 }
 
 #[test]
 fn non_finite_coordinates_are_rejected_before_anything_is_written() {
     let c = Collection::new("t", cfg(&[], 0));
-    c.upsert(&[report("good", 1.0, 1.0, 0)]).unwrap();
+    c.upsert(&[report("good", 1.0, 1.0, &[])]).unwrap();
     let e = c
-        .upsert(&[report("ok", 2.0, 2.0, 0), report("bad", f64::NAN, 0.0, 0)])
+        .upsert(&[
+            report("ok", 2.0, 2.0, &[]),
+            report("bad", f64::NAN, 0.0, &[]),
+        ])
         .unwrap_err();
     assert!(e.contains("non-finite"), "{e}");
     assert_eq!(
@@ -103,10 +110,10 @@ fn non_finite_coordinates_are_rejected_before_anything_is_written() {
 fn filtered_queries_go_through_the_label() {
     let c = Collection::new("t", cfg(&["idle", "enroute", "delivering"], 0));
     c.upsert(&[
-        report("t1", -46.6333, -23.5505, 2),
-        report("t2", -46.6340, -23.5510, 2),
-        report("t3", -46.6350, -23.5520, 0),
-        report("t4", -43.1729, -22.9068, 1),
+        report("t1", -46.6333, -23.5505, &[2]),
+        report("t2", -46.6340, -23.5510, &[2]),
+        report("t3", -46.6350, -23.5520, &[]),
+        report("t4", -43.1729, -22.9068, &[1]),
     ])
     .unwrap();
     let bbox = [-60.0, -35.0, -30.0, -10.0];
@@ -128,12 +135,12 @@ fn filtered_queries_go_through_the_label() {
 #[test]
 fn expiry_drops_only_the_silent_devices() {
     let c = Collection::new("t", cfg(&[], 1));
-    c.upsert(&[report("old", 0.0, 0.0, 0), report("older", 1.0, 1.0, 0)])
+    c.upsert(&[report("old", 0.0, 0.0, &[]), report("older", 1.0, 1.0, &[])])
         .unwrap();
     assert_eq!(c.sweep(), 0, "nothing is stale yet");
     thread::sleep(std::time::Duration::from_millis(1100));
     // one device keeps reporting; the other has gone quiet
-    c.upsert(&[report("old", 0.0, 0.0, 0)]).unwrap();
+    c.upsert(&[report("old", 0.0, 0.0, &[])]).unwrap();
     assert_eq!(c.sweep(), 1, "exactly the silent device should be dropped");
     assert_eq!(c.len(), 1);
     let names: Vec<String> = c
@@ -148,7 +155,7 @@ fn expiry_drops_only_the_silent_devices() {
 #[test]
 fn ttl_zero_disables_expiry() {
     let c = Collection::new("t", cfg(&[], 0));
-    c.upsert(&[report("a", 0.0, 0.0, 0)]).unwrap();
+    c.upsert(&[report("a", 0.0, 0.0, &[])]).unwrap();
     thread::sleep(std::time::Duration::from_millis(50));
     assert_eq!(c.sweep(), 0);
     assert_eq!(c.len(), 1);
@@ -177,7 +184,7 @@ fn readers_run_concurrently_with_a_writer() {
     c.upsert(
         &batch
             .iter()
-            .map(|(id, lng, lat)| report(id, *lng, *lat, 0))
+            .map(|(id, lng, lat)| report(id, *lng, *lat, &[]))
             .collect::<Vec<_>>(),
     )
     .unwrap();
@@ -197,7 +204,7 @@ fn readers_run_concurrently_with_a_writer() {
                 let rs: Vec<Report> = batch
                     .iter()
                     .take(2000)
-                    .map(|(id, lng, lat)| report(id, lng + d, *lat, 0))
+                    .map(|(id, lng, lat)| report(id, lng + d, *lat, &[]))
                     .collect();
                 c.upsert(&rs).unwrap();
                 n += rs.len() as u64;
@@ -251,7 +258,7 @@ fn tiles_carry_the_same_devices_as_the_bbox_query() {
         .collect();
     c.upsert(
         &pts.iter()
-            .map(|(id, lng, lat)| report(id, *lng, *lat, 0))
+            .map(|(id, lng, lat)| report(id, *lng, *lat, &[]))
             .collect::<Vec<_>>(),
     )
     .unwrap();
@@ -282,7 +289,7 @@ fn contains_reflects_the_index_not_the_intern_table() {
     assert!(!c.contains("truck-1"), "empty collection");
     assert!(c.device("truck-1").is_none());
 
-    c.upsert(&[report("truck-1", -46.6333, -23.5505, 1)])
+    c.upsert(&[report("truck-1", -46.6333, -23.5505, &[1])])
         .unwrap();
     assert!(c.contains("truck-1"));
     assert!(!c.contains("truck-2"), "an id never reported");
@@ -292,14 +299,14 @@ fn contains_reflects_the_index_not_the_intern_table() {
     assert!(!c.contains("truck-1"), "a removed device is not registered");
     assert!(c.device("truck-1").is_none());
 
-    c.upsert(&[report("truck-1", 1.0, 1.0, 0)]).unwrap();
+    c.upsert(&[report("truck-1", 1.0, 1.0, &[])]).unwrap();
     assert!(c.contains("truck-1"), "reporting again re-registers it");
 }
 
 #[test]
 fn device_reports_position_category_and_staleness() {
     let c = Collection::new("t", cfg(&["idle", "enroute", "delivering"], 300));
-    c.upsert(&[report("truck-1", -46.6333, -23.5505, 2)])
+    c.upsert(&[report("truck-1", -46.6333, -23.5505, &[2])])
         .unwrap();
 
     let d = c.device("truck-1").expect("registered");
@@ -319,7 +326,8 @@ fn device_reports_position_category_and_staleness() {
     thread::sleep(std::time::Duration::from_millis(30));
     let before = c.device("truck-1").unwrap().age_ms;
     assert!(before >= 25, "age did not advance: {before} ms");
-    c.upsert(&[report("truck-1", -46.70, -23.60, 2)]).unwrap();
+    c.upsert(&[report("truck-1", -46.70, -23.60, &[2])])
+        .unwrap();
     let after = c.device("truck-1").unwrap();
     assert!(after.age_ms < before, "reporting did not refresh last_seen");
     assert!((after.lng - -46.70).abs() < 1e-6);
@@ -329,7 +337,7 @@ fn device_reports_position_category_and_staleness() {
 #[test]
 fn device_without_categories_still_answers() {
     let c = Collection::new("t", cfg(&[], 0));
-    c.upsert(&[report("a", 1.0, 2.0, 0)]).unwrap();
+    c.upsert(&[report("a", 1.0, 2.0, &[])]).unwrap();
     let d = c.device("a").unwrap();
     assert_eq!(d.cat, None, "no labels configured, so no label to report");
     assert_eq!(d.cat_index, 0);
@@ -340,7 +348,7 @@ fn device_without_categories_still_answers() {
 #[test]
 fn an_expired_device_is_no_longer_registered() {
     let c = Collection::new("t", cfg(&[], 1));
-    c.upsert(&[report("ghost", 1.0, 1.0, 0)]).unwrap();
+    c.upsert(&[report("ghost", 1.0, 1.0, &[])]).unwrap();
     assert!(c.contains("ghost"));
     thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(c.sweep(), 1);
@@ -364,8 +372,8 @@ fn with_props<'a>(
         id,
         lng,
         lat,
-        cat: 0,
         props: Some(p),
+        cells: None,
     }
 }
 
@@ -404,7 +412,7 @@ fn a_position_report_without_props_leaves_them_alone() {
         .unwrap();
 
     for i in 0..50 {
-        c.upsert(&[report("truck-1", -46.63 + i as f64 * 0.001, -23.55, 0)])
+        c.upsert(&[report("truck-1", -46.63 + i as f64 * 0.001, -23.55, &[])])
             .unwrap();
     }
     let d = c.device("truck-1").unwrap();
@@ -465,7 +473,7 @@ fn oversized_properties_are_rejected() {
     let e = none.upsert(&[with_props("a", 1.0, 1.0, &ok)]).unwrap_err();
     assert!(e.contains("max_props_bytes = 0"), "{e}");
     // but plain reports still work
-    none.upsert(&[report("a", 1.0, 1.0, 0)]).unwrap();
+    none.upsert(&[report("a", 1.0, 1.0, &[])]).unwrap();
     assert!(none.contains("a"));
 }
 
@@ -491,7 +499,7 @@ fn a_removed_device_does_not_keep_its_properties() {
     let p = raw(r#"{"plate":"OLD"}"#);
     c.upsert(&[with_props("truck-1", 1.0, 1.0, &p)]).unwrap();
     assert!(c.remove("truck-1"));
-    c.upsert(&[report("truck-1", 2.0, 2.0, 0)]).unwrap();
+    c.upsert(&[report("truck-1", 2.0, 2.0, &[])]).unwrap();
     assert!(
         c.device("truck-1").unwrap().props.is_none(),
         "a recycled id resurrected its old properties"

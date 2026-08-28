@@ -54,8 +54,8 @@ fn a_restored_collection_holds_the_same_devices() {
             id: &id,
             lng: -46.63 + (rng.next() - 0.5) * 0.9,
             lat: -23.55 + (rng.next() - 0.5) * 0.9,
-            cat,
             props: None,
+            cells: Some(&[cat]),
         }])
         .unwrap();
         expected.push((id, cat));
@@ -67,8 +67,8 @@ fn a_restored_collection_holds_the_same_devices() {
             id: &id,
             lng: 2.35,
             lat: 48.85,
-            cat: i % 3,
             props: None,
+            cells: Some(&[i % 3]),
         }])
         .unwrap();
     }
@@ -124,8 +124,8 @@ fn a_restored_collection_holds_the_same_devices() {
             id: "brand-new",
             lng: 1.0,
             lat: 1.0,
-            cat: 0,
             props: None,
+            cells: None,
         }])
         .unwrap();
     assert!(restored.contains("brand-new"));
@@ -142,8 +142,8 @@ fn repeated_restores_do_not_drift() {
         id: "still",
         lng: -46.633308,
         lat: -23.550520,
-        cat: 0,
         props: None,
+        cells: None,
     }])
     .unwrap();
     let first = c.device("still").unwrap();
@@ -169,7 +169,7 @@ fn records_past_the_ttl_are_not_restored() {
             id: "fresh".into(),
             x: 100,
             y: 100,
-            cat: 0,
+            cells: vec![0],
             last_seen_ms: now,
             props: None,
         },
@@ -177,7 +177,7 @@ fn records_past_the_ttl_are_not_restored() {
             id: "recent".into(),
             x: 200,
             y: 200,
-            cat: 0,
+            cells: vec![0],
             last_seen_ms: now - 30_000,
             props: None,
         },
@@ -185,7 +185,7 @@ fn records_past_the_ttl_are_not_restored() {
             id: "stale".into(),
             x: 300,
             y: 300,
-            cat: 0,
+            cells: vec![0],
             last_seen_ms: now - 600_000,
             props: None,
         },
@@ -193,7 +193,7 @@ fn records_past_the_ttl_are_not_restored() {
             id: "ancient".into(),
             x: 400,
             y: 400,
-            cat: 0,
+            cells: vec![0],
             last_seen_ms: 0,
             props: None,
         },
@@ -220,7 +220,7 @@ fn a_shrunken_category_list_does_not_take_the_process_down() {
             id: "a".into(),
             x: 100,
             y: 100,
-            cat: 0,
+            cells: vec![0],
             last_seen_ms: now,
             props: None,
         },
@@ -228,7 +228,7 @@ fn a_shrunken_category_list_does_not_take_the_process_down() {
             id: "b".into(),
             x: 200,
             y: 200,
-            cat: 5,
+            cells: vec![5],
             last_seen_ms: now,
             props: None,
         },
@@ -284,8 +284,8 @@ fn snapshots_during_heavy_writes_stay_consistent() {
             id,
             lng: -46.63 + (rng.next() - 0.5) * 0.9,
             lat: -23.55 + (rng.next() - 0.5) * 0.9,
-            cat: 0,
             props: None,
+            cells: None,
         })
         .collect();
     c.upsert(&initial).unwrap();
@@ -304,8 +304,8 @@ fn snapshots_during_heavy_writes_stay_consistent() {
                         id,
                         lng: -46.63 + d,
                         lat: -23.55,
-                        cat: 1,
                         props: None,
+                        cells: Some(&[1]),
                     })
                     .collect();
                 c.upsert(&batch).unwrap();
@@ -344,16 +344,16 @@ fn properties_survive_a_snapshot_and_a_v1_file_still_loads() {
         id: "truck-1",
         lng: -46.63,
         lat: -23.55,
-        cat: 0,
         props: Some(&p),
+        cells: None,
     }])
     .unwrap();
     c.upsert(&[Report {
         id: "truck-2",
         lng: 2.35,
         lat: 48.85,
-        cat: 0,
         props: None,
+        cells: None,
     }])
     .unwrap();
 

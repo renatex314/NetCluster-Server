@@ -37,8 +37,29 @@ export interface CollectionConfig {
   radius?: number;
   extent?: number;
   hysteresis?: number;
-  /** Category labels; a label's position in this list is its category index. */
+  /**
+   * Category labels; a label's position in this list is its category index.
+   *
+   * A shorthand for one dimension named `cat`. Use `dimensions` for anything
+   * more; passing both is an error.
+   */
   categories?: string[];
+  /**
+   * Properties this collection can filter on. `multi` lets one device hold
+   * several values at once -- a vehicle owned by three clients, which a single
+   * category cannot express.
+   */
+  dimensions?: Dimension[];
+  /**
+   * Which combinations of dimensions a query may name. Defaults to each on its
+   * own.
+   *
+   * This is what filtering costs: a device contributes one aggregate entry per
+   * shape per tree level, so `[['client'], ['status'], ['client','status']]`
+   * costs three times what `[['client']]` does. A query that does not match a
+   * declared shape is a 400, never a silent scan.
+   */
+  filters?: string[][];
   /** Drop a device that has not reported for this long. 0 disables expiry. */
   ttlSeconds?: number;
   /**
@@ -51,12 +72,30 @@ export interface CollectionConfig {
   maxPropsBytes?: number;
 }
 
+/** One filterable property, and the values it can take. */
+export interface Dimension {
+  name: string;
+  /** Value labels; a label's position in this list is its value index. */
+  values: string[];
+  /** May one device hold several of these at once? Default false. */
+  multi?: boolean;
+}
+
 /** One position report. `cat` may be a label from the collection, or its index. */
 export interface Point {
   id: string;
   lng: number;
   lat: number;
   cat?: number | string;
+  /**
+   * Filter values, when the collection declares `dimensions`:
+   * `{ client: ['1', '7'], status: 'enroute' }`.
+   *
+   * Omit it and the device keeps the values it already had, exactly as omitting
+   * `props` keeps its properties -- a bare position report must not re-file a
+   * vehicle into whatever value happens to sit at index 0.
+   */
+  dims?: Record<string, string | number | Array<string | number>>;
   /**
    * Free-form attributes for this device. Any JSON object.
    *
@@ -165,6 +204,21 @@ export interface QueryOptions {
   zoom?: number;
   /** A category label or index. Omit for no filter. */
   cat?: number | string;
+  /**
+   * One value per dimension of a declared filter shape, e.g.
+   * `{ client: 7, status: 'enroute' }`. Sent as `?f.client=7&f.status=enroute`.
+   *
+   * A device may hold several values for a `multi` dimension, but a query names
+   * one of them. Naming an undeclared combination, dimension or value is a 400,
+   * not an empty result.
+   */
+  filter?: Record<string, string | number>;
+}
+
+/** The filter half of {@link QueryOptions}, for tiles. */
+export interface TileOptions {
+  cat?: number | string;
+  filter?: Record<string, string | number>;
 }
 
 export interface ReporterOptions {
@@ -247,8 +301,8 @@ export interface BoundCollection {
   has(id: string): Promise<boolean>;
   getDevice(id: string): Promise<DeviceInfo | null>;
   getClusters(opts?: QueryOptions): Promise<FeatureCollection>;
-  getTile(z: number, x: number, y: number, opts?: { cat?: number | string; format?: 'mvt' }): Promise<Uint8Array>;
-  getTile(z: number, x: number, y: number, opts: { cat?: number | string; format: 'json' }): Promise<FeatureCollection>;
+  getTile(z: number, x: number, y: number, opts?: TileOptions & { format?: 'mvt' }): Promise<Uint8Array>;
+  getTile(z: number, x: number, y: number, opts: TileOptions & { format: 'json' }): Promise<FeatureCollection>;
   getChildren(clusterId: number): Promise<ChildrenResult>;
   getLeaves(clusterId: number, opts?: { limit?: number; offset?: number }): Promise<FeatureCollection>;
   deviceCluster(id: string, zoom?: number): Promise<Feature>;
@@ -284,8 +338,8 @@ export declare class NetClusterClient {
   getDevice(name: string, id: string): Promise<DeviceInfo | null>;
 
   getClusters(name: string, opts?: QueryOptions): Promise<FeatureCollection>;
-  getTile(name: string, z: number, x: number, y: number, opts?: { cat?: number | string; format?: 'mvt' }): Promise<Uint8Array>;
-  getTile(name: string, z: number, x: number, y: number, opts: { cat?: number | string; format: 'json' }): Promise<FeatureCollection>;
+  getTile(name: string, z: number, x: number, y: number, opts?: TileOptions & { format?: 'mvt' }): Promise<Uint8Array>;
+  getTile(name: string, z: number, x: number, y: number, opts: TileOptions & { format: 'json' }): Promise<FeatureCollection>;
   getChildren(name: string, clusterId: number): Promise<ChildrenResult>;
   getLeaves(name: string, clusterId: number, opts?: { limit?: number; offset?: number }): Promise<FeatureCollection>;
   deviceCluster(name: string, id: string, zoom?: number): Promise<Feature>;

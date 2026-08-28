@@ -1,0 +1,440 @@
+//! Filter schema: dimensions, query shapes, and the cell encoding.
+//!
+//! A *dimension* is a property you filter on (`client`, `status`). A *shape* is a
+//! combination you are allowed to query (`["client", "status"]`). A *cell* is one
+//! concrete assignment of values to the dimensions of one shape. The index itself
+//! deals only in cell integers; naming lives here.
+//!
+//! Shapes are declared rather than inferred because they are what costs memory: a
+//! device contributes one aggregate entry per shape per tree level, so declaring
+//! `[["client"], ["status"], ["client","status"]]` costs three times what
+//! `[["client"]]` does. Inferring them from whatever a client happened to ask for
+//! would make a collection's footprint depend on which page someone opened.
+//!
+//! A query must name exactly the dimensions of some declared shape. That is what
+//! keeps a filtered query at one lookup per node: matching a subset of a cross
+//! product would mean summing every cell that agrees on the named dimensions, and
+//! there are more of those the fewer dimensions you name.
+
+use netcluster::MAX_CELLS;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// One filterable property.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Dimension {
+    pub name: String,
+    /// Value labels; a label's position in this list is its value index.
+    pub values: Vec<String>,
+    /// May one device hold several of these values at once? A vehicle owned by
+    /// three clients cannot be expressed any other way.
+    #[serde(default)]
+    pub multi: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Shape {
+    pub dims: Vec<usize>,
+    pub base: u32,
+    pub strides: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Schema {
+    pub dims: Vec<Dimension>,
+    pub shapes: Vec<Shape>,
+    pub cells: usize,
+    pub max_cells_per_device: usize,
+    by_name: HashMap<String, usize>,
+    by_key: HashMap<String, usize>,
+}
+
+impl Schema {
+    /// Build from declared dimensions and shapes.
+    ///
+    /// `filters` empty means "each dimension on its own", which reproduces a
+    /// single category both in behaviour and in cost.
+    pub fn new(dims: Vec<Dimension>, filters: &[Vec<String>]) -> Result<Self, String> {
+        let mut by_name = HashMap::new();
+        for (i, d) in dims.iter().enumerate() {
+            if d.values.is_empty() {
+                return Err(format!("dimension {:?} declares no values", d.name));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for v in &d.values {
+                if !seen.insert(v) {
+                    return Err(format!("dimension {:?} repeats the value {:?}", d.name, v));
+                }
+            }
+            if by_name.insert(d.name.clone(), i).is_some() {
+                return Err(format!("duplicate dimension {:?}", d.name));
+            }
+        }
+
+        let raw: Vec<Vec<String>> = if filters.is_empty() {
+            dims.iter().map(|d| vec![d.name.clone()]).collect()
+        } else {
+            filters.to_vec()
+        };
+
+        let mut shapes: Vec<Shape> = Vec::new();
+        let mut by_key: HashMap<String, usize> = HashMap::new();
+        for f in &raw {
+            if f.is_empty() {
+                return Err("a filter shape must name at least one dimension".into());
+            }
+            let mut idx = Vec::with_capacity(f.len());
+            for n in f {
+                match by_name.get(n) {
+                    Some(&i) => idx.push(i),
+                    None => {
+                        return Err(format!(
+                            "filter shape names {n:?}, which is not a declared dimension \
+                             (have: {})",
+                            dims.iter()
+                                .map(|d| d.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    }
+                }
+            }
+            // Sorted, so ["a","b"] and ["b","a"] are one shape rather than two
+            // that silently double the memory.
+            idx.sort_unstable();
+            if idx.windows(2).any(|w| w[0] == w[1]) {
+                return Err(format!("filter shape {f:?} repeats a dimension"));
+            }
+            let key = idx
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            if by_key.contains_key(&key) {
+                return Err(format!("duplicate filter shape {f:?}"));
+            }
+            by_key.insert(key, shapes.len());
+            shapes.push(Shape {
+                dims: idx,
+                base: 0,
+                strides: Vec::new(),
+            });
+        }
+
+        // Each shape gets a contiguous block, so a cell is `base + mixed-radix
+        // index` and never needs decoding.
+        let mut base: u64 = 0;
+        for sh in &mut shapes {
+            sh.base = base as u32;
+            let mut stride: u64 = 1;
+            sh.strides = vec![0; sh.dims.len()];
+            for k in (0..sh.dims.len()).rev() {
+                sh.strides[k] = stride as u32;
+                stride *= dims[sh.dims[k]].values.len() as u64;
+                if stride > MAX_CELLS as u64 {
+                    return Err(format!(
+                        "filter shape {:?} needs more than the {MAX_CELLS} cells available; \
+                         a shape costs the product of its dimensions",
+                        sh.dims
+                            .iter()
+                            .map(|&i| dims[i].name.as_str())
+                            .collect::<Vec<_>>()
+                    ));
+                }
+            }
+            base += stride;
+        }
+        if base > MAX_CELLS as u64 {
+            return Err(format!(
+                "the declared filters need {base} cells, over the {MAX_CELLS} limit"
+            ));
+        }
+
+        // A device holds one cell per shape when every value is single; a
+        // multi-valued dimension multiplies. Bound it, so one bad device cannot
+        // quietly cost a hundred times its neighbours.
+        let worst: usize = shapes
+            .iter()
+            .map(|sh| {
+                sh.dims
+                    .iter()
+                    .map(|&i| if dims[i].multi { 4 } else { 1 })
+                    .product::<usize>()
+            })
+            .sum();
+        Ok(Schema {
+            cells: base as usize,
+            max_cells_per_device: worst.max(1),
+            dims,
+            shapes,
+            by_name,
+            by_key,
+        })
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.dims.is_empty()
+    }
+
+    fn value(&self, d: usize, v: &str) -> Result<u32, String> {
+        let dim = &self.dims[d];
+        if let Some(i) = dim.values.iter().position(|x| x == v) {
+            return Ok(i as u32);
+        }
+        if let Ok(n) = v.parse::<usize>() {
+            if n < dim.values.len() {
+                return Ok(n as u32);
+            }
+        }
+        Err(format!(
+            "unknown value {v:?} for {:?}; this collection has {:?}",
+            dim.name, dim.values
+        ))
+    }
+
+    /// Every cell a device holding `vals` belongs to.
+    ///
+    /// A dimension absent from `vals` takes value 0, which is what a missing
+    /// `category` has always meant. Declare an explicit "unassigned" label if that
+    /// matters.
+    pub fn cells_for(
+        &self,
+        vals: &HashMap<String, Vec<String>>,
+        out: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        out.clear();
+        if !self.enabled() {
+            return Ok(());
+        }
+        let mut resolved: Vec<Vec<u32>> = Vec::with_capacity(self.dims.len());
+        for (d, dim) in self.dims.iter().enumerate() {
+            match vals.get(&dim.name) {
+                None => resolved.push(vec![0]),
+                Some(list) if list.is_empty() => resolved.push(vec![0]),
+                Some(list) => {
+                    if !dim.multi && list.len() > 1 {
+                        return Err(format!(
+                            "{:?} got {} values but is not declared multi",
+                            dim.name,
+                            list.len()
+                        ));
+                    }
+                    let mut v = Vec::with_capacity(list.len());
+                    for x in list {
+                        let i = self.value(d, x)?;
+                        if !v.contains(&i) {
+                            v.push(i);
+                        }
+                    }
+                    resolved.push(v);
+                }
+            }
+        }
+        for sh in &self.shapes {
+            emit(sh, &resolved, 0, sh.base, out);
+        }
+        if out.len() > self.max_cells_per_device {
+            return Err(format!(
+                "lands in {} filter cells, over the {} this collection allows",
+                out.len(),
+                self.max_cells_per_device
+            ));
+        }
+        Ok(())
+    }
+
+    /// The single cell a query selects, or -1 for "everything".
+    ///
+    /// `sel` must name exactly the dimensions of a declared shape; anything else
+    /// is an error rather than a slow path, so a filter can never quietly become a
+    /// scan of the viewport.
+    pub fn query_cell(&self, sel: &HashMap<String, String>) -> Result<i32, String> {
+        if sel.is_empty() {
+            return Ok(-1);
+        }
+        let mut idx = Vec::with_capacity(sel.len());
+        for n in sel.keys() {
+            match self.by_name.get(n) {
+                Some(&i) => idx.push(i),
+                None => {
+                    return Err(format!(
+                        "unknown filter {n:?}; this collection has {}",
+                        self.dims
+                            .iter()
+                            .map(|d| d.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                }
+            }
+        }
+        idx.sort_unstable();
+        let key = idx
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let Some(&si) = self.by_key.get(&key) else {
+            return Err(format!(
+                "no declared filter combines {:?}; this collection allows {}",
+                sel.keys().collect::<Vec<_>>(),
+                self.describe_shapes()
+            ));
+        };
+        let sh = &self.shapes[si];
+        let mut cell = sh.base;
+        for (k, &d) in sh.dims.iter().enumerate() {
+            let v = &sel[&self.dims[d].name];
+            cell += self.value(d, v)? * sh.strides[k];
+        }
+        Ok(cell as i32)
+    }
+
+    pub fn describe_shapes(&self) -> String {
+        self.shapes
+            .iter()
+            .map(|sh| {
+                format!(
+                    "[{}]",
+                    sh.dims
+                        .iter()
+                        .map(|&i| self.dims[i].name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn emit(sh: &Shape, resolved: &[Vec<u32>], k: usize, acc: u32, out: &mut Vec<u32>) {
+    if k == sh.dims.len() {
+        out.push(acc);
+        return;
+    }
+    for &v in &resolved[sh.dims[k]] {
+        emit(sh, resolved, k + 1, acc + v * sh.strides[k], out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dim(name: &str, values: &[&str], multi: bool) -> Dimension {
+        Dimension {
+            name: name.into(),
+            values: values.iter().map(|s| s.to_string()).collect(),
+            multi,
+        }
+    }
+
+    fn sample() -> Schema {
+        Schema::new(
+            vec![
+                dim("client", &["a", "b", "c"], true),
+                dim("status", &["idle", "enroute"], false),
+            ],
+            &[
+                vec!["client".into()],
+                vec!["status".into()],
+                vec!["client".into(), "status".into()],
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cells_are_blocked_per_shape() {
+        let s = sample();
+        assert_eq!(s.cells, 3 + 2 + 6);
+    }
+
+    #[test]
+    fn a_multi_valued_device_lands_in_a_cell_per_value() {
+        let s = sample();
+        let mut vals = HashMap::new();
+        vals.insert("client".into(), vec!["a".into(), "c".into()]);
+        vals.insert("status".into(), vec!["enroute".into()]);
+        let mut out = Vec::new();
+        s.cells_for(&vals, &mut out).unwrap();
+        out.sort_unstable();
+        // client a, client c, status enroute, (a,enroute), (c,enroute)
+        assert_eq!(out.len(), 5);
+
+        let mut sel = HashMap::new();
+        sel.insert("client".to_string(), "a".to_string());
+        sel.insert("status".to_string(), "enroute".to_string());
+        assert!(out.contains(&(s.query_cell(&sel).unwrap() as u32)));
+
+        sel.insert("client".to_string(), "b".to_string());
+        assert!(!out.contains(&(s.query_cell(&sel).unwrap() as u32)));
+    }
+
+    #[test]
+    fn an_undeclared_combination_is_refused_rather_than_scanned() {
+        let s = Schema::new(
+            vec![
+                dim("client", &["a", "b"], false),
+                dim("status", &["x"], false),
+            ],
+            &[vec!["client".into()], vec!["status".into()]],
+        )
+        .unwrap();
+        let mut sel = HashMap::new();
+        sel.insert("client".to_string(), "a".to_string());
+        sel.insert("status".to_string(), "x".to_string());
+        let err = s.query_cell(&sel).unwrap_err();
+        assert!(err.contains("no declared filter combines"), "{err}");
+    }
+
+    #[test]
+    fn unknown_names_and_values_are_named_in_the_error() {
+        let s = sample();
+        let mut sel = HashMap::new();
+        sel.insert("nope".to_string(), "a".to_string());
+        assert!(s.query_cell(&sel).unwrap_err().contains("unknown filter"));
+
+        let mut sel = HashMap::new();
+        sel.insert("status".to_string(), "gone".to_string());
+        assert!(s.query_cell(&sel).unwrap_err().contains("unknown value"));
+    }
+
+    #[test]
+    fn an_empty_selection_means_everything() {
+        assert_eq!(sample().query_cell(&HashMap::new()).unwrap(), -1);
+    }
+
+    #[test]
+    fn a_single_valued_dimension_refuses_a_list() {
+        let s = sample();
+        let mut vals = HashMap::new();
+        vals.insert("status".into(), vec!["idle".into(), "enroute".into()]);
+        let err = s.cells_for(&vals, &mut Vec::new()).unwrap_err();
+        assert!(err.contains("not declared multi"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_dimension_takes_value_zero() {
+        let s = sample();
+        let mut out = Vec::new();
+        s.cells_for(&HashMap::new(), &mut out).unwrap();
+        let mut sel = HashMap::new();
+        sel.insert("client".to_string(), "a".to_string());
+        sel.insert("status".to_string(), "idle".to_string());
+        assert!(out.contains(&(s.query_cell(&sel).unwrap() as u32)));
+    }
+
+    #[test]
+    fn duplicate_declarations_are_refused() {
+        assert!(Schema::new(vec![dim("a", &["x"], false), dim("a", &["y"], false)], &[]).is_err());
+        assert!(Schema::new(vec![dim("a", &["x", "x"], false)], &[]).is_err());
+        assert!(Schema::new(
+            vec![dim("a", &["x"], false)],
+            &[vec!["a".into()], vec!["a".into()]]
+        )
+        .is_err());
+        assert!(Schema::new(vec![dim("a", &["x"], false)], &[vec!["b".into()]]).is_err());
+    }
+}

@@ -8,8 +8,9 @@
 //! hits. At coarse zooms one query serves every viewer looking at that region.
 
 use crate::collection::{Collection, Config, OutFeature, Report};
-use crate::geojson::{peek_props, CatVal, GeoFeature};
+use crate::geojson::{peek_dims, peek_props, CatVal, DimVal, GeoFeature};
 use crate::mvt;
+use crate::schema::Dimension;
 use axum::{
     extract::{rejection::JsonRejection, FromRequest, Path, Query, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
@@ -286,6 +287,13 @@ pub struct ConfigBody {
     pub hysteresis: Option<f64>,
     /// Category labels; a label's position in this list is its category index.
     pub categories: Option<Vec<String>>,
+    /// Filterable properties, each with its values. `multi` lets one device hold
+    /// several at once. Set this or `categories`, never both.
+    pub dimensions: Option<Vec<Dimension>>,
+    /// Which combinations of dimensions a query may name. Empty means each on its
+    /// own. This is what filtering costs -- one aggregate entry per device per
+    /// shape per tree level.
+    pub filters: Option<Vec<Vec<String>>>,
     /// Largest per-device properties blob accepted, in bytes. 0 refuses properties.
     pub max_props_bytes: Option<usize>,
     pub ttl_seconds: Option<u64>,
@@ -300,6 +308,8 @@ impl ConfigBody {
             extent: self.extent.unwrap_or(d.extent),
             hysteresis: self.hysteresis.unwrap_or(d.hysteresis),
             categories: self.categories.unwrap_or(d.categories),
+            dimensions: self.dimensions.unwrap_or(d.dimensions),
+            filters: self.filters.unwrap_or(d.filters),
             max_props_bytes: self.max_props_bytes.unwrap_or(d.max_props_bytes),
             ttl_seconds: self.ttl_seconds.unwrap_or(d.ttl_seconds),
         }
@@ -325,6 +335,11 @@ async fn create_collection(
     if cfg.radius <= 0.0 || cfg.extent <= 0.0 {
         return Err(ApiError::bad("radius and extent must be positive"));
     }
+    // Resolve the filter schema here, where a bad declaration is a 400 the caller
+    // can read. `Collection::new` cannot report it: the config has already been
+    // accepted by then, and a panic on a request handler takes the process down.
+    cfg.schema()
+        .map_err(|e| ApiError::bad(e).code("bad_filters"))?;
     let mut cs = s.collections.write().unwrap();
     if let Some(existing) = cs.get(&name) {
         // Idempotent for the same geometry, an error for a different one. Silently
@@ -335,6 +350,8 @@ async fn create_collection(
             || e.radius != cfg.radius
             || e.extent != cfg.extent
             || e.categories != cfg.categories
+            || e.dimensions != cfg.dimensions
+            || e.filters != cfg.filters
         {
             return Err(ApiError::conflict(format!(
                 "collection {name:?} already exists with a different geometry; \
@@ -436,6 +453,11 @@ pub struct ReportBody {
     lat: f64,
     #[serde(default)]
     cat: Option<CatVal>,
+    /// Filter values, when the collection declares `dimensions`:
+    /// `{"client": [1, 7], "status": "enroute"}`. Omitting it leaves the device's
+    /// existing values alone, exactly as omitting `props` leaves its properties.
+    #[serde(default)]
+    dims: Option<HashMap<String, DimVal>>,
     /// Any JSON object. Omit it to leave the device's existing properties alone;
     /// send `{}` to clear them.
     #[serde(default)]
@@ -545,6 +567,81 @@ impl<'de> Deserialize<'de> for PositionsBody {
     }
 }
 
+/// Which cell a query selects.
+///
+/// `?f.client=7&f.status=enroute` names one declared filter shape. The `f.`
+/// prefix keeps filter names out of the same namespace as `bbox`, `zoom` and
+/// `cat`, so a dimension called `zoom` is not a problem and no grammar is needed.
+///
+/// `?cat=` remains the spelling for a collection declared with `categories`.
+/// Naming a dimension or a value this collection does not have is a 400 rather
+/// than an empty result: a filter that silently matches nothing looks exactly
+/// like a fleet that has gone quiet.
+fn parse_filter(c: &Collection, q: &HashMap<String, String>) -> ApiResult<i32> {
+    let mut sel: HashMap<String, String> = HashMap::new();
+    for (k, v) in q {
+        if let Some(name) = k.strip_prefix("f.") {
+            if v.is_empty() {
+                continue;
+            }
+            sel.insert(name.to_string(), v.clone());
+        }
+    }
+    if !sel.is_empty() {
+        if let Some(cat) = q.get("cat") {
+            if !cat.is_empty() {
+                return Err(
+                    ApiError::bad("pass either ?cat= or ?f.<name>=, not both".to_string())
+                        .code("bad_filter"),
+                );
+            }
+        }
+        return c
+            .filter_cell(&sel)
+            .map_err(|e| ApiError::bad(e).code("bad_filter"));
+    }
+    c.category(q.get("cat").map(|s| s.as_str()))
+        .map_err(|e| ApiError::bad(e).code("bad_filter"))
+}
+
+/// The filter cells one compact report belongs to.
+///
+/// `None` means the report named no filter values, which leaves the device's
+/// existing ones alone. That distinction matters: positions arrive many times a
+/// second and a bare one must not re-file a vehicle into whatever value happens
+/// to sit at index 0.
+fn compact_cells(
+    c: &Collection,
+    r: &ReportBody,
+    vals: &mut HashMap<String, Vec<String>>,
+) -> Result<Option<Vec<u32>>, String> {
+    if !c.schema.enabled() {
+        return Ok(None);
+    }
+    vals.clear();
+    if let Some(dims) = &r.dims {
+        for (k, v) in dims {
+            vals.insert(k.clone(), v.0.clone());
+        }
+    }
+    // `cat` is the older spelling of the first dimension, and still the one the
+    // compact form uses when a collection declares `categories`.
+    if let Some(cat) = &r.cat {
+        let name = c.schema.dims[0].name.clone();
+        let v = match cat {
+            CatVal::Num(n) => n.to_string(),
+            CatVal::Name(s) => s.clone(),
+        };
+        vals.entry(name).or_insert_with(|| vec![v]);
+    }
+    if vals.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    c.schema.cells_for(vals, &mut out)?;
+    Ok(Some(out))
+}
+
 /// Where a GeoJSON Feature's category is looked for in `properties`, in order of
 /// preference, unless `?cat_property=` names one. Both spellings are here because
 /// the compact form calls it `cat` and the JavaScript library defaults to
@@ -576,23 +673,28 @@ async fn positions(
 
     let n = match &body {
         PositionsBody::Compact(reports) => {
-            let mut resolved = Vec::with_capacity(reports.len());
+            // Cells are built into one owned buffer first so the reports can
+            // borrow slices of it; a report that names no filter values at all
+            // gets None, which leaves the device where it is.
+            let mut store: Vec<Option<Vec<u32>>> = Vec::with_capacity(reports.len());
+            let mut vals: HashMap<String, Vec<String>> = HashMap::new();
             for r in reports {
-                let cat = match &r.cat {
-                    None => 0,
-                    Some(CatVal::Num(n)) => *n,
-                    Some(CatVal::Name(s)) => {
-                        c.category(Some(s)).map_err(ApiError::bad)?.max(0) as u32
-                    }
-                };
-                resolved.push(Report {
+                store.push(
+                    compact_cells(&c, r, &mut vals)
+                        .map_err(|e| ApiError::bad(format!("device {:?}: {e}", r.id)))?,
+                );
+            }
+            let resolved: Vec<Report<'_>> = reports
+                .iter()
+                .zip(&store)
+                .map(|(r, cells)| Report {
                     id: &r.id,
                     lng: r.lng,
                     lat: r.lat,
-                    cat,
                     props: r.props.as_deref(),
-                });
-            }
+                    cells: cells.as_deref(),
+                })
+                .collect();
             c.upsert(&resolved).map_err(ApiError::bad)?
         }
         PositionsBody::Geo(feats) => {
@@ -604,30 +706,95 @@ async fn positions(
             };
             // The peek is a second pass over the properties text, so it is only
             // paid when something actually has to come out of there: an id the
-            // Feature did not carry, or a category this collection can use.
-            let want_cat = !c.config.categories.is_empty();
+            // Feature did not carry, or filter values this collection can use.
+            //
+            // Which names to look for depends on how the collection was declared.
+            // With `categories` it is the `cat`/`category` aliases, earliest one
+            // winning. With `dimensions` it is one property per dimension, each
+            // distinct -- so the two use different peeks over the same one pass.
+            let legacy_cat = !c.config.categories.is_empty();
+            let dim_names: Vec<&str> = if legacy_cat {
+                Vec::new()
+            } else {
+                c.schema.dims.iter().map(|d| d.name.as_str()).collect()
+            };
+            let want_vals = legacy_cat || !dim_names.is_empty();
 
             let mut peeked: Vec<(Option<String>, Option<CatVal>)> = Vec::with_capacity(feats.len());
+            let mut peeked_dims: Vec<Vec<Option<DimVal>>> = Vec::with_capacity(feats.len());
             for (i, f) in feats.iter().enumerate() {
                 let want_id = id_prop.is_some() || f.id.is_none();
-                if !(want_id || want_cat) {
+                if !(want_id || want_vals) {
                     peeked.push((None, None));
+                    peeked_dims.push(Vec::new());
                     continue;
                 }
+                let id_key = if want_id {
+                    id_prop.or(Some("id"))
+                } else {
+                    None
+                };
                 match &f.props {
                     Some(p) => {
-                        let id_key = if want_id {
-                            id_prop.or(Some("id"))
+                        if legacy_cat || dim_names.is_empty() {
+                            let keys: &[&str] = if legacy_cat { &cat_keys } else { &[] };
+                            peeked.push(peek_props(p.get(), id_key, keys).map_err(|e| {
+                                ApiError::bad(format!(
+                                    "features[{i}]: properties are unreadable: {e}"
+                                ))
+                            })?);
+                            peeked_dims.push(Vec::new());
                         } else {
-                            None
-                        };
-                        let keys: &[&str] = if want_cat { &cat_keys } else { &[] };
-                        peeked.push(peek_props(p.get(), id_key, keys).map_err(|e| {
-                            ApiError::bad(format!("features[{i}]: properties are unreadable: {e}"))
-                        })?);
+                            let (id, vals) =
+                                peek_dims(p.get(), id_key, &dim_names).map_err(|e| {
+                                    ApiError::bad(format!(
+                                        "features[{i}]: properties are unreadable: {e}"
+                                    ))
+                                })?;
+                            peeked.push((id, None));
+                            peeked_dims.push(vals);
+                        }
                     }
-                    None => peeked.push((None, None)),
+                    None => {
+                        peeked.push((None, None));
+                        peeked_dims.push(Vec::new());
+                    }
                 }
+            }
+
+            // Cells first, into one owned buffer the reports borrow from.
+            let mut cell_store: Vec<Option<Vec<u32>>> = Vec::with_capacity(feats.len());
+            let mut vals: HashMap<String, Vec<String>> = HashMap::new();
+            for i in 0..feats.len() {
+                if !c.schema.enabled() {
+                    cell_store.push(None);
+                    continue;
+                }
+                vals.clear();
+                if legacy_cat {
+                    if let Some(cat) = &peeked[i].1 {
+                        let v = match cat {
+                            CatVal::Num(n) => n.to_string(),
+                            CatVal::Name(s) => s.clone(),
+                        };
+                        vals.insert(c.schema.dims[0].name.clone(), vec![v]);
+                    }
+                } else {
+                    for (d, got) in peeked_dims[i].iter().enumerate() {
+                        if let Some(v) = got {
+                            vals.insert(dim_names[d].to_string(), v.0.clone());
+                        }
+                    }
+                }
+                if vals.is_empty() {
+                    cell_store.push(None);
+                    continue;
+                }
+                let mut out = Vec::new();
+                c.schema.cells_for(&vals, &mut out).map_err(|e| {
+                    ApiError::bad(format!("features[{i}]: {e}")).code("bad_geojson")
+                })?;
+                cell_store.push(Some(out));
             }
 
             let mut resolved = Vec::with_capacity(feats.len());
@@ -673,19 +840,12 @@ async fn positions(
                         .code("bad_geojson")
                     })?,
                 };
-                let cat = match &peeked[i].1 {
-                    None => 0,
-                    Some(CatVal::Num(n)) => *n,
-                    Some(CatVal::Name(s)) => {
-                        c.category(Some(s)).map_err(ApiError::bad)?.max(0) as u32
-                    }
-                };
                 resolved.push(Report {
                     id,
                     lng: geom.lng,
                     lat: geom.lat,
-                    cat,
                     props: f.props.as_deref(),
+                    cells: cell_store[i].as_deref(),
                 });
             }
             c.upsert(&resolved).map_err(ApiError::bad)?
@@ -804,9 +964,7 @@ async fn clusters(
     Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult<Json<Value>> {
     let c = s.get(&name)?;
-    let cat = c
-        .category(q.get("cat").map(|s| s.as_str()))
-        .map_err(ApiError::bad)?;
+    let cat = parse_filter(&c, &q)?;
     let fs = c.clusters(parse_bbox(&q)?, parse_zoom(&q)?, cat);
     Ok(Json(collection_json(&fs)))
 }
@@ -881,9 +1039,7 @@ async fn tile(
         )));
     }
     let c = s.get(&name)?;
-    let cat = c
-        .category(q.get("cat").map(|s| s.as_str()))
-        .map_err(ApiError::bad)?;
+    let cat = parse_filter(&c, &q)?;
     let feats = c.tile(z, x, y, cat);
 
     match ext {

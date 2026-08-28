@@ -6,4 +6,5 @@ pub mod collection;
 pub mod geojson;
 pub mod mvt;
 pub mod routes;
+pub mod schema;
 pub mod snapshot;

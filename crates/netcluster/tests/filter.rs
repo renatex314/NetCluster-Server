@@ -275,3 +275,190 @@ fn slices_survive_churn() {
         }
     }
 }
+
+// ------------------------------------------- several cells per device -------
+//
+// The core knows nothing about dimension names: a caller encodes its own
+// combinations and hands over cell indices. These tests use the same encoding the
+// server does -- one block per filter shape -- so a device that belongs to two
+// clients and one status occupies five cells.
+
+const CLIENTS: u32 = 6;
+const STATUSES: u32 = 3;
+/// shapes: [client] at 0, [status] at CLIENTS, [client, status] after that
+const BASE_STATUS: u32 = CLIENTS;
+const BASE_BOTH: u32 = CLIENTS + STATUSES;
+const CELLS: usize = (CLIENTS + STATUSES + CLIENTS * STATUSES) as usize;
+
+fn cells_of(clients: &[u32], status: u32, out: &mut Vec<u32>) {
+    out.clear();
+    for &c in clients {
+        out.push(c);
+        out.push(BASE_BOTH + c * STATUSES + status);
+    }
+    out.push(BASE_STATUS + status);
+}
+
+fn total(nc: &NetCluster, zoom: f64, cell: i32) -> i32 {
+    nc.get_clusters(WORLD, zoom, cell)
+        .iter()
+        .map(|f| match f {
+            Feature::Cluster { count, .. } => *count as i32,
+            Feature::Point { .. } => 1,
+        })
+        .sum()
+}
+
+fn multi_world(dense_cells: usize) -> (NetCluster, HashMap<u64, (Vec<u32>, u32)>) {
+    let mut rng = Rng(9876);
+    let mut nc = NetCluster::new(Options {
+        cells: CELLS,
+        max_cells_per_device: 8,
+        dense_cells,
+        ..Default::default()
+    });
+    let mut truth: HashMap<u64, (Vec<u32>, u32)> = HashMap::new();
+    let mut buf = Vec::new();
+    for i in 0..600u64 {
+        let lng = -46.63 + (rng.next() - 0.5) * 0.6;
+        let lat = -23.55 + (rng.next() - 0.5) * 0.6;
+        let a = (rng.next() * CLIENTS as f64) as u32 % CLIENTS;
+        let b = (rng.next() * CLIENTS as f64) as u32 % CLIENTS;
+        let clients: Vec<u32> = if a == b { vec![a] } else { vec![a, b] };
+        let status = (rng.next() * STATUSES as f64) as u32 % STATUSES;
+        cells_of(&clients, status, &mut buf);
+        let (x, y) = project(lng, lat);
+        nc.insert_projected_cells(i, x, y, &buf);
+        truth.insert(i, (clients, status));
+    }
+    (nc, truth)
+}
+
+#[test]
+fn a_device_can_hold_several_values_and_filters_combine() {
+    for dense_cells in [64, 0] {
+        let (nc, truth) = multi_world(dense_cells);
+        assert_eq!(nc.options().dense_cells > 0, dense_cells > 0);
+        nc.verify().expect("aggregates must agree with the tree");
+
+        for z in [0.0, 6.0, 11.0, 16.0] {
+            for c in 0..CLIENTS {
+                let want = truth.values().filter(|(cl, _)| cl.contains(&c)).count() as i32;
+                assert_eq!(total(&nc, z, c as i32), want, "client {c} at z{z}");
+            }
+            for s in 0..STATUSES {
+                let want = truth.values().filter(|(_, st)| *st == s).count() as i32;
+                assert_eq!(
+                    total(&nc, z, (BASE_STATUS + s) as i32),
+                    want,
+                    "status {s} at z{z}"
+                );
+            }
+            // the conjunction, which marginal counts cannot answer
+            for c in 0..CLIENTS {
+                for s in 0..STATUSES {
+                    let want = truth
+                        .values()
+                        .filter(|(cl, st)| cl.contains(&c) && *st == s)
+                        .count() as i32;
+                    assert_eq!(
+                        total(&nc, z, (BASE_BOTH + c * STATUSES + s) as i32),
+                        want,
+                        "client {c} and status {s} at z{z}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_standing_device_changes_filters_when_its_values_change() {
+    let mut nc = NetCluster::new(Options {
+        cells: CELLS,
+        max_cells_per_device: 8,
+        ..Default::default()
+    });
+    let (x, y) = project(-46.63, -23.55);
+    let mut buf = Vec::new();
+    cells_of(&[2], 0, &mut buf);
+    nc.insert_projected_cells(1, x, y, &buf);
+    assert_eq!(total(&nc, 16.0, BASE_STATUS as i32), 1);
+
+    // identical position, different status
+    cells_of(&[2], 1, &mut buf);
+    nc.move_to_projected_cells(1, x, y, Some(&buf));
+    assert_eq!(
+        total(&nc, 16.0, BASE_STATUS as i32),
+        0,
+        "left the old status"
+    );
+    assert_eq!(
+        total(&nc, 16.0, (BASE_STATUS + 1) as i32),
+        1,
+        "joined the new status"
+    );
+    assert_eq!(total(&nc, 16.0, 2), 1, "client is unchanged");
+    // and the conjunction moved with it
+    assert_eq!(total(&nc, 16.0, (BASE_BOTH + 2 * STATUSES) as i32), 0);
+    assert_eq!(total(&nc, 16.0, (BASE_BOTH + 2 * STATUSES + 1) as i32), 1);
+    nc.verify().expect("aggregates must survive a re-file");
+
+    // a bare position report leaves the values alone
+    let (x2, y2) = project(-46.64, -23.56);
+    nc.move_to_projected(1, x2, y2);
+    assert_eq!(total(&nc, 16.0, (BASE_STATUS + 1) as i32), 1);
+    nc.verify().unwrap();
+}
+
+#[test]
+fn co_located_devices_are_all_reachable_by_filter() {
+    // 20 vehicles sharing one coordinate cluster at every zoom, so the filter has
+    // to reach inside the cluster rather than read the marker's own properties.
+    let mut nc = NetCluster::new(Options {
+        cells: CELLS,
+        max_cells_per_device: 8,
+        ..Default::default()
+    });
+    let (x, y) = project(-46.6333, -23.5505);
+    let mut buf = Vec::new();
+    cells_of(&[4], 1, &mut buf);
+    for i in 0..20u64 {
+        nc.insert_projected_cells(i, x, y, &buf);
+    }
+    cells_of(&[5], 1, &mut buf);
+    nc.insert_projected_cells(99, x, y, &buf);
+    assert_eq!(total(&nc, 16.0, 4), 20);
+    assert_eq!(total(&nc, 16.0, 5), 1);
+    assert_eq!(total(&nc, 16.0, -1), 21);
+}
+
+#[test]
+fn the_table_empties_when_the_index_does() {
+    let mut nc = NetCluster::new(Options {
+        cells: CELLS,
+        max_cells_per_device: 8,
+        dense_cells: 0,
+        ..Default::default()
+    });
+    let mut buf = Vec::new();
+    for round in 0..3u32 {
+        for i in 0..400u64 {
+            let (x, y) = project(-46.6 + i as f64 * 0.001, -23.5 + i as f64 * 0.001);
+            cells_of(
+                &[(i as u32 + round) % CLIENTS],
+                i as u32 % STATUSES,
+                &mut buf,
+            );
+            nc.insert_projected_cells(i, x, y, &buf);
+        }
+        for i in 0..400u64 {
+            nc.remove(i);
+        }
+        assert_eq!(
+            nc.agg_entries(),
+            0,
+            "round {round}: entries survived an empty index"
+        );
+    }
+}

@@ -49,6 +49,25 @@ export class NetClusterError extends Error {
 const trimSlash = (u) => String(u).replace(/\/+$/, '');
 const enc = encodeURIComponent;
 
+/**
+ * Filter values onto `f.<name>=` query parameters.
+ *
+ * A query names one value per dimension of a declared filter shape. A device may
+ * hold several values for a `multi` dimension, but a query picks one of them --
+ * "client 7" has an answer, "client 7 or 9" is two questions.
+ */
+function applyFilter(q, filter) {
+  if (filter === undefined || filter === null) return;
+  for (const [k, v] of Object.entries(filter)) {
+    if (v === undefined || v === null || v === '') continue;
+    if (Array.isArray(v)) {
+      throw new TypeError(
+        `netcluster: filter on ${JSON.stringify(k)} takes one value, not a list`);
+    }
+    q.set(`f.${k}`, String(v));
+  }
+}
+
 /** FNV-1a, for picking a stable replica from a viewer key. */
 function hash32(s) {
   let h = 0x811c9dc5;
@@ -201,6 +220,8 @@ export class NetClusterClient {
     if (config.extent !== undefined) body.extent = config.extent;
     if (config.hysteresis !== undefined) body.hysteresis = config.hysteresis;
     if (config.categories !== undefined) body.categories = config.categories;
+    if (config.dimensions !== undefined) body.dimensions = config.dimensions;
+    if (config.filters !== undefined) body.filters = config.filters;
     if (config.ttlSeconds !== undefined) body.ttl_seconds = config.ttlSeconds;
     if (config.maxPropsBytes !== undefined) body.max_props_bytes = config.maxPropsBytes;
     return this._write(`/v1/collections/${enc(name)}`, { method: 'PUT', body });
@@ -349,10 +370,11 @@ export class NetClusterClient {
    * Clusters in a bounding box, as a GeoJSON FeatureCollection.
    * @param {[number,number,number,number]} opts.bbox [west, south, east, north]
    */
-  getClusters(name, { bbox, zoom = 0, cat } = {}) {
+  getClusters(name, { bbox, zoom = 0, cat, filter } = {}) {
     const q = new URLSearchParams({ zoom: String(zoom) });
     if (bbox) q.set('bbox', bbox.join(','));
     if (cat !== undefined && cat !== null && cat !== '') q.set('cat', String(cat));
+    applyFilter(q, filter);
     return this._read(`/v1/collections/${enc(name)}/clusters?${q}`);
   }
 
@@ -360,9 +382,10 @@ export class NetClusterClient {
    * One vector tile. Returns a `Uint8Array` of MVT bytes, or the tile as GeoJSON
    * in tile-extent coordinates with `format: 'json'`.
    */
-  getTile(name, z, x, y, { cat, format = 'mvt' } = {}) {
+  getTile(name, z, x, y, { cat, filter, format = 'mvt' } = {}) {
     const q = new URLSearchParams();
     if (cat !== undefined && cat !== null && cat !== '') q.set('cat', String(cat));
+    applyFilter(q, filter);
     const qs = q.toString();
     const ext = format === 'json' ? 'json' : 'mvt';
     return this._read(

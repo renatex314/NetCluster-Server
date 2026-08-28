@@ -80,6 +80,14 @@ is not.
 Capped by `max_props_bytes` (default 1024). Anything you filter or group by belongs
 in `categories` instead, which is indexed.
 
+Filters are declared up front and matched exactly. `categories` gives you one;
+`dimensions` plus `filters` gives you several that **combine**
+(`?f.client=7&f.status=enroute`), and `multi` lets one device hold several values
+for a dimension. Still out of reach: substring search, ranges, `OR` across values,
+and anything in `props`. Note too that `clusters` is not a device listing:
+co-located devices come back as one cluster with no id and no props at every
+zoom.
+
 ## Tuning the clustering
 
 Set per collection when you create it:
@@ -90,7 +98,8 @@ Set per collection when you create it:
 | `extent` | `512` | tile extent those pixels are measured against |
 | `max_zoom` | `16` | finest zoom at which points still cluster (max 20) |
 | `hysteresis` | `0.25` | how far an assignment stretches before a point is re-homed |
-| `categories` | `[]` | filter labels |
+| `categories` | `[]` | filter labels (one dimension) |
+| `dimensions` / `filters` | `[]` | several filterable properties, and which combinations a query may name |
 | `max_props_bytes` | `1024` | largest per-device `props` blob; 0 refuses properties |
 | `ttl_seconds` | `300` | drop a device that has not reported for this long |
 

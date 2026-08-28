@@ -65,5 +65,5 @@ mod project;
 
 pub use cellhash::CellHash;
 pub use feature::{ClusterIdError, Feature, TileFeature};
-pub use index::{NetCluster, Options, Slot, Stats, Verification, NONE};
+pub use index::{NetCluster, Options, Slot, Stats, Verification, MAX_CELLS, NONE};
 pub use project::{project, unproject, PREC, PREC_BITS, PREC_I};

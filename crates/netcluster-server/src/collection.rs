@@ -23,6 +23,7 @@
 //! are wrong. Shard by collection (fleet A, fleet B), never by region, and size a
 //! process so that one collection fits in it.
 
+use crate::schema::{Dimension, Schema};
 use crate::snapshot::DeviceRecord;
 use netcluster::{Feature, NetCluster, Options};
 use serde_json::value::RawValue;
@@ -54,7 +55,23 @@ pub struct Config {
     pub hysteresis: f64,
     /// Category labels. The index of a label *is* its category, so a query can say
     /// `?cat=delivering` instead of `?cat=2`.
+    ///
+    /// A shorthand for a single dimension named `cat`. Set this or `dimensions`,
+    /// never both.
     pub categories: Vec<String>,
+    /// Properties this collection can filter on. Each declares its possible
+    /// values, and `multi` lets one device hold several at once -- a vehicle owned
+    /// by three clients, say, which a single category cannot express.
+    #[serde(default)]
+    pub dimensions: Vec<Dimension>,
+    /// Which combinations of dimensions a query may name. Empty means each
+    /// dimension on its own.
+    ///
+    /// This is what filtering costs: a device contributes one aggregate entry per
+    /// shape per tree level, so declaring `[["client"], ["status"],
+    /// ["client","status"]]` costs three times what `[["client"]]` does.
+    #[serde(default)]
+    pub filters: Vec<Vec<String>>,
     /// Largest per-device properties blob accepted, in bytes. 0 refuses properties
     /// entirely.
     ///
@@ -77,6 +94,8 @@ impl Default for Config {
             extent: 512.0,
             hysteresis: 0.25,
             categories: Vec::new(),
+            dimensions: Vec::new(),
+            filters: Vec::new(),
             max_props_bytes: 1024,
             ttl_seconds: 300,
         }
@@ -130,6 +149,14 @@ struct Inner {
 pub struct Collection {
     pub name: String,
     pub config: Config,
+    /// Resolved filter schema. Derived from `config`, kept beside it so a query
+    /// resolves names to a cell without rebuilding it every time.
+    pub schema: Schema,
+    /// Where a device with no filter values at all goes: value 0 in every
+    /// dimension, which is what a missing `category` has always meant. Without
+    /// this a device reported without values would hold no cells and vanish from
+    /// every filter while still appearing unfiltered.
+    default_cells: Vec<u32>,
     state: RwLock<Inner>,
     pub created_ms: u64,
     pub ingested: AtomicU64,
@@ -151,7 +178,6 @@ pub struct Report<'a> {
     pub id: &'a str,
     pub lng: f64,
     pub lat: f64,
-    pub cat: u32,
     /// `None` leaves whatever the device already had; `Some` replaces it.
     ///
     /// That asymmetry is the point: properties are slow-changing metadata and
@@ -164,6 +190,12 @@ pub struct Report<'a> {
     /// `{"nested":{"a":1}}`, a patch of `{"nested":{"b":2}}` could reasonably
     /// replace `nested` or merge into it -- and replacement is not.
     pub props: Option<&'a RawValue>,
+    /// The filter cells this device belongs to.
+    ///
+    /// `None` means the report carried no filter values at all, which leaves the
+    /// device's existing ones alone -- a bare position report must not silently
+    /// re-file a vehicle into whatever value happens to be index 0.
+    pub cells: Option<&'a [u32]>,
 }
 
 /// One thing to draw.
@@ -237,18 +269,58 @@ pub struct CollectionStats {
     pub max_props_bytes: usize,
 }
 
+impl Config {
+    /// Resolve the declared filters, or say why they cannot be.
+    ///
+    /// `categories` is the older spelling of one dimension named `cat`; it is
+    /// translated here so there is exactly one code path below this line.
+    pub fn schema(&self) -> Result<Schema, String> {
+        if !self.categories.is_empty() && !self.dimensions.is_empty() {
+            return Err("set either `categories` or `dimensions`, not both".into());
+        }
+        if !self.filters.is_empty() && self.dimensions.is_empty() {
+            return Err("`filters` needs `dimensions` to name".into());
+        }
+        let dims = if self.dimensions.is_empty() {
+            if self.categories.is_empty() {
+                Vec::new()
+            } else {
+                vec![Dimension {
+                    name: "cat".into(),
+                    values: self.categories.clone(),
+                    multi: false,
+                }]
+            }
+        } else {
+            self.dimensions.clone()
+        };
+        Schema::new(dims, &self.filters)
+    }
+}
+
 impl Collection {
     pub fn new(name: &str, config: Config) -> Self {
+        let schema = config
+            .schema()
+            .expect("Config::validate must run before Collection::new");
         let index = NetCluster::new(Options {
             min_zoom: 0,
             max_zoom: config.max_zoom,
             radius: config.radius,
             extent: config.extent,
             hysteresis: config.hysteresis,
-            categories: config.categories.len(),
+            cells: schema.cells,
+            max_cells_per_device: schema.max_cells_per_device,
+            ..Default::default()
         });
+        let mut default_cells = Vec::new();
+        schema
+            .cells_for(&HashMap::new(), &mut default_cells)
+            .expect("value 0 exists in every declared dimension");
         Collection {
             name: name.to_string(),
+            schema,
+            default_cells,
             config,
             state: RwLock::new(Inner {
                 index,
@@ -281,7 +353,7 @@ impl Collection {
         } else {
             0
         };
-        let k = c.config.categories.len();
+        let cells = c.schema.cells;
         let mut skipped = 0usize;
         {
             let mut st = c.state.write().unwrap();
@@ -290,17 +362,26 @@ impl Collection {
                     skipped += 1;
                     continue;
                 }
-                // The config can have changed since the snapshot was written. A
-                // category that no longer exists falls back to 0 rather than
-                // panicking on a startup path, where a panic means the process
-                // never comes back at all.
-                let cat = if k > 0 && (r.cat as usize) < k {
-                    r.cat
-                } else {
-                    0
-                };
+                // The config can have changed since the snapshot was written, so
+                // a cell that no longer exists is dropped rather than panicking on
+                // a startup path, where a panic means the process never comes back
+                // at all. Dropping is the safe direction: the device still appears
+                // on the map, just not under a filter it can no longer belong to.
+                let mut kept: Vec<u32> = r
+                    .cells
+                    .iter()
+                    .copied()
+                    .filter(|&c| (c as usize) < cells)
+                    .collect();
+                kept.truncate(c.schema.max_cells_per_device);
+                // If the declaration changed enough that nothing survived, the
+                // device still has to land somewhere filterable rather than
+                // disappearing from every filter while showing up unfiltered.
+                if kept.is_empty() {
+                    kept.extend_from_slice(&c.default_cells);
+                }
                 let n = st.ids.intern(&r.id);
-                st.index.insert_projected(n, r.x, r.y, cat);
+                st.index.insert_projected_cells(n, r.x, r.y, &kept);
                 st.ids.last_seen[n as usize] = r.last_seen_ms;
                 if let Some(p) = &r.props {
                     st.ids.props[n as usize] = RawValue::from_string(p.clone()).ok().map(Arc::new);
@@ -332,7 +413,7 @@ impl Collection {
                 id: st.ids.to_str[n as usize].clone(),
                 x,
                 y,
-                cat: st.index.category_of(n).unwrap_or(0),
+                cells: st.index.cells_of(n).unwrap_or(&[]).to_vec(),
                 last_seen_ms: seen,
                 props: st.ids.props[n as usize]
                     .as_ref()
@@ -371,32 +452,56 @@ impl Collection {
         if sel.is_empty() {
             return Ok(-1);
         }
-        if let Some(i) = self.config.categories.iter().position(|c| c == sel) {
-            return Ok(i as i32);
-        }
-        if let Ok(n) = sel.parse::<usize>() {
-            if n < self.config.categories.len() {
-                return Ok(n as i32);
+        let mut one = HashMap::with_capacity(1);
+        let name = match self.schema.dims.first() {
+            Some(d) => d.name.clone(),
+            None => {
+                return Err(format!(
+                    "unknown category {sel:?}; this collection declares no filters"
+                ))
             }
-        }
-        Err(format!(
-            "unknown category {sel:?}; this collection has {:?}",
-            self.config.categories
-        ))
+        };
+        one.insert(name, sel.to_string());
+        // Reworded rather than passed through: `?cat=` is the published spelling
+        // and its error text is what clients match on. The schema underneath calls
+        // the same thing a dimension value.
+        self.schema.query_cell(&one).map_err(|_| {
+            format!(
+                "unknown category {sel:?}; this collection has {:?}",
+                self.config.categories
+            )
+        })
+    }
+
+    /// The cell a `?f.name=value` selection picks, or -1 for everything.
+    pub fn filter_cell(&self, sel: &HashMap<String, String>) -> Result<i32, String> {
+        self.schema.query_cell(sel)
     }
 
     pub fn upsert(&self, reports: &[Report<'_>]) -> Result<usize, String> {
-        let k = self.config.categories.len();
+        let cells = self.schema.cells;
         let cap = self.config.max_props_bytes;
         for r in reports {
             if !r.lng.is_finite() || !r.lat.is_finite() {
                 return Err(format!("device {:?} sent a non-finite coordinate", r.id));
             }
-            if k > 0 && r.cat as usize >= k {
-                return Err(format!(
-                    "device {:?} has category {} but this collection has {k}",
-                    r.id, r.cat
-                ));
+            if let Some(cs) = r.cells {
+                if cs.len() > self.schema.max_cells_per_device {
+                    return Err(format!(
+                        "device {:?} lands in {} filter cells, over the {} this collection allows",
+                        r.id,
+                        cs.len(),
+                        self.schema.max_cells_per_device
+                    ));
+                }
+                for &c in cs {
+                    if c as usize >= cells {
+                        return Err(format!(
+                            "device {:?} has filter cell {c} but this collection has {cells}",
+                            r.id
+                        ));
+                    }
+                }
             }
             if let Some(p) = r.props {
                 let raw = p.get();
@@ -429,9 +534,16 @@ impl Collection {
         for r in reports {
             let n = st.ids.intern(r.id);
             if st.index.contains(n) {
-                st.index.move_to(n, r.lng, r.lat);
+                // `r.cells` of None leaves the device's filter values alone; Some
+                // re-files it. Before this the values were frozen at first insert,
+                // so a vehicle's status could never change -- and a status change
+                // does not move the vehicle, so nothing else would notice.
+                st.index.move_to_cells(n, r.lng, r.lat, r.cells);
             } else {
-                st.index.insert_with_category(n, r.lng, r.lat, r.cat);
+                // A new device with no values named still has to land somewhere,
+                // and that somewhere is value 0 in every dimension.
+                st.index
+                    .insert_with_cells(n, r.lng, r.lat, r.cells.unwrap_or(&self.default_cells));
             }
             st.ids.last_seen[n as usize] = now;
             if let Some(p) = r.props {
