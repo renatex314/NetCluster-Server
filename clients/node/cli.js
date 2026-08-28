@@ -13,8 +13,15 @@
 
 import { NetClusterClient, NetClusterError } from './index.js';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.1.0';
+// Read from the manifest rather than repeating it here. Hardcoded, this said
+// 0.1.0 while the package was on 0.4.0: `netcluster --version` is the one thing
+// a user reads to tell you what they are running, so it cannot be a copy that
+// nothing keeps in step.
+const VERSION = JSON.parse(
+  readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf8')
+).version;
 
 // ---------------------------------------------------------------- plumbing --
 

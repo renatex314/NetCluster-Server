@@ -313,6 +313,19 @@ test('an unreachable server says so rather than hanging', () => {
   assert.match(r.stderr, /is the server running/);
 });
 
+test('--version matches the package, and the manifest ships with it', () => {
+  // `URL` is shadowed by the server URL constant above, so build the path
+  const pkg = JSON.parse(readFileSync(join(HERE, 'package.json'), 'utf8'));
+  const r = cli(['--version']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), pkg.version,
+    'the CLI version drifted from the package -- it used to be a hardcoded copy');
+  // cli.js reads package.json at runtime, so `files` must not exclude it. npm
+  // always ships the manifest, but the bin path has to resolve beside it.
+  assert.equal(pkg.bin.netcluster, 'cli.js',
+    'npm rewrites a "./" prefix on publish and warns while doing it');
+});
+
 test('help lists every command', () => {
   const r = cli(['help']);
   assert.equal(r.status, 0);
