@@ -379,15 +379,19 @@ await test('a second process restores from the snapshot', async () => {
 });
 
 await test('dropping a collection removes its snapshot', async () => {
-  const { readdirSync } = await import('node:fs');
+  const { existsSync } = await import('node:fs');
+  const snapshotPath = join(DATA, 'will-be-dropped.ncs');
+
   const tmp = nc.collection('will-be-dropped');
   await tmp.create({ ttlSeconds: 0 });
   await tmp.report([{ id: 'x', lng: 1, lat: 1 }]);
   await tmp.snapshot();
-  const before = readdirSync(DATA).length;
+
+  assert.ok(existsSync(snapshotPath), 'snapshot was not created');
+
   const res = await tmp.drop();
-  assert.equal(res.snapshot_removed, true, 'the snapshot file was left behind');
-  assert.equal(readdirSync(DATA).length, before - 1, 'file count did not drop');
+  assert.equal(res.snapshot_removed, true);
+  assert.equal(existsSync(snapshotPath), false, 'snapshot file was left behind');
 });
 
 await test('the index still passes its own invariant check', async () => {
