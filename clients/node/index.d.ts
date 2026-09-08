@@ -23,7 +23,7 @@ export interface ClientOptions {
   urls?: string[];
   /** Per-request timeout. Default 5000. */
   timeoutMs?: number;
-  /** Retries for network errors and 5xx. Never applied to 4xx. Default 1. */
+  /** Retries for network errors, 429 and 5xx, with backoff. Default 1. */
   retries?: number;
   /** Called when a write reached some replicas but not all. */
   onReplicaError?: (failures: { url: string; error: Error }[]) => void;
@@ -83,7 +83,7 @@ export interface CollectionConfig {
  *
  * Give it `values` when you know them, or `capacity` when you do not. With
  * `capacity` the values are interned as they arrive, so the ceiling is how many
- * distinct ones may coexist rather than how large an id may get — auto-increment
+ * distinct ones have ever been assigned rather than how large an id may get — auto-increment
  * client ids running into the millions are fine behind `capacity: 4096`.
  */
 export interface Dimension {
@@ -101,6 +101,11 @@ export interface Point {
   id: string;
   lng: number;
   lat: number;
+  /**
+   * Strictly increasing source version. Defaults to a process-local logical clock.
+   * An older retry is ignored by the server instead of moving the device back.
+   */
+  updatedAt?: number;
   cat?: number | string;
   /**
    * Filter values, when the collection declares `dimensions`:
@@ -159,6 +164,8 @@ export interface DeviceInfo {
   last_seen_ms: number;
   /** How long ago it reported. Compare against the collection's `ttl_seconds`. */
   age_ms: number;
+  /** Last accepted source-side version, when the client supplied one. */
+  updated_at_ms: number | null;
   /** Whatever was last reported for this device, or null. */
   props: Record<string, unknown> | null;
 }
@@ -194,9 +201,19 @@ export interface CollectionStats {
   snapshot_failures: number;
   /** Devices loaded from a snapshot at startup. */
   restored: number;
+  /** Reports rejected because their source version was older than the stored one. */
+  stale_reports: number;
+  /** Defensive index rebuilds after a detected materialized-view mismatch. */
+  repairs: number;
+  /** Number of currently interned dynamic values per dimension. */
+  interned: number[];
+  /** Declared value capacity per dimension. */
+  dimension_capacities: number[];
   /** Bytes of device properties currently held. */
   props_bytes: number;
   max_props_bytes: number;
+  /** Bytes held by the searchable text fields. */
+  text_bytes: number;
 }
 
 export interface Health {
@@ -210,6 +227,8 @@ export interface Health {
 
 export interface ReportResult {
   accepted: number;
+  /** Reports ignored because their source version was older than the stored one. */
+  stale?: number;
   devices?: number;
 }
 
@@ -266,6 +285,8 @@ export interface ReporterStats {
   /** Reports replaced by a newer one for the same device before being sent. */
   coalesced: number;
   sent: number;
+  /** Reports ignored because their source version was older than the stored one. */
+  stale: number;
   requests: number;
   errors: number;
 }
@@ -292,6 +313,9 @@ export declare class Reporter {
  */
 export interface InputFeature {
   type: 'Feature';
+  /** Source version; sent as a top-level GeoJSON foreign member. */
+  updatedAt?: number;
+  updated_at_ms?: number;
   id?: string | number;
   properties: Record<string, unknown> | null;
   geometry: { type: 'Point'; coordinates: number[] };

@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import assert from 'node:assert/strict';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const BIN = process.env.NETCLUSTER_BIN ?? join(HERE, '../../target/release/netcluster-server');
+const BIN = process.env.NETCLUSTER_BIN ?? join(HERE, '../../target/release/netcluster-server' + (process.platform === 'win32' ? '.exe' : ''));
 const PORT = 9000 + Math.floor(Math.random() * 900);
 const URL = `http://127.0.0.1:${PORT}`;
 const DATA = join(tmpdir(), `netcluster-cli-${process.pid}-${Date.now()}`);
@@ -80,7 +80,7 @@ test('a different geometry is refused, not silently ignored', () => {
 test('seed and collections', () => {
   const s = cli(['seed', 'fleet', '--count', '5000', '--categories', 'idle,enroute,delivering']);
   assert.equal(s.status, 0, s.stderr);
-  assert.match(s.stdout, /seeded 5,000/);
+  assert.ok(s.stdout.includes('seeded ' + (5000).toLocaleString()), s.stdout);
   const c = cli(['collections', '--json']);
   const found = JSON.parse(c.stdout).find((x) => x.name === 'fleet');
   assert.equal(found.devices, 5000);

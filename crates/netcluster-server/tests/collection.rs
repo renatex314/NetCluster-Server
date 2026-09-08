@@ -2,6 +2,8 @@
 //! labels, expiry, and concurrent reads while a writer is running.
 
 use netcluster_server::collection::{Collection, Config, Report};
+use netcluster_server::schema::Dimension;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -23,6 +25,7 @@ fn report<'a>(id: &'a str, lng: f64, lat: f64, cells: &'a [u32]) -> Report<'a> {
         // an empty list is "this report names no filter values", which is the
         // only thing that means anything on a collection with none declared
         cells: if cells.is_empty() { None } else { Some(cells) },
+        updated_at_ms: None,
     }
 }
 
@@ -57,6 +60,81 @@ fn reinterning_a_removed_id_reuses_its_slot() {
         (f.lng - 1.0).abs() < 1e-6,
         "reinsert kept the stale position"
     );
+}
+
+#[test]
+fn a_late_versioned_report_cannot_move_a_device_backwards() {
+    let c = Collection::new("t", cfg(&[], 0));
+    let newer = Report {
+        id: "vehicle-7",
+        lng: 10.0,
+        lat: 10.0,
+        props: None,
+        cells: None,
+        updated_at_ms: Some(200),
+    };
+    let older = Report {
+        id: "vehicle-7",
+        lng: 1.0,
+        lat: 1.0,
+        props: None,
+        cells: None,
+        updated_at_ms: Some(100),
+    };
+    assert_eq!(c.upsert(&[newer]).unwrap(), 1);
+    assert_eq!(c.upsert(&[older]).unwrap(), 0);
+    let d = c.device("vehicle-7").unwrap();
+    assert!((d.lng - 10.0).abs() < 1e-6);
+    assert!((d.lat - 10.0).abs() < 1e-6);
+    assert_eq!(c.stats().stale_reports, 1);
+}
+
+#[test]
+fn dynamic_dimension_slots_are_not_reassigned_after_devices_leave() {
+    let c = Collection::new(
+        "t",
+        Config {
+            dimensions: vec![Dimension {
+                name: "client".into(),
+                values: Vec::new(),
+                capacity: Some(2),
+                multi: false,
+            }],
+            ..Default::default()
+        },
+    );
+    for (id, value) in [("a", "old-a"), ("b", "old-b")] {
+        let mut vals = HashMap::new();
+        vals.insert("client".into(), vec![value.into()]);
+        let mut cells = Vec::new();
+        c.cells_for_report(&vals, &mut cells).unwrap();
+        c.upsert(&[Report {
+            id,
+            lng: 1.0,
+            lat: 1.0,
+            props: None,
+            cells: Some(&cells),
+            updated_at_ms: None,
+        }])
+        .unwrap();
+    }
+    assert_eq!(c.interned(), vec![2]);
+    c.remove("a");
+    c.remove("b");
+
+    let mut vals = HashMap::new();
+    vals.insert("client".into(), vec!["new".into()]);
+    let mut cells = Vec::new();
+    assert!(c
+        .cells_for_report(&vals, &mut cells)
+        .unwrap_err()
+        .contains("declared capacity"));
+    assert_eq!(c.interned(), vec![2]);
+    let mut query = HashMap::new();
+    query.insert("client".into(), "new".into());
+    assert_eq!(c.filter_cell(&query).unwrap(), None);
+    query.insert("client".into(), "old-a".into());
+    assert_eq!(c.filter_cell(&query).unwrap(), Some(0));
 }
 
 #[test]
@@ -374,6 +452,7 @@ fn with_props<'a>(
         lat,
         props: Some(p),
         cells: None,
+        updated_at_ms: None,
     }
 }
 

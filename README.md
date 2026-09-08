@@ -8,7 +8,8 @@ inside this polygon* — and leave clustering to the client. So a map of moving
 things ends up running two systems: one for the queries, and a separate
 supercluster instance rebuilt on a timer for the markers. This closes that seam:
 the primary index is a net hierarchy, so clustering is a first-class query and the
-index is never rebuilt.
+index is updated incrementally; a defensive rebuild is triggered only if an
+internal position mismatch is detected.
 
 ```
 POST /v1/collections/fleet/positions     ->  917,000 reports/s
@@ -178,6 +179,11 @@ curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: app
   -d '[{"id":"truck-1","lng":-46.6333,"lat":-23.5505,"cat":"delivering"},
        {"id":"truck-2","lng":-46.6340,"lat":-23.5510,"cat":"delivering"}]'
 
+# An optional source version makes retries idempotent in time. Older reports
+# are answered with accepted: 0 and stale: 1 instead of moving a device back.
+curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: application/json' \
+  -d '[{"id":"truck-1","lng":-46.63,"lat":-23.55,"updated_at_ms":1730000000000}]'
+
 # or post GeoJSON straight through -- same endpoint, same upsert
 curl -X POST localhost:8080/v1/collections/fleet/positions -H 'content-type: application/json' \
   --data-binary @fleet.geojson
@@ -200,9 +206,9 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `PUT /v1/collections/{name}` | create; idempotent, 409 on a different geometry |
 | `GET /v1/collections` | list, with stats |
 | `DELETE /v1/collections/{name}` | drop |
-| `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson) |
+| `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson); returns `accepted` and `stale` |
 | `DELETE /v1/collections/{name}/devices/{id}` | remove one device |
-| `GET .../devices/{id}` | is it registered? 200 with position, category and staleness, or 404 (`HEAD` for a bare check) |
+| `GET .../devices/{id}` | is it registered? 200 with position, category, staleness and last accepted source version, or 404 (`HEAD` for a bare check) |
 | `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON; `?f.<name>=` for declared dimensions, `?where=` to search text |
 | `GET .../tiles/{z}/{x}/{y}.mvt` | vector tile (`.json` for tile-space GeoJSON) |
 | `GET .../devices/{id}/cluster?zoom=` | which marker contains this device |
@@ -284,10 +290,57 @@ so they are comparable with each other; the absolute figures move ±10% with
 machine state, which is why they differ from the ones under
 [Measured](#measured) taken on a separate run.
 
-**One thing to know:** a device's category is fixed when it is first seen. A later
-report moves it and replaces its properties, but does not re-file it into another
-category. That is not a GeoJSON quirk — the compact path behaves the same way. If
-a vehicle's status changes, `DELETE` it and report it again.
+**One thing to know:** a later report moves a device and re-files it into its new
+category or dimension values, even when it has not moved. A bare position report
+keeps its previous filter values. This is true for both compact and GeoJSON input.
+
+**Retries and ordering:** compact points and GeoJSON Features may include the
+top-level foreign member `updated_at_ms`. Use a strictly increasing source
+version for each device. Older and equal versions are counted in `stale` and
+do not change coordinates, properties, filter cells or TTL. After a device has
+received a version, unversioned reports are also counted as stale; devices that
+have never received a version retain legacy arrival-order behavior.
+Versions survive version-4 snapshots; versions 1–3 still load, without ordering
+history. Deleting/expiring a device clears its ordering history.
+
+The Node client captures versions before batching/queueing and preserves them
+through retries. Pass `updatedAt` from the authoritative source for live updates
+AND backfills. Its automatic process-local clock orders calls in that process;
+it cannot identify stale source data or order independent processes/restarts.
+Do not mix source revisions with automatically generated clock values.
+Equal source versions must represent the same update.
+
+**Load protection:** requests are admitted before body buffering, CPU/index work
+and large JSON/MVT responses run off the async executor, and report requests
+wait asynchronously for a per-collection writer. Overload returns
+`503 {"code":"overloaded",...}` with `Retry-After: 1`; it is not an acknowledgement.
+Retry the same versioned payload with backoff. The bundled client does so, checks
+`accepted + stale` for every batch, and exposes incomplete acknowledgements as errors.
+Health checks do not wait for collection index locks.
+
+| Environment variable | Default | Purpose |
+|---|---|---|
+| `NETCLUSTER_MAX_INFLIGHT` | 64 | Maximum admitted non-health requests |
+| `NETCLUSTER_MAX_BLOCKING` | available CPUs, clamped to 2–8 | Concurrent HTTP CPU/index jobs |
+| `NETCLUSTER_MAX_BATCH` | 5000 | Reports per request; larger batches receive 413 |
+
+Worker and per-collection writer queues each have a one-second wait budget.
+Keep batches near 500–1000. These bounds control queue growth, not the execution
+time of an already-running operation; expensive administrative `/verify`
+checks are still O(N²) and should run outside peak ingest.
+
+Dynamic dimension slots are permanent, including slots whose devices expired.
+Size capacity for all distinct values assigned during the collection's lifetime.
+Capacity exhaustion returns an explicit error; slots are never reassigned to a
+different label, which would corrupt pending batches, queries or snapshots.
+Stats expose `interned` and `dimension_capacities` for monitoring.
+A detected direct position/cell mismatch triggers a defensive index rebuild and
+increments `repairs`. This is not a general detector for every possible tree
+invariant violation; use `/verify` for a full diagnostic.
+
+Upgrade the server before the Node client. Upgrade all writers for a collection
+together before sending versioned data. Version-4 snapshots cannot be read by
+older server binaries; retain a pre-upgrade snapshot for rollback.
 
 ## Attaching data to a device
 
@@ -349,10 +402,15 @@ curl 'localhost:8080/v1/collections/fleet/clusters?bbox=-47,-24,-46,-23&zoom=12&
 
 A dimension takes either `values` (the labels) or `capacity` (how many distinct
 ones may exist), so you do not have to know every client id up front — with a
-capacity they are interned as they arrive, and the ceiling is how many can coexist
+capacity they are interned as they arrive, and the ceiling is how many have ever been assigned
 rather than how large an id can get. On such a dimension a value nothing has
 reported yet is an empty result rather than a 400, since the server cannot tell it
 from a client that has not started reporting.
+
+`/stats` exposes `interned` alongside `dimension_capacities`. If a dynamic
+dimension fills, the server reclaims slots belonging only to expired or removed
+devices before retrying the report; if no slot can be reclaimed, the request
+fails explicitly with the dimension and value named in the error.
 
 `multi` lets one device hold several values for a dimension — a vehicle owned by
 three clients — which a single category cannot express. Values ride in `dims` on

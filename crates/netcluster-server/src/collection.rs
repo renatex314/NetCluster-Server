@@ -125,6 +125,14 @@ struct IdMap {
     to_str: Vec<String>,
     /// Last report time per interned id; `u64::MAX` means "not currently live".
     last_seen: Vec<u64>,
+    /// Optional source version for rejecting late retries. `None` preserves the
+    /// arrival-order semantics until a device first receives a version.
+    last_update: Vec<Option<u64>>,
+    /// Last projected position, kept outside the index so it can be rebuilt if a
+    /// long-lived incremental update ever fails to land.
+    positions: Vec<Option<(i32, i32)>>,
+    /// Last resolved filter cells, kept as source data for the same repair path.
+    cells: Vec<Vec<u32>>,
     /// Free-form properties per interned id, as raw JSON.
     ///
     /// Held behind an `Arc` so a query copies a refcount rather than the text: at
@@ -148,6 +156,9 @@ impl IdMap {
         let n = self.to_str.len() as u64;
         self.to_str.push(id.to_string());
         self.last_seen.push(u64::MAX);
+        self.last_update.push(None);
+        self.positions.push(None);
+        self.cells.push(Vec::new());
         self.props.push(None);
         for _ in 0..self.fields {
             self.text.push(None);
@@ -212,6 +223,11 @@ pub struct Collection {
     /// and always in this order.
     interner: RwLock<Interner>,
     state: RwLock<Inner>,
+    /// Async backpressure for report requests. The actual index remains behind
+    /// its synchronous lock, but waiting requests must not occupy runtime workers.
+    write_gate: Arc<tokio::sync::Mutex<()>>,
+    snapshot_gate: std::sync::Mutex<()>,
+    live_devices: std::sync::atomic::AtomicUsize,
     pub created_ms: u64,
     pub ingested: AtomicU64,
     pub queries: AtomicU64,
@@ -224,6 +240,10 @@ pub struct Collection {
     pub snapshot_failures: AtomicU64,
     /// Devices loaded from a snapshot at startup.
     pub restored: AtomicU64,
+    /// Reports ignored because their source version was older than the stored one.
+    pub stale_reports: AtomicU64,
+    /// Defensive index rebuilds triggered by a position mismatch.
+    pub repairs: AtomicU64,
 }
 
 /// One position report.
@@ -250,6 +270,9 @@ pub struct Report<'a> {
     /// device's existing ones alone -- a bare position report must not silently
     /// re-file a vehicle into whatever value happens to be index 0.
     pub cells: Option<&'a [u32]>,
+    /// Optional source-side monotonic version, in milliseconds since the epoch.
+    /// Unversioned reports use arrival order only until the device becomes versioned.
+    pub updated_at_ms: Option<u64>,
 }
 
 /// One thing to draw.
@@ -281,6 +304,8 @@ pub struct DeviceInfo {
     /// How long ago that was. The useful form: compare it against the TTL to see
     /// how close a device is to being swept.
     pub age_ms: u64,
+    /// Last accepted source-side version, when the client supplied one.
+    pub updated_at_ms: Option<u64>,
     /// Whatever was last reported for this device, or null.
     pub props: Option<Arc<Box<RawValue>>>,
 }
@@ -317,6 +342,13 @@ pub struct CollectionStats {
     pub last_snapshot_bytes: u64,
     pub snapshot_failures: u64,
     pub restored: u64,
+    pub stale_reports: u64,
+    pub repairs: u64,
+    /// Number of dynamic values currently interned per dimension.
+    pub interned: Vec<usize>,
+    /// Declared value capacity per dimension; compare with `interned` to spot
+    /// a dimension approaching exhaustion before reports begin failing.
+    pub dimension_capacities: Vec<usize>,
     /// Bytes of device properties currently held. Worth watching: it is the one
     /// part of the index whose size you control from outside.
     pub props_bytes: usize,
@@ -396,6 +428,9 @@ impl Collection {
                     ..IdMap::default()
                 },
             }),
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
+            snapshot_gate: std::sync::Mutex::new(()),
+            live_devices: std::sync::atomic::AtomicUsize::new(0),
             created_ms: now_ms(),
             ingested: AtomicU64::new(0),
             queries: AtomicU64::new(0),
@@ -404,7 +439,15 @@ impl Collection {
             last_snapshot_bytes: AtomicU64::new(0),
             snapshot_failures: AtomicU64::new(0),
             restored: AtomicU64::new(0),
+            stale_reports: AtomicU64::new(0),
+            repairs: AtomicU64::new(0),
         }
+    }
+
+    /// Serialize report application without making async runtime workers wait
+    /// inside a synchronous mutex. The guard may be held across a blocking task.
+    pub async fn acquire_write(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.write_gate.clone().lock_owned().await
     }
 
     /// Rebuild a collection from a snapshot.
@@ -461,11 +504,30 @@ impl Collection {
                 let n = st.ids.intern(&r.id);
                 st.index.insert_projected_cells(n, r.x, r.y, &kept);
                 st.ids.last_seen[n as usize] = r.last_seen_ms;
+                st.ids.last_update[n as usize] = r.updated_at_ms;
+                st.ids.positions[n as usize] = Some((r.x, r.y));
+                st.ids.cells[n as usize] = kept;
                 if let Some(p) = &r.props {
                     st.ids.props[n as usize] = RawValue::from_string(p.clone()).ok().map(Arc::new);
+                    if !c.config.text.is_empty() {
+                        if let Ok(mut got) = crate::geojson::peek_text(
+                            p,
+                            &c.config.text.iter().map(String::as_str).collect::<Vec<_>>(),
+                        ) {
+                            for t in got.iter_mut().flatten() {
+                                *t = t.to_lowercase();
+                            }
+                            let base = n as usize * st.ids.fields;
+                            for (f, v) in got.iter().enumerate() {
+                                st.ids.text[base + f] = v.as_deref().map(Box::from);
+                            }
+                        }
+                    }
                 }
             }
         }
+        c.live_devices
+            .store(c.state.read().unwrap().index.len(), Ordering::Relaxed);
         c.restored
             .store(c.len() as u64, std::sync::atomic::Ordering::Relaxed);
         (c, skipped)
@@ -484,15 +546,16 @@ impl Collection {
                 continue; // interned once, not currently live
             }
             let n = n as u64;
-            let Some((x, y)) = st.index.position(n) else {
+            let Some((x, y)) = st.ids.positions[n as usize] else {
                 continue;
             };
             out.push(DeviceRecord {
                 id: st.ids.to_str[n as usize].clone(),
                 x,
                 y,
-                cells: st.index.cells_of(n).unwrap_or(&[]).to_vec(),
+                cells: st.ids.cells[n as usize].clone(),
                 last_seen_ms: seen,
+                updated_at_ms: st.ids.last_update[n as usize],
                 props: st.ids.props[n as usize]
                     .as_ref()
                     .map(|p| p.get().to_owned()),
@@ -504,6 +567,7 @@ impl Collection {
     /// Export and write a snapshot, recording the outcome for /metrics.
     pub fn snapshot_to(&self, path: &std::path::Path) -> std::io::Result<u64> {
         use std::sync::atomic::Ordering::Relaxed;
+        let _snapshot_guard = self.snapshot_gate.lock().unwrap();
         let records = self.export();
         let meta = crate::snapshot::Meta {
             name: self.name.clone(),
@@ -578,6 +642,8 @@ impl Collection {
         vals: &HashMap<String, Vec<String>>,
         out: &mut Vec<u32>,
     ) -> Result<(), String> {
+        // Slots are permanent. Recycling them can invalidate an already-resolved
+        // report, query or snapshot even when no current device uses the slot.
         let mut interner = self.interner.write().unwrap();
         self.schema.cells_for(
             vals,
@@ -672,27 +738,63 @@ impl Collection {
         }
 
         let now = now_ms();
+        let mut accepted = 0usize;
+        let mut stale = 0usize;
         let mut st = self.state.write().unwrap();
         for (i, r) in reports.iter().enumerate() {
             let n = st.ids.intern(r.id);
-            if st.index.contains(n) {
+            if let Some(current) = st.ids.last_update[n as usize] {
+                // Once versioned, an unversioned or equal-version report must
+                // not roll the record back. Equal versions are idempotent retries.
+                if r.updated_at_ms.map_or(true, |incoming| incoming <= current) {
+                    stale += 1;
+                    continue;
+                }
+            }
+            let was_live = st.ids.last_seen[n as usize] != u64::MAX;
+            let projected = netcluster::project(r.lng, r.lat);
+            let target_cells = match r.cells {
+                Some(cells) => cells.to_vec(),
+                None if was_live => st.ids.cells[n as usize].clone(),
+                None => self.default_cells.clone(),
+            };
+            if was_live {
                 // `r.cells` of None leaves the device's filter values alone; Some
                 // re-files it. Before this the values were frozen at first insert,
                 // so a vehicle's status could never change -- and a status change
                 // does not move the vehicle, so nothing else would notice.
-                st.index.move_to_cells(n, r.lng, r.lat, r.cells);
+                st.index
+                    .move_to_projected_cells(n, projected.0, projected.1, r.cells);
             } else {
                 // A new device with no values named still has to land somewhere,
                 // and that somewhere is value 0 in every dimension.
                 st.index
-                    .insert_with_cells(n, r.lng, r.lat, r.cells.unwrap_or(&self.default_cells));
+                    .insert_projected_cells(n, projected.0, projected.1, &target_cells);
+            }
+            st.ids.positions[n as usize] = Some(projected);
+            if !was_live || r.cells.is_some() {
+                st.ids.cells[n as usize] = target_cells;
             }
             st.ids.last_seen[n as usize] = now;
+            // The index is a materialised view. If its direct position lookup
+            // disagrees with the just-accepted report, repair it from the
+            // independent position/cell records rather than exposing a no-op.
+            if st.index.position(n) != Some(projected)
+                || st.index.cells_of(n) != Some(st.ids.cells[n as usize].as_slice())
+            {
+                Self::rebuild_index(&mut st);
+                self.repairs.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[repair] collection {} rebuilt after position mismatch for device {:?}",
+                    self.name, r.id
+                );
+            }
+            if let Some(version) = r.updated_at_ms {
+                st.ids.last_update[n as usize] = Some(version);
+            }
             if let Some(p) = r.props {
-                // Reparsing here is what makes reads free: the blob is stored as
-                // validated raw text and handed straight to the serialiser.
-                st.ids.props[n as usize] =
-                    RawValue::from_string(p.get().to_owned()).ok().map(Arc::new);
+                // Keep the already-validated raw text without parsing under the lock.
+                st.ids.props[n as usize] = Some(Arc::new(p.to_owned()));
                 // Searchable fields follow the properties they came from: a report
                 // that replaces `props` replaces these, and one that omits it
                 // leaves both alone.
@@ -703,10 +805,30 @@ impl Collection {
                     }
                 }
             }
+            accepted += 1;
         }
-        self.ingested
-            .fetch_add(reports.len() as u64, Ordering::Relaxed);
-        Ok(reports.len())
+        self.live_devices.store(st.index.len(), Ordering::Relaxed);
+        self.ingested.fetch_add(accepted as u64, Ordering::Relaxed);
+        self.stale_reports
+            .fetch_add(stale as u64, Ordering::Relaxed);
+        Ok(accepted)
+    }
+
+    /// Rebuild the derived tree from the independent per-device records. This
+    /// is intentionally cold-path recovery, not normal update behavior.
+    fn rebuild_index(st: &mut Inner) {
+        let mut fresh = NetCluster::new(st.index.options());
+        let stats = st.index.stats;
+        for (n, &seen) in st.ids.last_seen.iter().enumerate() {
+            if seen == u64::MAX {
+                continue;
+            }
+            if let Some((x, y)) = st.ids.positions[n] {
+                fresh.insert_projected_cells(n as u64, x, y, &st.ids.cells[n]);
+            }
+        }
+        fresh.stats = stats;
+        st.index = fresh;
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -717,10 +839,18 @@ impl Collection {
         let gone = st.index.remove(n);
         if gone {
             st.ids.last_seen[n as usize] = u64::MAX;
+            st.ids.last_update[n as usize] = None;
+            st.ids.positions[n as usize] = None;
+            st.ids.cells[n as usize].clear();
             // Interning is permanent, so without this a device that comes back
             // silently inherits the properties it had in a previous life.
             st.ids.props[n as usize] = None;
+            let base = n as usize * st.ids.fields;
+            for f in 0..st.ids.fields {
+                st.ids.text[base + f] = None;
+            }
         }
+        self.live_devices.store(st.index.len(), Ordering::Relaxed);
         gone
     }
 
@@ -741,7 +871,11 @@ impl Collection {
     pub fn device(&self, id: &str) -> Option<DeviceInfo> {
         let st = self.state.read().unwrap();
         let &n = st.ids.to_num.get(id)?;
-        let (lng, lat) = st.index.position_of(n)?;
+        if !st.index.contains(n) {
+            return None;
+        }
+        let (x, y) = st.ids.positions[n as usize]?;
+        let (lng, lat) = netcluster::unproject(x as f64, y as f64);
         let cat_index = st.index.category_of(n)?;
         let last_seen_ms = st.ids.last_seen[n as usize];
         Some(DeviceInfo {
@@ -752,16 +886,17 @@ impl Collection {
             cat_index,
             last_seen_ms,
             age_ms: now_ms().saturating_sub(last_seen_ms),
+            updated_at_ms: st.ids.last_update[n as usize],
             props: st.ids.props.get(n as usize).cloned().flatten(),
         })
     }
 
     pub fn len(&self) -> usize {
-        self.state.read().unwrap().index.len()
+        self.live_devices.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.state.read().unwrap().index.is_empty()
+        self.len() == 0
     }
 
     pub fn clusters(&self, bbox: [f64; 4], zoom: f64, cat: i32) -> Vec<OutFeature> {
@@ -888,7 +1023,7 @@ impl Collection {
                 }
             }
             let (Some(rep), Some((x, y))) =
-                (st.index.representative_slot(id, z), st.index.position(id))
+                (st.index.representative_slot(id, z), st.ids.positions[n])
             else {
                 continue;
             };
@@ -1000,16 +1135,33 @@ impl Collection {
                     && st.index.remove(n)
                 {
                     st.ids.last_seen[n as usize] = u64::MAX;
+                    st.ids.last_update[n as usize] = None;
+                    st.ids.positions[n as usize] = None;
+                    st.ids.cells[n as usize].clear();
                     st.ids.props[n as usize] = None;
+                    let base = n as usize * st.ids.fields;
+                    for f in 0..st.ids.fields {
+                        st.ids.text[base + f] = None;
+                    }
                     dropped += 1;
                 }
             }
+            self.live_devices.store(st.index.len(), Ordering::Relaxed);
         }
         self.expired.fetch_add(dropped as u64, Ordering::Relaxed);
         dropped
     }
 
     pub fn stats(&self) -> CollectionStats {
+        // Keep lock ordering consistent with report cell resolution: interner
+        // first, collection state second. This also makes capacity exhaustion
+        // visible without ever holding the two locks in reverse order.
+        let interner = self.interner.read().unwrap();
+        let interned: Vec<usize> = (0..self.schema.dims.len())
+            .map(|d| interner.len(d))
+            .collect();
+        let dimension_capacities: Vec<usize> =
+            self.schema.dims.iter().map(Dimension::size).collect();
         let st = self.state.read().unwrap();
         let s = st.index.stats;
         CollectionStats {
@@ -1025,6 +1177,8 @@ impl Collection {
             ingested: self.ingested.load(Ordering::Relaxed),
             queries: self.queries.load(Ordering::Relaxed),
             expired: self.expired.load(Ordering::Relaxed),
+            stale_reports: self.stale_reports.load(Ordering::Relaxed),
+            repairs: self.repairs.load(Ordering::Relaxed),
             uptime_ms: now_ms().saturating_sub(self.created_ms),
             moves_fast_pct: if s.moves > 0 {
                 100.0 * s.moves_fast as f64 / s.moves as f64
@@ -1035,6 +1189,8 @@ impl Collection {
             last_snapshot_bytes: self.last_snapshot_bytes.load(Ordering::Relaxed),
             snapshot_failures: self.snapshot_failures.load(Ordering::Relaxed),
             restored: self.restored.load(Ordering::Relaxed),
+            interned,
+            dimension_capacities,
             props_bytes: st
                 .ids
                 .props
@@ -1054,6 +1210,77 @@ impl Collection {
     /// Run the full invariant check. Admin only: `O(N²)`.
     pub fn verify(&self) -> Result<String, String> {
         let st = self.state.read().unwrap();
+        for (n, &seen) in st.ids.last_seen.iter().enumerate() {
+            if seen == u64::MAX {
+                continue;
+            }
+            if st.index.position(n as u64) != st.ids.positions[n]
+                || st.index.cells_of(n as u64) != Some(st.ids.cells[n].as_slice())
+            {
+                return Err(format!(
+                    "source/index mismatch for device {:?}",
+                    st.ids.name(n as u64)
+                ));
+            }
+        }
         st.index.verify().map(|v| format!("{v:?}"))
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_derived_record_is_repaired_on_the_next_report() {
+        let c = Collection::new(
+            "test",
+            Config {
+                ttl_seconds: 0,
+                ..Config::default()
+            },
+        );
+        let props = RawValue::from_string(r#"{"plate":"NEW"}"#.into()).unwrap();
+        let report = Report {
+            id: "v",
+            lng: 1.,
+            lat: 1.,
+            cells: None,
+            props: None,
+            updated_at_ms: Some(100),
+        };
+        c.upsert(std::slice::from_ref(&report)).unwrap();
+        {
+            let mut st = c.state.write().unwrap();
+            assert!(st.index.remove(0)); // fault injection, keep independent source data
+        }
+        assert!(c.verify().is_err());
+        assert_eq!(
+            c.upsert(&[Report {
+                lng: 20.,
+                lat: 20.,
+                props: Some(&props),
+                updated_at_ms: Some(200),
+                ..report
+            }])
+            .unwrap(),
+            1
+        );
+        // The core's move operation reinserts a missing ID itself; a full
+        // collection rebuild is unnecessary for this recoverable case.
+        assert_eq!(c.repairs.load(Ordering::Relaxed), 0);
+        assert!(c.verify().is_ok());
+        let hits = c.clusters([-180., -85., 180., 85.], 20., -1);
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].lng - 20.).abs() < 1e-6);
+        assert!(hits[0].props.as_ref().unwrap().get().contains("NEW"));
+    }
+
+    #[test]
+    fn health_count_does_not_acquire_the_index_lock() {
+        let c = Collection::new("test", Config::default());
+        let _held = c.state.write().unwrap();
+        assert_eq!(c.len(), 0);
+        assert!(c.is_empty());
     }
 }

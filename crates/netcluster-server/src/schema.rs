@@ -25,7 +25,7 @@ use std::collections::HashMap;
 /// Give it either `values` (the labels, when you know them) or `capacity` (how
 /// many distinct ones may exist, when you do not). With `capacity` the values are
 /// *interned*: each one seen for the first time takes the next free index, so the
-/// ceiling is how many can coexist rather than how large an id may get. A fleet
+/// ceiling is how many have ever been assigned rather than how large an id may get. A fleet
 /// with auto-increment client ids running into the millions but two thousand live
 /// clients wants `capacity: 4096`, not a list.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -403,12 +403,15 @@ impl Schema {
 #[derive(Clone, Debug, Default)]
 pub struct Interner {
     tables: Vec<HashMap<String, u32>>,
+    /// High-water mark. Slots are never reassigned, including snapshot holes.
+    next: Vec<u32>,
 }
 
 impl Interner {
     pub fn new(schema: &Schema) -> Self {
         Interner {
             tables: vec![HashMap::new(); schema.dims.len()],
+            next: vec![0; schema.dims.len()],
         }
     }
 
@@ -417,10 +420,13 @@ impl Interner {
     pub fn labels(&self) -> Vec<Vec<String>> {
         self.tables
             .iter()
-            .map(|t| {
-                let mut v = vec![String::new(); t.len()];
+            .enumerate()
+            .map(|(d, t)| {
+                let mut v = vec![String::new(); self.next[d] as usize];
                 for (s, &i) in t {
-                    v[i as usize] = s.clone();
+                    if let Some(slot) = v.get_mut(i as usize) {
+                        *slot = s.clone();
+                    }
                 }
                 v
             })
@@ -439,6 +445,7 @@ impl Interner {
                     me.tables[d].insert(v.clone(), i as u32);
                 }
             }
+            me.next[d] = list.len().min(schema.dims[d].size()) as u32;
         }
         me
     }
@@ -460,21 +467,25 @@ impl Values for Interning<'_> {
         if !dim.is_dynamic() {
             return self.schema.static_value(d, v).map(Some);
         }
-        let t = &mut self.interner.tables[d];
-        if let Some(&i) = t.get(v) {
+        if let Some(&i) = self.interner.tables[d].get(v) {
             return Ok(Some(i));
         }
-        let next = t.len();
-        if next >= dim.size() {
+        if v.is_empty() {
             return Err(format!(
-                "{:?} already holds {} distinct values, its declared capacity; \
-                 {v:?} would be one more",
-                dim.name,
-                dim.size()
+                "dimension {:?} requires a non-empty value",
+                dim.name
             ));
         }
-        t.insert(v.to_string(), next as u32);
-        Ok(Some(next as u32))
+        let i = self.interner.next[d];
+        if i >= dim.size() as u32 {
+            return Err(format!(
+                "{:?} already holds {} distinct values, its declared capacity; {v:?} would be one more",
+                dim.name, dim.size()
+            ));
+        }
+        self.interner.next[d] += 1;
+        self.interner.tables[d].insert(v.to_string(), i);
+        Ok(Some(i))
     }
 }
 

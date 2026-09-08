@@ -62,6 +62,7 @@ fn a_restored_collection_holds_the_same_devices() {
             lat: -23.55 + (rng.next() - 0.5) * 0.9,
             props: None,
             cells: Some(&[cat]),
+            updated_at_ms: None,
         }])
         .unwrap();
         expected.push((id, cat));
@@ -75,6 +76,7 @@ fn a_restored_collection_holds_the_same_devices() {
             lat: 48.85,
             props: None,
             cells: Some(&[i % 3]),
+            updated_at_ms: None,
         }])
         .unwrap();
     }
@@ -133,6 +135,7 @@ fn a_restored_collection_holds_the_same_devices() {
             lat: 1.0,
             props: None,
             cells: None,
+            updated_at_ms: None,
         }])
         .unwrap();
     assert!(restored.contains("brand-new"));
@@ -151,6 +154,7 @@ fn repeated_restores_do_not_drift() {
         lat: -23.550520,
         props: None,
         cells: None,
+        updated_at_ms: None,
     }])
     .unwrap();
     let first = c.device("still").unwrap();
@@ -178,6 +182,7 @@ fn records_past_the_ttl_are_not_restored() {
             y: 100,
             cells: vec![0],
             last_seen_ms: now,
+            updated_at_ms: None,
             props: None,
         },
         snapshot::DeviceRecord {
@@ -186,6 +191,7 @@ fn records_past_the_ttl_are_not_restored() {
             y: 200,
             cells: vec![0],
             last_seen_ms: now - 30_000,
+            updated_at_ms: None,
             props: None,
         },
         snapshot::DeviceRecord {
@@ -194,6 +200,7 @@ fn records_past_the_ttl_are_not_restored() {
             y: 300,
             cells: vec![0],
             last_seen_ms: now - 600_000,
+            updated_at_ms: None,
             props: None,
         },
         snapshot::DeviceRecord {
@@ -202,6 +209,7 @@ fn records_past_the_ttl_are_not_restored() {
             y: 400,
             cells: vec![0],
             last_seen_ms: 0,
+            updated_at_ms: None,
             props: None,
         },
     ];
@@ -229,6 +237,7 @@ fn a_shrunken_category_list_does_not_take_the_process_down() {
             y: 100,
             cells: vec![0],
             last_seen_ms: now,
+            updated_at_ms: None,
             props: None,
         },
         snapshot::DeviceRecord {
@@ -237,6 +246,7 @@ fn a_shrunken_category_list_does_not_take_the_process_down() {
             y: 200,
             cells: vec![5],
             last_seen_ms: now,
+            updated_at_ms: None,
             props: None,
         },
     ];
@@ -293,6 +303,7 @@ fn snapshots_during_heavy_writes_stay_consistent() {
             lat: -23.55 + (rng.next() - 0.5) * 0.9,
             props: None,
             cells: None,
+            updated_at_ms: None,
         })
         .collect();
     c.upsert(&initial).unwrap();
@@ -313,6 +324,7 @@ fn snapshots_during_heavy_writes_stay_consistent() {
                         lat: -23.55,
                         props: None,
                         cells: Some(&[1]),
+                        updated_at_ms: None,
                     })
                     .collect();
                 c.upsert(&batch).unwrap();
@@ -353,6 +365,7 @@ fn properties_survive_a_snapshot_and_a_v1_file_still_loads() {
         lat: -23.55,
         props: Some(&p),
         cells: None,
+        updated_at_ms: None,
     }])
     .unwrap();
     c.upsert(&[Report {
@@ -361,6 +374,7 @@ fn properties_survive_a_snapshot_and_a_v1_file_still_loads() {
         lat: 48.85,
         props: None,
         cells: None,
+        updated_at_ms: None,
     }])
     .unwrap();
 
@@ -459,6 +473,7 @@ fn interned_values_survive_a_snapshot() {
             lat: -23.55,
             props: None,
             cells: Some(&cells),
+            updated_at_ms: None,
         }])
         .unwrap();
     }

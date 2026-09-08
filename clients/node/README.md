@@ -115,6 +115,44 @@ scalars become MVT tags so you can style by them.
 Capped by `maxPropsBytes` (default 1024). `props` is payload, never indexed —
 anything you filter or group by belongs in a [dimension](#filtering) instead.
 
+### Ordering and retries
+
+`report()`, `reportGeoJSON()` and Reporter capture an update version at invocation
+or enqueue time, before any chunks are sent. Retries and failed flushes retain
+that version and a copy of the payload. Reporter coalescing keeps the greatest
+version, not simply the last arrival.
+
+For live updates and backfills, pass the SAME authoritative source version:
+
+```js
+await fleet.report({
+  id: 'truck-1', lng: -46.63, lat: -23.55,
+  updatedAt: sourceUpdatedAtMs,
+});
+```
+
+GeoJSON accepts `updatedAt` or `updated_at_ms` on each Feature, not inside its
+properties. Versions must increase for each distinct update to a device.
+Without an explicit version, the client uses a process-local logical clock
+based on `Date.now()`. That fallback may run ahead of wall time during bursts,
+cannot order separate processes/restarts, and cannot recognize stale data that
+was already old before it reached the client. Do not mix it with source revisions.
+
+The server counts older, equal, and unversioned-after-versioned reports in
+`stale`; they do not replace data or refresh TTL. Versions persist in snapshots.
+Equal versions must identify the same update. Deletion/expiry clears history.
+Reporter includes stale counts in `reporter.stats.stale`.
+
+The client rejects acknowledgements unless `accepted + stale` matches the
+submitted batch. Network errors, 429 and 5xx retry with bounded exponential
+backoff/jitter and respect Retry-After (capped at 30 seconds). Explicit cancellation
+does not retry. Default retry count remains one; handle final failures and alert
+on repeated stale/error results rather than silently dropping them.
+
+Deploy the updated server BEFORE this client. Then upgrade all writers together:
+old unversioned writers cannot modify a device once versioned writes start.
+The default batch size is 1000; the server's default maximum is 5000.
+
 ## Filtering
 
 A map usually needs more than one filter at a time: *which client owns this

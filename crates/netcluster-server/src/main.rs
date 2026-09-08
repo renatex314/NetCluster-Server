@@ -6,7 +6,8 @@
 //! client, so a map of moving things ends up running two systems: one for the
 //! queries, and a separate supercluster instance rebuilt on a timer for the
 //! markers. This closes that seam: the primary index is a net hierarchy, so
-//! clustering is a first-class query and the index is never rebuilt.
+//! clustering is a first-class query and the index is updated incrementally;
+//! the server only rebuilds it as a defensive repair after detecting a mismatch.
 //!
 //! Configuration is entirely environment variables, because a process with no
 //! durable state has nothing else to configure:

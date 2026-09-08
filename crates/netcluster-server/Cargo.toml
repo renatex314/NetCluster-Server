@@ -25,7 +25,7 @@ axum = "0.8.4"
 netcluster = { path = "../netcluster" }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
 
 [dev-dependencies]
 # Already in the tree via axum, so this costs nothing to add and nothing to

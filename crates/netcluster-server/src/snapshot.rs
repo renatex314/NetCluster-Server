@@ -44,7 +44,8 @@ const MAGIC: &[u8; 6] = b"NCSNAP";
 /// which is a poor trade for one field -- and a version-1 or -2 record's single
 /// category is exactly a one-element cell set, because a lone dimension encodes
 /// its values as cells 0..n.
-const VERSION: u16 = 3;
+// Version 4 preserves the source version across restarts.
+const VERSION: u16 = 4;
 const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
 const FNV_PRIME: u64 = 1_099_511_628_211;
 
@@ -79,6 +80,7 @@ pub struct DeviceRecord {
     /// shape, times any value it holds more than one of.
     pub cells: Vec<u32>,
     pub last_seen_ms: u64,
+    pub updated_at_ms: Option<u64>,
     /// Raw JSON object, exactly as it arrived. Kept as text rather than a parsed
     /// value so neither writing a snapshot nor answering a query re-parses it.
     pub props: Option<String>,
@@ -178,6 +180,10 @@ pub fn write(path: &Path, meta: &Meta, records: &[DeviceRecord]) -> io::Result<u
                 w.write_all(&c.to_le_bytes())?;
             }
             w.write_all(&r.last_seen_ms.to_le_bytes())?;
+            w.write_all(&[u8::from(r.updated_at_ms.is_some())])?;
+            if let Some(version) = r.updated_at_ms {
+                w.write_all(&version.to_le_bytes())?;
+            }
             let props = r.props.as_deref().unwrap_or("");
             w.write_all(&(props.len() as u32).to_le_bytes())?;
             w.write_all(props.as_bytes())?;
@@ -265,6 +271,15 @@ pub fn read(path: &Path) -> io::Result<(Meta, Vec<DeviceRecord>)> {
             vec![u32::from_le_bytes(take(4)?.try_into().unwrap())]
         };
         let last_seen_ms = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        let updated_at_ms = if version >= 4 {
+            match take(1)?[0] {
+                0 => None,
+                1 => Some(u64::from_le_bytes(take(8)?.try_into().unwrap())),
+                _ => return Err(bad("invalid source-version flag")),
+            }
+        } else {
+            None
+        };
         let props = if has_props {
             let n = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
             let raw = take(n)?;
@@ -285,6 +300,7 @@ pub fn read(path: &Path) -> io::Result<(Meta, Vec<DeviceRecord>)> {
             y,
             cells,
             last_seen_ms,
+            updated_at_ms,
             props,
         });
     }
@@ -370,11 +386,51 @@ mod tests {
             y: x / 2,
             cells: vec![(x as u32) % 2],
             last_seen_ms: 1_700_000_000_000 + x as u64,
+            updated_at_ms: Some(1_700_000_000_000 + x as u64),
             props: if x % 3 == 0 {
                 Some(format!(r#"{{"plate":"ABC-{x}","battery":{}}}"#, x % 100))
             } else {
                 None
             },
+        }
+    }
+
+    #[test]
+    fn formats_one_two_and_three_restore_without_a_source_version() {
+        let d = tmpdir("legacy");
+        for version in 1u16..=3 {
+            let p = path_for(&d, &format!("v{version}"));
+            let cfg = serde_json::to_vec(&meta()).unwrap();
+            let r = rec("v", 6);
+            let mut body = Vec::new();
+            body.extend_from_slice(MAGIC);
+            body.extend_from_slice(&version.to_le_bytes());
+            body.extend_from_slice(&(cfg.len() as u32).to_le_bytes());
+            body.extend_from_slice(&cfg);
+            body.extend_from_slice(&1u64.to_le_bytes());
+            body.extend_from_slice(&1u16.to_le_bytes());
+            body.extend_from_slice(b"v");
+            body.extend_from_slice(&r.x.to_le_bytes());
+            body.extend_from_slice(&r.y.to_le_bytes());
+            if version >= 3 {
+                body.extend_from_slice(&1u16.to_le_bytes());
+            }
+            body.extend_from_slice(&r.cells[0].to_le_bytes());
+            body.extend_from_slice(&r.last_seen_ms.to_le_bytes());
+            if version >= 2 {
+                let props = r.props.as_deref().unwrap();
+                body.extend_from_slice(&(props.len() as u32).to_le_bytes());
+                body.extend_from_slice(props.as_bytes());
+            }
+            let mut hash = FNV_OFFSET;
+            fnv(&mut hash, &body);
+            body.extend_from_slice(&hash.to_le_bytes());
+            fs::write(&p, &body).unwrap();
+            let (_, got) = read(&p).unwrap();
+            assert_eq!(got[0].updated_at_ms, None);
+            assert_eq!(got[0].cells, r.cells);
+            assert_eq!(got[0].last_seen_ms, r.last_seen_ms);
+            assert_eq!(got[0].props, if version >= 2 { r.props } else { None });
         }
     }
 
@@ -423,7 +479,8 @@ mod tests {
             .collect();
         let bare_bytes = write(&path_for(&d, "bare"), &meta(), &bare).unwrap();
         let per = bare_bytes as f64 / 100_000.0;
-        assert!(per < 40.0, "{per:.1} bytes per device without properties");
+        // Versioned records carry an additional presence byte and u64.
+        assert!(per < 49.0, "{per:.1} bytes per device without properties");
 
         // and properties cost close to exactly what they weigh
         let props_bytes: usize = records

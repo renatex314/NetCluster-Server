@@ -47,7 +47,8 @@
   "license": "MIT",
   "dependencies": {},
   "scripts": {
-    "test": "node test.mjs && node test-cli.mjs",
+    "test": "node --test test-unit.mjs && node test.mjs && node test-cli.mjs",
+    "test:unit": "node --test test-unit.mjs",
     "example": "node example.mjs",
     "example:fleet": "node example-fleet.mjs",
     "cli": "node cli.js",

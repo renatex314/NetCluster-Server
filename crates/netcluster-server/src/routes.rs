@@ -12,7 +12,8 @@ use crate::geojson::{peek_dims, peek_props, CatVal, DimVal, GeoFeature};
 use crate::mvt;
 use crate::schema::Dimension;
 use axum::{
-    extract::{rejection::JsonRejection, FromRequest, Path, Query, Request, State},
+    body::Bytes,
+    extract::{FromRequest, Path, Query, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -23,7 +24,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 pub struct AppState {
     pub collections: RwLock<HashMap<String, Arc<Collection>>>,
@@ -52,6 +55,14 @@ impl AppState {
 pub struct ApiError(StatusCode, String, &'static str);
 
 impl ApiError {
+    fn overloaded() -> Self {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is busy; retry this same versioned batch with backoff".into(),
+            "overloaded",
+        )
+    }
+
     fn bad(m: impl Into<String>) -> Self {
         ApiError(StatusCode::BAD_REQUEST, m.into(), "bad_request")
     }
@@ -76,11 +87,52 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1, "code": self.2 }))).into_response()
+        let busy = self.0 == StatusCode::SERVICE_UNAVAILABLE;
+        let mut response =
+            (self.0, Json(json!({ "error": self.1, "code": self.2 }))).into_response();
+        if busy {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+/// The collection uses compact synchronous locks and index operations. Keeping
+/// those calls off Tokio's runtime workers is important under load: a request
+/// waiting behind one large batch must consume a blocking-pool slot, not an
+/// executor worker that could have served another request.
+async fn run_blocking<T, F>(job: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> ApiResult<T> + Send + 'static,
+{
+    // Bound running CPU/lock work separately from HTTP admission. The permit
+    // lives INSIDE the job, so a disconnected caller cannot release it early.
+    static WORKERS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    let workers = WORKERS.get_or_init(|| {
+        Arc::new(Semaphore::new(env_limit(
+            "NETCLUSTER_MAX_BLOCKING",
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(2)
+                .clamp(2, 8),
+        )))
+    });
+    let permit = tokio::time::timeout(Duration::from_secs(1), workers.clone().acquire_owned())
+        .await
+        .map_err(|_| ApiError::overloaded())?
+        .map_err(|_| ApiError::overloaded())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        job()
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), "panic"))?
+}
 
 /// `Json<T>`, rejected in this API's error shape.
 ///
@@ -97,31 +149,58 @@ pub struct JsonBody<T>(pub T);
 
 impl<T, S> FromRequest<S> for JsonBody<T>
 where
-    T: serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned + Send + 'static,
     S: Send + Sync,
 {
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(req, state).await {
-            Ok(Json(v)) => Ok(JsonBody(v)),
-            Err(e) => {
-                let code = match &e {
-                    JsonRejection::JsonDataError(_) => "unprocessable_body",
-                    JsonRejection::JsonSyntaxError(_) => "malformed_json",
-                    JsonRejection::MissingJsonContentType(_) => "wrong_content_type",
-                    JsonRejection::BytesRejection(_) => "body_too_large",
-                    _ => "bad_body",
-                };
-                Err(ApiError(e.status(), e.body_text(), code))
-            }
+        let content_type = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(';').next().unwrap_or_default().trim())
+            .unwrap_or_default();
+        if content_type != "application/json" && !content_type.ends_with("+json") {
+            return Err(ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "expected content-type application/json".into(),
+                "wrong_content_type",
+            ));
         }
+        let bytes = Bytes::from_request(req, state)
+            .await
+            .map_err(|e| ApiError(e.status(), e.body_text(), "body_too_large"))?;
+        let parsed = run_blocking(move || Ok(serde_json::from_slice::<T>(&bytes))).await?;
+        parsed.map(JsonBody).map_err(|e| {
+            let (status, code) = if e.is_syntax() || e.is_eof() {
+                (StatusCode::BAD_REQUEST, "malformed_json")
+            } else {
+                (StatusCode::UNPROCESSABLE_ENTITY, "unprocessable_body")
+            };
+            ApiError(status, e.to_string(), code)
+        })
     }
 }
 
 // ------------------------------------------------------------------ router --
 
+fn env_limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
+    router_with_limit(state, env_limit("NETCLUSTER_MAX_INFLIGHT", 64))
+}
+
+/// Admission happens before body buffering/parsing. Excess requests fail quickly
+/// with 503 instead of growing an unbounded queue of parsed report bodies.
+pub fn router_with_limit(state: Arc<AppState>, max_inflight: usize) -> Router {
+    let admission = Arc::new(Semaphore::new(max_inflight.max(1)));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
@@ -163,6 +242,18 @@ pub fn router(state: Arc<AppState>) -> Router {
         // guardrail for that advice, not an obstacle to it: a bigger body holds the
         // write lock longer and every reader waits behind it.
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let admission = admission.clone();
+            async move {
+                if req.uri().path() == "/healthz" {
+                    return next.run(req).await;
+                }
+                let Ok(_permit) = admission.try_acquire_owned() else {
+                    return ApiError::overloaded().into_response();
+                };
+                next.run(req).await
+            }
+        }))
         .layer(middleware::from_fn(cors))
         .with_state(state)
 }
@@ -198,76 +289,84 @@ fn add_cors(r: &mut Response) {
 
 // ------------------------------------------------------------------- admin --
 
-async fn healthz(State(s): State<Arc<AppState>>) -> Json<Value> {
+async fn healthz(State(s): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    // Counts are atomic: liveness must not wait on a collection index lock.
     let cs = s.collections.read().unwrap();
-    let devices: usize = cs.values().map(|c| c.len()).sum();
-    Json(json!({
+    Ok(Json(json!({
         "status": "ok",
         "collections": cs.len(),
-        "devices": devices,
+        "devices": cs.values().map(|c| c.len()).sum::<usize>(),
         "uptime_ms": crate::collection::now_ms().saturating_sub(s.started_ms),
         "persistence": s.data_dir.is_some(),
-    }))
+    })))
 }
 
 /// Prometheus text exposition. Hand-written rather than pulled from a crate: it is
 /// a dozen lines and this way there is no registry to keep in sync.
-async fn metrics(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut out = String::new();
-    out.push_str("# HELP netcluster_devices Devices currently in the index\n");
-    out.push_str("# TYPE netcluster_devices gauge\n");
-    let cs = s.collections.read().unwrap();
-    for c in cs.values() {
-        let st = c.stats();
-        let n = &st.name;
-        out.push_str(&format!(
-            "netcluster_devices{{collection=\"{n}\"}} {}\n",
-            st.devices
-        ));
-        out.push_str(&format!(
-            "netcluster_reports_total{{collection=\"{n}\"}} {}\n",
-            st.ingested
-        ));
-        out.push_str(&format!(
-            "netcluster_queries_total{{collection=\"{n}\"}} {}\n",
-            st.queries
-        ));
-        out.push_str(&format!(
-            "netcluster_expired_total{{collection=\"{n}\"}} {}\n",
-            st.expired
-        ));
-        out.push_str(&format!(
-            "netcluster_memory_bytes{{collection=\"{n}\"}} {}\n",
-            st.memory_bytes
-        ));
-        out.push_str(&format!(
-            "netcluster_fast_move_ratio{{collection=\"{n}\"}} {:.4}\n",
-            st.moves_fast_pct / 100.0
-        ));
-        // A snapshot that has quietly stopped succeeding is the failure you want
-        // to hear about before you need the data, not after.
-        out.push_str(&format!(
-            "netcluster_snapshot_last_success_timestamp{{collection=\"{n}\"}} {}\n",
-            st.last_snapshot_ms / 1000
-        ));
-        out.push_str(&format!(
-            "netcluster_snapshot_bytes{{collection=\"{n}\"}} {}\n",
-            st.last_snapshot_bytes
-        ));
-        out.push_str(&format!(
-            "netcluster_snapshot_failures_total{{collection=\"{n}\"}} {}\n",
-            st.snapshot_failures
-        ));
-        out.push_str(&format!(
-            "netcluster_restored_devices{{collection=\"{n}\"}} {}\n",
-            st.restored
-        ));
-    }
-    out.push_str(&format!(
-        "netcluster_requests_total {}\n",
-        s.requests.load(Ordering::Relaxed)
-    ));
-    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
+async fn metrics(State(s): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+    let requests = s.requests.load(Ordering::Relaxed);
+    let out = run_blocking(move || {
+        let mut out = String::new();
+        out.push_str("# HELP netcluster_devices Devices currently in the index\n");
+        out.push_str("# TYPE netcluster_devices gauge\n");
+        let cs: Vec<_> = s.collections.read().unwrap().values().cloned().collect();
+        for c in cs {
+            let st = c.stats();
+            let n = &st.name;
+            out.push_str(&format!(
+                "netcluster_devices{{collection=\"{n}\"}} {}\n",
+                st.devices
+            ));
+            out.push_str(&format!(
+                "netcluster_reports_total{{collection=\"{n}\"}} {}\n",
+                st.ingested
+            ));
+            out.push_str(&format!(
+                "netcluster_queries_total{{collection=\"{n}\"}} {}\n",
+                st.queries
+            ));
+            out.push_str(&format!(
+                "netcluster_expired_total{{collection=\"{n}\"}} {}\n",
+                st.expired
+            ));
+            out.push_str(&format!(
+                "netcluster_memory_bytes{{collection=\"{n}\"}} {}\n",
+                st.memory_bytes
+            ));
+            out.push_str(&format!(
+                "netcluster_fast_move_ratio{{collection=\"{n}\"}} {:.4}\n",
+                st.moves_fast_pct / 100.0
+            ));
+            out.push_str(&format!(
+                "netcluster_snapshot_last_success_timestamp{{collection=\"{n}\"}} {}\n",
+                st.last_snapshot_ms / 1000
+            ));
+            out.push_str(&format!(
+                "netcluster_snapshot_bytes{{collection=\"{n}\"}} {}\n",
+                st.last_snapshot_bytes
+            ));
+            out.push_str(&format!(
+                "netcluster_snapshot_failures_total{{collection=\"{n}\"}} {}\n",
+                st.snapshot_failures
+            ));
+            out.push_str(&format!(
+                "netcluster_restored_devices{{collection=\"{n}\"}} {}\n",
+                st.restored
+            ));
+            out.push_str(&format!(
+                "netcluster_stale_reports_total{{collection=\"{n}\"}} {}\n",
+                st.stale_reports
+            ));
+            out.push_str(&format!(
+                "netcluster_repairs_total{{collection=\"{n}\"}} {}\n",
+                st.repairs
+            ));
+        }
+        out.push_str(&format!("netcluster_requests_total {requests}\n"));
+        Ok(out)
+    })
+    .await?;
+    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out))
 }
 
 async fn demo_page() -> impl IntoResponse {
@@ -319,11 +418,15 @@ impl ConfigBody {
     }
 }
 
-async fn list_collections(State(s): State<Arc<AppState>>) -> Json<Value> {
-    let cs = s.collections.read().unwrap();
-    let mut names: Vec<_> = cs.values().map(|c| c.stats()).collect();
-    names.sort_by(|a, b| a.name.cmp(&b.name));
-    Json(json!({ "collections": names }))
+async fn list_collections(State(s): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    let value = run_blocking(move || {
+        let cs: Vec<_> = s.collections.read().unwrap().values().cloned().collect();
+        let mut names: Vec<_> = cs.iter().map(|c| c.stats()).collect();
+        names.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(json!({ "collections": names }))
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 async fn create_collection(
@@ -331,76 +434,94 @@ async fn create_collection(
     Path(name): Path<String>,
     body: Option<Json<ConfigBody>>,
 ) -> ApiResult<Json<Value>> {
-    let cfg = body.map(|Json(b)| b).unwrap_or_default().into_config();
-    if cfg.max_zoom > 20 {
-        return Err(ApiError::bad("max_zoom must be <= 20"));
-    }
-    if cfg.radius <= 0.0 || cfg.extent <= 0.0 {
-        return Err(ApiError::bad("radius and extent must be positive"));
-    }
-    // Resolve the filter schema here, where a bad declaration is a 400 the caller
-    // can read. `Collection::new` cannot report it: the config has already been
-    // accepted by then, and a panic on a request handler takes the process down.
-    cfg.schema()
-        .map_err(|e| ApiError::bad(e).code("bad_filters"))?;
-    let mut cs = s.collections.write().unwrap();
-    if let Some(existing) = cs.get(&name) {
-        // Idempotent for the same geometry, an error for a different one. Silently
-        // keeping the old geometry would mean two deployments disagreeing about
-        // what a cluster means while both believe they configured it.
-        let e = &existing.config;
-        if e.max_zoom != cfg.max_zoom
-            || e.radius != cfg.radius
-            || e.extent != cfg.extent
-            || e.categories != cfg.categories
-            || e.dimensions != cfg.dimensions
-            || e.filters != cfg.filters
-        {
-            return Err(ApiError::conflict(format!(
-                "collection {name:?} already exists with a different geometry; \
-                 drop it or use another name"
-            )));
+    run_blocking(move || {
+        let cfg = body.map(|Json(b)| b).unwrap_or_default().into_config();
+        if cfg.max_zoom > 20 {
+            return Err(ApiError::bad("max_zoom must be <= 20"));
         }
-        return Ok(Json(
-            json!({ "created": false, "collection": existing.stats() }),
-        ));
-    }
-    let c = Arc::new(Collection::new(&name, cfg));
-    let st = c.stats();
-    cs.insert(name, c);
-    Ok(Json(json!({ "created": true, "collection": st })))
+        if cfg.radius <= 0.0 || cfg.extent <= 0.0 {
+            return Err(ApiError::bad("radius and extent must be positive"));
+        }
+        // Resolve the filter schema here, where a bad declaration is a 400 the caller
+        // can read. `Collection::new` cannot report it: the config has already been
+        // accepted by then, and a panic on a request handler takes the process down.
+        cfg.schema()
+            .map_err(|e| ApiError::bad(e).code("bad_filters"))?;
+        let candidate = Arc::new(Collection::new(&name, cfg.clone()));
+        let (existing, created) = {
+            let mut cs = s.collections.write().unwrap();
+            match cs.get(&name) {
+                Some(c) => (c.clone(), false),
+                None => {
+                    cs.insert(name.clone(), candidate.clone());
+                    (candidate, true)
+                }
+            }
+        };
+        if !created {
+            // Idempotent for the same geometry, an error for a different one. Silently
+            // keeping the old geometry would mean two deployments disagreeing about
+            // what a cluster means while both believe they configured it.
+            let e = &existing.config;
+            if e.max_zoom != cfg.max_zoom
+                || e.radius != cfg.radius
+                || e.extent != cfg.extent
+                || e.categories != cfg.categories
+                || e.dimensions != cfg.dimensions
+                || e.filters != cfg.filters
+            {
+                return Err(ApiError::conflict(format!(
+                    "collection {name:?} already exists with a different geometry; \
+                 drop it or use another name"
+                )));
+            }
+            return Ok(Json(
+                json!({ "created": false, "collection": existing.stats() }),
+            ));
+        }
+        Ok(Json(
+            json!({ "created": true, "collection": existing.stats() }),
+        ))
+    })
+    .await
 }
 
 async fn drop_collection(
     State(s): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let dropped = s.collections.write().unwrap().remove(&name);
-    match dropped {
-        Some(c) => {
-            // The snapshot has to go with it, or the collection resurrects at the
-            // next restart and a delete quietly did not stick.
-            let mut file_removed = false;
-            if let Some(dir) = &s.data_dir {
-                match crate::snapshot::remove(&crate::snapshot::path_for(dir, &name)) {
-                    Ok(()) => file_removed = true,
-                    Err(e) => eprintln!("[snapshot] could not delete {name}: {e}"),
+    run_blocking(move || {
+        let dropped = s.collections.write().unwrap().remove(&name);
+        match dropped {
+            Some(c) => {
+                // The snapshot has to go with it, or the collection resurrects at the
+                // next restart and a delete quietly did not stick.
+                let mut file_removed = false;
+                if let Some(dir) = &s.data_dir {
+                    match crate::snapshot::remove(&crate::snapshot::path_for(dir, &name)) {
+                        Ok(()) => file_removed = true,
+                        Err(e) => eprintln!("[snapshot] could not delete {name}: {e}"),
+                    }
                 }
+                Ok(Json(json!({
+                    "dropped": name,
+                    "devices": c.len(),
+                    "snapshot_removed": file_removed,
+                })))
             }
-            Ok(Json(json!({
-                "dropped": name,
-                "devices": c.len(),
-                "snapshot_removed": file_removed,
-            })))
+            None => {
+                Err(ApiError::not_found(format!("no collection {name:?}"))
+                    .code("no_such_collection"))
+            }
         }
-        None => {
-            Err(ApiError::not_found(format!("no collection {name:?}")).code("no_such_collection"))
-        }
-    }
+    })
+    .await
 }
 
 async fn stats(State(s): State<Arc<AppState>>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(s.get(&name)?.stats())))
+    let c = s.get(&name)?;
+    let value = run_blocking(move || Ok(json!(c.stats()))).await?;
+    Ok(Json(value))
 }
 
 /// Write a snapshot now.
@@ -420,9 +541,8 @@ async fn force_snapshot(
     let c = s.get(&name)?;
     let path = crate::snapshot::path_for(&dir, &name);
     // Serialising and writing must not happen on a runtime worker.
-    let bytes = tokio::task::spawn_blocking(move || c.snapshot_to(&path))
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), "panic"))?
+    let bytes = run_blocking(move || Ok(c.snapshot_to(&path)))
+        .await?
         .map_err(|e| {
             ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -437,7 +557,9 @@ async fn verify(
     State(s): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    match s.get(&name)?.verify() {
+    let c = s.get(&name)?;
+    let result = run_blocking(move || Ok(c.verify())).await?;
+    match result {
         Ok(v) => Ok(Json(json!({ "ok": true, "detail": v }))),
         Err(e) => Ok(Json(json!({ "ok": false, "violation": e }))),
     }
@@ -454,6 +576,10 @@ pub struct ReportBody {
     id: String,
     lng: f64,
     lat: f64,
+    /// Optional source-side monotonic version. A late retry with an older
+    /// version is ignored instead of moving the device backwards in time.
+    #[serde(default)]
+    updated_at_ms: Option<u64>,
     #[serde(default)]
     cat: Option<CatVal>,
     /// Filter values, when the collection declares `dimensions`:
@@ -728,187 +854,205 @@ async fn positions(
         }
     };
 
-    let n = match &body {
-        PositionsBody::Compact(reports) => {
-            // Cells are built into one owned buffer first so the reports can
-            // borrow slices of it; a report that names no filter values at all
-            // gets None, which leaves the device where it is.
-            let mut store: Vec<Option<Vec<u32>>> = Vec::with_capacity(reports.len());
-            let mut vals: HashMap<String, Vec<String>> = HashMap::new();
-            for r in reports {
-                store.push(
-                    compact_cells(&c, r, &mut vals)
-                        .map_err(|e| ApiError::bad(format!("device {:?}: {e}", r.id)))?,
-                );
-            }
-            let resolved: Vec<Report<'_>> = reports
-                .iter()
-                .zip(&store)
-                .map(|(r, cells)| Report {
-                    id: &r.id,
-                    lng: r.lng,
-                    lat: r.lat,
-                    props: r.props.as_deref(),
-                    cells: cells.as_deref(),
-                })
-                .collect();
-            c.upsert(&resolved).map_err(ApiError::bad)?
-        }
-        PositionsBody::Geo(feats) => {
-            let id_prop = q.get("id_property").map(|s| s.as_str());
-            let cat_prop = q.get("cat_property").map(|s| s.as_str());
-            let cat_keys: Vec<&str> = match cat_prop {
-                Some(k) => vec![k],
-                None => CAT_PROPERTIES.to_vec(),
-            };
-            // The peek is a second pass over the properties text, so it is only
-            // paid when something actually has to come out of there: an id the
-            // Feature did not carry, or filter values this collection can use.
-            //
-            // Which names to look for depends on how the collection was declared.
-            // With `categories` it is the `cat`/`category` aliases, earliest one
-            // winning. With `dimensions` it is one property per dimension, each
-            // distinct -- so the two use different peeks over the same one pass.
-            let legacy_cat = !c.config.categories.is_empty();
-            let dim_names: Vec<&str> = if legacy_cat {
-                Vec::new()
-            } else {
-                c.schema.dims.iter().map(|d| d.name.as_str()).collect()
-            };
-            let want_vals = legacy_cat || !dim_names.is_empty();
-
-            let mut peeked: Vec<(Option<String>, Option<CatVal>)> = Vec::with_capacity(feats.len());
-            let mut peeked_dims: Vec<Vec<Option<DimVal>>> = Vec::with_capacity(feats.len());
-            for (i, f) in feats.iter().enumerate() {
-                let want_id = id_prop.is_some() || f.id.is_none();
-                if !(want_id || want_vals) {
-                    peeked.push((None, None));
-                    peeked_dims.push(Vec::new());
-                    continue;
+    // The collection's index and validation are deliberately synchronous. The
+    // admission layer bounds pending requests, while the blocking pool keeps a
+    // batch from starving Tokio workers that serve health checks and readers.
+    let submitted = match &body {
+        PositionsBody::Compact(reports) => reports.len(),
+        PositionsBody::Geo(features) => features.len(),
+    };
+    let max_batch = env_limit("NETCLUSTER_MAX_BATCH", 5000);
+    if submitted > max_batch {
+        return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE,
+            format!("batch has {submitted} reports; maximum is {max_batch}; split it into smaller batches"),
+            "batch_too_large"));
+    }
+    let write_gate = c.clone();
+    let write_guard = tokio::time::timeout(Duration::from_secs(1), write_gate.acquire_write())
+        .await
+        .map_err(|_| ApiError::overloaded())?;
+    let (n, devices) = run_blocking(move || {
+        // Move the guard into the blocking task. If the HTTP client disconnects,
+        // the task may outlive this handler; the next writer must still wait until
+        // this mutation has actually finished.
+        let _write_guard = write_guard;
+        let n = match body {
+            PositionsBody::Compact(reports) => {
+                // Cells are built into one owned buffer first so the reports can
+                // borrow slices of it; a report that names no filter values at all
+                // gets None, which leaves the device where it is.
+                let mut store: Vec<Option<Vec<u32>>> = Vec::with_capacity(reports.len());
+                let mut vals: HashMap<String, Vec<String>> = HashMap::new();
+                for r in &reports {
+                    store.push(
+                        compact_cells(&c, r, &mut vals)
+                            .map_err(|e| ApiError::bad(format!("device {:?}: {e}", r.id)))?,
+                    );
                 }
-                let id_key = if want_id {
-                    id_prop.or(Some("id"))
-                } else {
-                    None
+                let resolved: Vec<Report<'_>> = reports
+                    .iter()
+                    .zip(&store)
+                    .map(|(r, cells)| Report {
+                        id: &r.id,
+                        lng: r.lng,
+                        lat: r.lat,
+                        props: r.props.as_deref(),
+                        cells: cells.as_deref(),
+                        updated_at_ms: r.updated_at_ms,
+                    })
+                    .collect();
+                c.upsert(&resolved).map_err(ApiError::bad)?
+            }
+            PositionsBody::Geo(feats) => {
+                let id_prop = q.get("id_property").map(|s| s.as_str());
+                let cat_prop = q.get("cat_property").map(|s| s.as_str());
+                let cat_keys: Vec<&str> = match cat_prop {
+                    Some(k) => vec![k],
+                    None => CAT_PROPERTIES.to_vec(),
                 };
-                match &f.props {
-                    Some(p) => {
-                        if legacy_cat || dim_names.is_empty() {
-                            let keys: &[&str] = if legacy_cat { &cat_keys } else { &[] };
-                            peeked.push(peek_props(p.get(), id_key, keys).map_err(|e| {
-                                ApiError::bad(format!(
-                                    "features[{i}]: properties are unreadable: {e}"
-                                ))
-                            })?);
-                            peeked_dims.push(Vec::new());
-                        } else {
-                            let (id, vals) =
-                                peek_dims(p.get(), id_key, &dim_names).map_err(|e| {
+                // The peek is a second pass over the properties text, so it is only
+                // paid when something actually has to come out of there: an id the
+                // Feature did not carry, or filter values this collection can use.
+                let legacy_cat = !c.config.categories.is_empty();
+                let dim_names: Vec<&str> = if legacy_cat {
+                    Vec::new()
+                } else {
+                    c.schema.dims.iter().map(|d| d.name.as_str()).collect()
+                };
+                let want_vals = legacy_cat || !dim_names.is_empty();
+
+                let mut peeked: Vec<(Option<String>, Option<CatVal>)> =
+                    Vec::with_capacity(feats.len());
+                let mut peeked_dims: Vec<Vec<Option<DimVal>>> = Vec::with_capacity(feats.len());
+                for (i, f) in feats.iter().enumerate() {
+                    let want_id = id_prop.is_some() || f.id.is_none();
+                    if !(want_id || want_vals) {
+                        peeked.push((None, None));
+                        peeked_dims.push(Vec::new());
+                        continue;
+                    }
+                    let id_key = if want_id { id_prop.or(Some("id")) } else { None };
+                    match &f.props {
+                        Some(p) => {
+                            if legacy_cat || dim_names.is_empty() {
+                                let keys: &[&str] = if legacy_cat { &cat_keys } else { &[] };
+                                peeked.push(peek_props(p.get(), id_key, keys).map_err(|e| {
                                     ApiError::bad(format!(
                                         "features[{i}]: properties are unreadable: {e}"
                                     ))
-                                })?;
-                            peeked.push((id, None));
-                            peeked_dims.push(vals);
+                                })?);
+                                peeked_dims.push(Vec::new());
+                            } else {
+                                let (id, vals) =
+                                    peek_dims(p.get(), id_key, &dim_names).map_err(|e| {
+                                        ApiError::bad(format!(
+                                            "features[{i}]: properties are unreadable: {e}"
+                                        ))
+                                    })?;
+                                peeked.push((id, None));
+                                peeked_dims.push(vals);
+                            }
                         }
-                    }
-                    None => {
-                        peeked.push((None, None));
-                        peeked_dims.push(Vec::new());
-                    }
-                }
-            }
-
-            // Cells first, into one owned buffer the reports borrow from.
-            let mut cell_store: Vec<Option<Vec<u32>>> = Vec::with_capacity(feats.len());
-            let mut vals: HashMap<String, Vec<String>> = HashMap::new();
-            for i in 0..feats.len() {
-                if !c.schema.enabled() {
-                    cell_store.push(None);
-                    continue;
-                }
-                vals.clear();
-                if legacy_cat {
-                    if let Some(cat) = &peeked[i].1 {
-                        let v = match cat {
-                            CatVal::Num(n) => n.to_string(),
-                            CatVal::Name(s) => s.clone(),
-                        };
-                        vals.insert(c.schema.dims[0].name.clone(), vec![v]);
-                    }
-                } else {
-                    for (d, got) in peeked_dims[i].iter().enumerate() {
-                        if let Some(v) = got {
-                            vals.insert(dim_names[d].to_string(), v.0.clone());
+                        None => {
+                            peeked.push((None, None));
+                            peeked_dims.push(Vec::new());
                         }
                     }
                 }
-                if vals.is_empty() {
-                    cell_store.push(None);
-                    continue;
-                }
-                let mut out = Vec::new();
-                c.cells_for_report(&vals, &mut out).map_err(|e| {
-                    ApiError::bad(format!("features[{i}]: {e}")).code("bad_geojson")
-                })?;
-                cell_store.push(Some(out));
-            }
 
-            let mut resolved = Vec::with_capacity(feats.len());
-            for (i, f) in feats.iter().enumerate() {
-                let geom = f.geom.as_ref().ok_or_else(|| {
-                    ApiError::bad(format!(
-                        "features[{i}] has a null geometry, so it has no position to cluster"
-                    ))
-                    .code("bad_geojson")
-                })?;
-                // A GeoJSON coordinates array is positional, so the pair can be
-                // -- and often is -- written the wrong way round. Web Mercator
-                // clamps latitude, so without this the point silently lands at a
-                // pole instead of failing. Only catches a swap that puts a
-                // longitude past +-90 into the latitude slot; nothing can catch
-                // one where both numbers are in range. The compact form names its
-                // fields, so it needs none of this.
-                if !(-90.0..=90.0).contains(&geom.lat) {
-                    return Err(ApiError::bad(format!(
-                        "features[{i}] has latitude {}, outside [-90, 90]. GeoJSON coordinates are \
-                         [longitude, latitude] -- are yours the other way round?",
-                        geom.lat
-                    ))
-                    .code("bad_geojson"));
+                // Cells first, into one owned buffer the reports borrow from.
+                let mut cell_store: Vec<Option<Vec<u32>>> = Vec::with_capacity(feats.len());
+                let mut vals: HashMap<String, Vec<String>> = HashMap::new();
+                for i in 0..feats.len() {
+                    if !c.schema.enabled() {
+                        cell_store.push(None);
+                        continue;
+                    }
+                    vals.clear();
+                    if legacy_cat {
+                        if let Some(cat) = &peeked[i].1 {
+                            let v = match cat {
+                                CatVal::Num(n) => n.to_string(),
+                                CatVal::Name(s) => s.clone(),
+                            };
+                            vals.insert(c.schema.dims[0].name.clone(), vec![v]);
+                        }
+                    } else {
+                        for (d, got) in peeked_dims[i].iter().enumerate() {
+                            if let Some(v) = got {
+                                vals.insert(dim_names[d].to_string(), v.0.clone());
+                            }
+                        }
+                    }
+                    if vals.is_empty() {
+                        cell_store.push(None);
+                        continue;
+                    }
+                    let mut out = Vec::new();
+                    c.cells_for_report(&vals, &mut out).map_err(|e| {
+                        ApiError::bad(format!("features[{i}]: {e}")).code("bad_geojson")
+                    })?;
+                    cell_store.push(Some(out));
                 }
-                let id = match (id_prop, &peeked[i].0, &f.id) {
-                    // An explicitly named property wins outright: having asked for
-                    // it, silently falling back to feature.id would key half the
-                    // fleet one way and half the other.
-                    (Some(k), p, _) => p.as_deref().ok_or_else(|| {
+
+                let mut resolved = Vec::with_capacity(feats.len());
+                for (i, f) in feats.iter().enumerate() {
+                    let geom = f.geom.as_ref().ok_or_else(|| {
                         ApiError::bad(format!(
-                            "features[{i}] has no properties.{k}, which id_property named as the id"
+                            "features[{i}] has a null geometry, so it has no position to cluster"
                         ))
                         .code("bad_geojson")
-                    })?,
-                    (None, _, Some(v)) => v.as_str(),
-                    (None, p, None) => p.as_deref().ok_or_else(|| {
-                        ApiError::bad(format!(
-                            "features[{i}] has no id. Put it on the feature (\"id\": \"vehicle-7\", \
-                             where GeoJSON says it goes) or in properties.id, or name the property \
-                             with ?id_property="
+                    })?;
+                    // A GeoJSON coordinates array is positional, so the pair can be
+                    // -- and often is -- written the wrong way round. Web Mercator
+                    // clamps latitude, so without this the point silently lands at a
+                    // pole instead of failing. Only catches a swap that puts a
+                    // longitude past +-90 into the latitude slot.
+                    if !(-90.0..=90.0).contains(&geom.lat) {
+                        return Err(ApiError::bad(format!(
+                            "features[{i}] has latitude {}, outside [-90, 90]. GeoJSON coordinates are \
+                             [longitude, latitude] -- are yours the other way round?",
+                            geom.lat
                         ))
-                        .code("bad_geojson")
-                    })?,
-                };
-                resolved.push(Report {
-                    id,
-                    lng: geom.lng,
-                    lat: geom.lat,
-                    props: f.props.as_deref(),
-                    cells: cell_store[i].as_deref(),
-                });
+                        .code("bad_geojson"));
+                    }
+                    let id = match (id_prop, &peeked[i].0, &f.id) {
+                        (Some(k), p, _) => p.as_deref().ok_or_else(|| {
+                            ApiError::bad(format!(
+                                "features[{i}] has no properties.{k}, which id_property named as the id"
+                            ))
+                            .code("bad_geojson")
+                        })?,
+                        (None, _, Some(v)) => v.as_str(),
+                        (None, p, None) => p.as_deref().ok_or_else(|| {
+                            ApiError::bad(format!(
+                                "features[{i}] has no id. Put it on the feature (\"id\": \"vehicle-7\", \
+                                 where GeoJSON says it goes) or in properties.id, or name the property \
+                                 with ?id_property="
+                            ))
+                            .code("bad_geojson")
+                        })?,
+                    };
+                    resolved.push(Report {
+                        id,
+                        lng: geom.lng,
+                        lat: geom.lat,
+                        props: f.props.as_deref(),
+                        cells: cell_store[i].as_deref(),
+                        updated_at_ms: f.updated_at_ms,
+                    });
+                }
+                c.upsert(&resolved).map_err(ApiError::bad)?
             }
-            c.upsert(&resolved).map_err(ApiError::bad)?
-        }
-    };
-    Ok(Json(json!({ "accepted": n, "devices": c.len() })))
+        };
+        Ok((n, c.len()))
+    })
+    .await?;
+    Ok(Json(json!({
+        "accepted": n,
+        "stale": submitted.saturating_sub(n),
+        "devices": devices,
+    })))
 }
 
 /// Is this device registered, and what does the index know about it?
@@ -921,7 +1065,9 @@ async fn get_device(
     Path((name, id)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
     let c = s.get(&name)?;
-    match c.device(&id) {
+    let lookup_id = id.clone();
+    let device = run_blocking(move || Ok(c.device(&lookup_id))).await?;
+    match device {
         Some(d) => Ok(Json(json!(d))),
         None => Err(
             ApiError::not_found(format!("device {id:?} is not registered in {name:?}"))
@@ -935,7 +1081,16 @@ async fn delete_device(
     Path((name, id)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
     let c = s.get(&name)?;
-    Ok(Json(json!({ "removed": c.remove(&id) })))
+    let write_gate = c.clone();
+    let write_guard = tokio::time::timeout(Duration::from_secs(1), write_gate.acquire_write())
+        .await
+        .map_err(|_| ApiError::overloaded())?;
+    let removed = run_blocking(move || {
+        let _write_guard = write_guard;
+        Ok(c.remove(&id))
+    })
+    .await?;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 // ------------------------------------------------------------------ query --
@@ -1035,20 +1190,23 @@ async fn clusters(
     State(s): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(q): Query<HashMap<String, String>>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     let c = s.get(&name)?;
-    let cat = parse_filter(&c, &q)?;
-    let preds = parse_where(&c, &q)?;
     let (bbox, zoom) = (parse_bbox(&q)?, parse_zoom(&q)?);
-    // Two paths on purpose. Without `?where=` this reads precomputed aggregates
-    // and costs what it always did; with one it scans, and that is the only way a
-    // substring can be answered exactly.
-    let fs = if preds.is_empty() {
-        c.clusters(bbox, zoom, cat)
-    } else {
-        c.search(bbox, zoom, cat, &preds)
-    };
-    Ok(Json(collection_json(&fs)))
+    run_blocking(move || {
+        let cat = parse_filter(&c, &q)?;
+        let preds = parse_where(&c, &q)?;
+        // Two paths on purpose. Without `?where=` this reads precomputed aggregates
+        // and costs what it always did; with one it scans, and that is the only way a
+        // substring can be answered exactly.
+        let fs = if preds.is_empty() {
+            c.clusters(bbox, zoom, cat)
+        } else {
+            c.search(bbox, zoom, cat, &preds)
+        };
+        Ok(Json(collection_json(&fs)).into_response())
+    })
+    .await
 }
 
 async fn device_cluster(
@@ -1058,7 +1216,9 @@ async fn device_cluster(
 ) -> ApiResult<Json<Value>> {
     let c = s.get(&name)?;
     let z = parse_zoom(&q)? as i32;
-    match c.device_cluster(&id, z) {
+    let lookup_id = id.clone();
+    let feature = run_blocking(move || Ok(c.device_cluster(&lookup_id, z))).await?;
+    match feature {
         Some(f) => Ok(Json(geojson(&f))),
         None => Err(
             ApiError::not_found(format!("device {id:?} is not in {name:?}"))
@@ -1070,20 +1230,23 @@ async fn device_cluster(
 async fn cluster_children(
     State(s): State<Arc<AppState>>,
     Path((name, cid)): Path<(String, u64)>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     let c = s.get(&name)?;
-    let fs = c.children(cid).map_err(ApiError::bad)?;
-    let nz = c.expansion_zoom(cid).map_err(ApiError::bad)?;
-    let mut v = collection_json(&fs);
-    v["expansion_zoom"] = json!(nz);
-    Ok(Json(v))
+    run_blocking(move || {
+        let fs = c.children(cid).map_err(ApiError::bad)?;
+        let nz = c.expansion_zoom(cid).map_err(ApiError::bad)?;
+        let mut v = collection_json(&fs);
+        v["expansion_zoom"] = json!(nz);
+        Ok(Json(v).into_response())
+    })
+    .await
 }
 
 async fn cluster_leaves(
     State(s): State<Arc<AppState>>,
     Path((name, cid)): Path<(String, u64)>,
     Query(q): Query<HashMap<String, String>>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     let c = s.get(&name)?;
     let limit = q
         .get("limit")
@@ -1093,10 +1256,13 @@ async fn cluster_leaves(
         .get("offset")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0usize);
-    let fs = c
-        .leaves(cid, limit.min(10_000), offset)
-        .map_err(ApiError::bad)?;
-    Ok(Json(collection_json(&fs)))
+    run_blocking(move || {
+        let fs = c
+            .leaves(cid, limit.min(10_000), offset)
+            .map_err(ApiError::bad)?;
+        Ok(Json(collection_json(&fs)).into_response())
+    })
+    .await
 }
 
 async fn tile(
@@ -1130,93 +1296,96 @@ async fn tile(
         )
         .code("where_not_supported"));
     }
-    let cat = parse_filter(&c, &q)?;
-    let feats = c.tile(z, x, y, cat);
-
-    match ext {
-        "mvt" | "pbf" => {
-            let extent = c.config.extent as u32;
-            let mut layer = mvt::Layer::new("clusters", extent);
-            for f in &feats {
-                if let Some(dev) = &f.device {
-                    let mut tags = vec![
-                        ("cluster", mvt::Val::Bool(false)),
-                        ("id", mvt::Val::Str(dev.clone())),
-                    ];
-                    // Top-level scalars become tags so a renderer can style by
-                    // them. Nested objects and arrays are skipped rather than
-                    // stringified: a vector-tile value is a scalar, and quietly
-                    // turning {"a":1} into the text `{"a":1}` would produce a
-                    // filter that silently never matches.
-                    let flat = f.props.as_ref().and_then(|p| {
-                        serde_json::from_str::<serde_json::Map<String, Value>>(p.get()).ok()
-                    });
-                    if let Some(map) = &flat {
-                        for (k, v) in map {
-                            let val = match v {
-                                Value::String(x) => mvt::Val::Str(x.clone()),
-                                Value::Bool(b) => mvt::Val::Bool(*b),
-                                Value::Number(n) if n.is_u64() => {
-                                    mvt::Val::Uint(n.as_u64().unwrap())
+    let extent = c.config.extent as u32;
+    let ext = ext.to_owned();
+    run_blocking(move || {
+        let cat = parse_filter(&c, &q)?;
+        let feats = c.tile(z, x, y, cat);
+        match ext.as_str() {
+            "mvt" | "pbf" => {
+                let mut layer = mvt::Layer::new("clusters", extent);
+                for f in &feats {
+                    if let Some(dev) = &f.device {
+                        let mut tags = vec![
+                            ("cluster", mvt::Val::Bool(false)),
+                            ("id", mvt::Val::Str(dev.clone())),
+                        ];
+                        // Top-level scalars become tags so a renderer can style by
+                        // them. Nested objects and arrays are skipped rather than
+                        // stringified: a vector-tile value is a scalar, and quietly
+                        // turning {"a":1} into the text `{"a":1}` would produce a
+                        // filter that silently never matches.
+                        let flat = f.props.as_ref().and_then(|p| {
+                            serde_json::from_str::<serde_json::Map<String, Value>>(p.get()).ok()
+                        });
+                        if let Some(map) = &flat {
+                            for (k, v) in map {
+                                let val = match v {
+                                    Value::String(x) => mvt::Val::Str(x.clone()),
+                                    Value::Bool(b) => mvt::Val::Bool(*b),
+                                    Value::Number(n) if n.is_u64() => {
+                                        mvt::Val::Uint(n.as_u64().unwrap())
+                                    }
+                                    Value::Number(n) => mvt::Val::Str(n.to_string()),
+                                    _ => continue,
+                                };
+                                if k != "cluster" && k != "id" {
+                                    tags.push((k.as_str(), val));
                                 }
-                                Value::Number(n) => mvt::Val::Str(n.to_string()),
-                                _ => continue,
-                            };
-                            if k != "cluster" && k != "id" {
-                                tags.push((k.as_str(), val));
                             }
                         }
+                        layer.add_point(f.id, f.x, f.y, &tags);
+                    } else {
+                        layer.add_point(
+                            f.id,
+                            f.x,
+                            f.y,
+                            &[
+                                ("cluster", mvt::Val::Bool(true)),
+                                ("point_count", mvt::Val::Uint(f.count as u64)),
+                                ("point_count_abbreviated", mvt::Val::Str(abbrev(f.count))),
+                            ],
+                        );
                     }
-                    layer.add_point(f.id, f.x, f.y, &tags);
-                } else {
-                    layer.add_point(
-                        f.id,
-                        f.x,
-                        f.y,
-                        &[
-                            ("cluster", mvt::Val::Bool(true)),
-                            ("point_count", mvt::Val::Uint(f.count as u64)),
-                            ("point_count_abbreviated", mvt::Val::Str(abbrev(f.count))),
-                        ],
-                    );
                 }
+                let body = if layer.is_empty() {
+                    Vec::new()
+                } else {
+                    mvt::encode(vec![layer])
+                };
+                Ok((
+                    [
+                        (header::CONTENT_TYPE, "application/vnd.mapbox-vector-tile"),
+                        // Data moves constantly, so the window is short -- but at coarse
+                        // zooms a tile is shared by every viewer looking at that region,
+                        // and even two seconds collapses thousands of queries into one.
+                        (header::CACHE_CONTROL, "public, max-age=2"),
+                    ],
+                    body,
+                )
+                    .into_response())
             }
-            let body = if layer.is_empty() {
-                Vec::new()
-            } else {
-                mvt::encode(vec![layer])
-            };
-            Ok((
-                [
-                    (header::CONTENT_TYPE, "application/vnd.mapbox-vector-tile"),
-                    // Data moves constantly, so the window is short -- but at coarse
-                    // zooms a tile is shared by every viewer looking at that region,
-                    // and even two seconds collapses thousands of queries into one.
-                    (header::CACHE_CONTROL, "public, max-age=2"),
-                ],
-                body,
-            )
-                .into_response())
+            "json" | "geojson" => {
+                let fs: Vec<OutFeature> = feats
+                    .iter()
+                    .map(|f| OutFeature {
+                        lng: f.x as f64,
+                        lat: f.y as f64,
+                        count: f.count,
+                        device: f.device.clone(),
+                        cluster_id: if f.device.is_some() { None } else { Some(f.id) },
+                        props: f.props.clone(),
+                    })
+                    .collect();
+                let mut v = collection_json(&fs);
+                v["note"] = json!("coordinates are tile-extent units, not degrees");
+                v["extent"] = json!(extent);
+                Ok(Json(v).into_response())
+            }
+            other => Err(ApiError::bad(format!(
+                "unknown tile format {other:?}; use .mvt or .json"
+            ))),
         }
-        "json" | "geojson" => {
-            let fs: Vec<OutFeature> = feats
-                .iter()
-                .map(|f| OutFeature {
-                    lng: f.x as f64,
-                    lat: f.y as f64,
-                    count: f.count,
-                    device: f.device.clone(),
-                    cluster_id: if f.device.is_some() { None } else { Some(f.id) },
-                    props: f.props.clone(),
-                })
-                .collect();
-            let mut v = collection_json(&fs);
-            v["note"] = json!("coordinates are tile-extent units, not degrees");
-            v["extent"] = json!(c.config.extent);
-            Ok(Json(v).into_response())
-        }
-        other => Err(ApiError::bad(format!(
-            "unknown tile format {other:?}; use .mvt or .json"
-        ))),
-    }
+    })
+    .await
 }

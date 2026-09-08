@@ -49,6 +49,48 @@ export class NetClusterError extends Error {
 const trimSlash = (u) => String(u).replace(/\/+$/, '');
 const enc = encodeURIComponent;
 
+// A process-local fallback, not a replacement for a timestamp from the source
+// database. Assign once at enqueue/invocation, never at flush or on retry.
+let lastLocalVersion = 0;
+function localVersion() {
+  lastLocalVersion = Math.max(Date.now(), lastLocalVersion + 1);
+  return lastLocalVersion;
+}
+function wirePoint(point, fallback) {
+  const updatedAt = point.updatedAt ?? point.updated_at_ms ?? fallback ?? localVersion();
+  if (!Number.isSafeInteger(updatedAt) || updatedAt < 0) {
+    throw new TypeError('netcluster: updatedAt must be a non-negative safe integer');
+  }
+  const { updatedAt: _ignored, ...rest } = point;
+  // Own nested props/dims as well: caller mutation after enqueue cannot change
+  // the contents of a retry while keeping its original version.
+  return structuredClone({ ...rest, updated_at_ms: updatedAt });
+}
+function checkBatchSize(maxBatch) {
+  if (!Number.isSafeInteger(maxBatch) || maxBatch <= 0) {
+    throw new TypeError('netcluster: maxBatch must be a positive safe integer');
+  }
+}
+function checkAck(ack, submitted) {
+  const accepted = ack?.accepted;
+  const stale = ack?.stale ?? 0;
+  if (!Number.isSafeInteger(accepted) || accepted < 0 ||
+      !Number.isSafeInteger(stale) || stale < 0 || accepted + stale !== submitted) {
+    throw new NetClusterError('netcluster: incomplete position acknowledgement', {
+      body: { code: 'incomplete_ack', submitted, accepted, stale },
+    });
+  }
+}
+const pause = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) { reject(signal.reason); return; }
+  const abort = () => { clearTimeout(timer); reject(signal.reason); };
+  const timer = setTimeout(() => {
+    signal?.removeEventListener('abort', abort);
+    resolve();
+  }, ms);
+  signal?.addEventListener('abort', abort, { once: true });
+});
+
 /**
  * Filter values onto `f.<name>=` query parameters.
  *
@@ -145,8 +187,17 @@ export class NetClusterClient {
 
   async _req(base, path, { method = 'GET', body, raw = false, signal } = {}) {
     const url = base + path;
+    // Encode once. Besides avoiding repeated CPU work on retries, this makes the
+    // retry payload byte-for-byte identical to the first attempt.
+    const encodedBody = body !== undefined ? JSON.stringify(body) : undefined;
     let last;
+    let retryAfterMs = 0;
     for (let attempt = 0; attempt <= this.retries; attempt++) {
+      signal?.throwIfAborted();
+      if (attempt) {
+        await pause(Math.max(retryAfterMs, Math.min(2000, 100 * 2 ** (attempt - 1)) *
+          (0.5 + Math.random())), signal);
+      }
       let res;
       try {
         res = await this.fetch(url, {
@@ -155,19 +206,22 @@ export class NetClusterClient {
             ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
             ...this.headers,
           },
-          body: body !== undefined ? JSON.stringify(body) : undefined,
-          signal: signal ?? AbortSignal.timeout(this.timeoutMs),
+          body: encodedBody,
+          signal: signal
+            ? AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)])
+            : AbortSignal.timeout(this.timeoutMs),
         });
+        if (res.ok) {
+          if (res.status === 204) return null;
+          return raw ? new Uint8Array(await res.arrayBuffer()) : await res.json();
+        }
       } catch (e) {
+        signal?.throwIfAborted();
         last = new NetClusterError(`${method} ${url} failed: ${e.message}`, {
           url,
           cause: e,
         });
         continue;
-      }
-      if (res.ok) {
-        if (res.status === 204) return null;
-        return raw ? new Uint8Array(await res.arrayBuffer()) : await res.json();
       }
       let parsed = null;
       let text = '';
@@ -183,7 +237,13 @@ export class NetClusterClient {
       );
       // 4xx means the request is wrong. Retrying will produce the same 4xx and
       // hides the real problem behind a timeout.
-      if (res.status >= 400 && res.status < 500) throw err;
+      if (res.status >= 400 && res.status < 500 && res.status !== 429) throw err;
+      const retryAfter = res.headers?.get?.('retry-after');
+      const seconds = Number(retryAfter);
+      retryAfterMs = retryAfter === null || retryAfter === undefined ? 0 :
+        Number.isFinite(seconds) ? Math.max(0, seconds * 1000) :
+        Math.max(0, Date.parse(retryAfter) - Date.now()) || 0;
+      retryAfterMs = Math.min(retryAfterMs, 30_000);
       last = err;
     }
     throw last;
@@ -287,18 +347,28 @@ export class NetClusterClient {
    * for its whole duration and every reader waits behind it.
    */
   async report(name, points, { maxBatch = DEFAULT_MAX_BATCH } = {}) {
-    const list = Array.isArray(points) ? points : [points];
+    checkBatchSize(maxBatch);
+    const version = localVersion();
+    const seen = new Set();
+    const list = (Array.isArray(points) ? points : [points]).map(p => {
+      const fallback = seen.has(p.id) ? localVersion() : version;
+      seen.add(p.id);
+      return wirePoint(p, fallback);
+    });
     if (list.length === 0) return { accepted: 0 };
     let accepted = 0;
+    let stale = 0;
     let last = null;
     for (let i = 0; i < list.length; i += maxBatch) {
       last = await this._write(`/v1/collections/${enc(name)}/positions`, {
         method: 'POST',
         body: list.slice(i, i + maxBatch),
       });
-      accepted += last?.accepted ?? 0;
+      checkAck(last, Math.min(maxBatch, list.length - i));
+      accepted += last.accepted;
+      stale += last?.stale ?? 0;
     }
-    return { accepted, devices: last?.devices };
+    return { accepted, stale, devices: last?.devices };
   }
 
   /**
@@ -318,16 +388,19 @@ export class NetClusterClient {
    *        then `category`.
    */
   async reportGeoJSON(name, geojson, { maxBatch = DEFAULT_MAX_BATCH, idProperty, catProperty } = {}) {
-    const features = Array.isArray(geojson)
+    checkBatchSize(maxBatch);
+    const input = Array.isArray(geojson)
       ? geojson
       : geojson && geojson.type === 'Feature'
         ? [geojson]
         : (geojson && geojson.features) || null;
-    if (!Array.isArray(features)) {
+    if (!Array.isArray(input)) {
       throw new TypeError(
         'netcluster: reportGeoJSON takes a GeoJSON FeatureCollection, an array of Features, or one Feature'
       );
     }
+    const version = localVersion();
+    const features = input.map(f => wirePoint(f, version));
     if (features.length === 0) return { accepted: 0 };
 
     const q = new URLSearchParams();
@@ -337,15 +410,18 @@ export class NetClusterClient {
     const path = `/v1/collections/${enc(name)}/positions${qs ? `?${qs}` : ''}`;
 
     let accepted = 0;
+    let stale = 0;
     let last = null;
     for (let i = 0; i < features.length; i += maxBatch) {
       last = await this._write(path, {
         method: 'POST',
         body: { type: 'FeatureCollection', features: features.slice(i, i + maxBatch) },
       });
-      accepted += last?.accepted ?? 0;
+      checkAck(last, Math.min(maxBatch, features.length - i));
+      accepted += last.accepted;
+      stale += last?.stale ?? 0;
     }
-    return { accepted, devices: last?.devices };
+    return { accepted, stale, devices: last?.devices };
   }
 
   remove(name, id) {
@@ -506,10 +582,11 @@ export class Reporter {
     this.collection = collection;
     this.flushMs = options.flushMs ?? 500;
     this.maxBatch = options.maxBatch ?? DEFAULT_MAX_BATCH;
+    checkBatchSize(this.maxBatch);
     this.onError = options.onError;
     /** @type {Map<string, object>} */
     this.pending = new Map();
-    this.stats = { queued: 0, coalesced: 0, sent: 0, requests: 0, errors: 0 };
+    this.stats = { queued: 0, coalesced: 0, sent: 0, stale: 0, requests: 0, errors: 0 };
     this._closed = false;
     this._inflight = null;
     this._timer = setInterval(() => {
@@ -525,9 +602,11 @@ export class Reporter {
     if (!point || typeof point.id !== 'string') {
       throw new TypeError('netcluster: a report needs a string id');
     }
+    point = wirePoint(point);
     const prev = this.pending.get(point.id);
     if (prev !== undefined) {
       this.stats.coalesced++;
+      if (point.updated_at_ms <= prev.updated_at_ms) { this.stats.stale++; return; }
       // Carry properties forward. Coalescing keeps the newest report, and a plain
       // position report carries no `props` -- so without this, reporting
       // properties and then a position before the next flush would discard them
@@ -536,6 +615,10 @@ export class Reporter {
       if (point.props === undefined && prev.props !== undefined) {
         point = { ...point, props: prev.props };
       }
+    }
+    if (prev && point.dims === undefined && point.cat === undefined) {
+      if (prev.dims !== undefined) point.dims = prev.dims;
+      if (prev.cat !== undefined) point.cat = prev.cat;
     }
     this.pending.set(point.id, point);
     this.stats.queued++;
@@ -559,13 +642,17 @@ export class Reporter {
           maxBatch: this.maxBatch,
         });
         this.stats.sent += r.accepted;
+        this.stats.stale += r.stale ?? 0;
         this.stats.requests += Math.ceil(batch.length / this.maxBatch);
         return r;
       } catch (e) {
         this.stats.errors++;
         // Put them back, unless a newer report has already superseded them --
         // dropping a position silently would leave a vehicle frozen on the map.
-        for (const p of batch) if (!this.pending.has(p.id)) this.pending.set(p.id, p);
+        for (const p of batch) {
+          const pending = this.pending.get(p.id);
+          if (!pending || pending.updated_at_ms < p.updated_at_ms) this.pending.set(p.id, p);
+        }
         if (this.onError) this.onError(e);
         else throw e;
         return { accepted: 0 };

@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { NetClusterClient, NetClusterError, DEFAULT_MAX_BATCH } from './index.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const BIN = process.env.NETCLUSTER_BIN ?? join(HERE, '../../target/release/netcluster-server');
+const BIN = process.env.NETCLUSTER_BIN ?? join(HERE, '../../target/release/netcluster-server' + (process.platform === 'win32' ? '.exe' : ''));
 const PORT = 8000 + Math.floor(Math.random() * 1000);
 const URL = `http://127.0.0.1:${PORT}`;
 
@@ -86,6 +86,20 @@ await test('report and cluster', async () => {
   assert.equal(fc.type, 'FeatureCollection');
   const total = fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
   assert.equal(total, 4, 'every device must be accounted for exactly once');
+});
+
+await test('late retries do not move a device backwards', async () => {
+  await fleet.report([{ id: 'ordered-1', lng: 10, lat: 10, updatedAt: 200,
+                        props: { state: 'new' } }]);
+  const late = await fleet.report([{ id: 'ordered-1', lng: 1, lat: 1, updatedAt: 100,
+                                     props: { state: 'old' } }]);
+  assert.equal(late.accepted, 0);
+  assert.equal(late.stale, 1);
+  const d = await fleet.getDevice('ordered-1');
+  assert.ok(Math.abs(d.lng - 10) < 1e-6);
+  assert.ok(Math.abs(d.lat - 10) < 1e-6);
+  assert.equal(d.props.state, 'new');
+  await fleet.remove('ordered-1');
 });
 
 await test('filter by category label', async () => {

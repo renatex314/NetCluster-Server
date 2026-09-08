@@ -254,6 +254,8 @@ impl<'de> Deserialize<'de> for PointGeom {
 /// One Feature, read but not adopted: the wrapper is dropped and only these
 /// three values go on.
 pub struct GeoFeature {
+    /// Source version as a GeoJSON foreign member, not a user property.
+    pub updated_at_ms: Option<u64>,
     pub id: Option<String>,
     /// `None` when the Feature carried a null geometry.
     pub geom: Option<PointGeom>,
@@ -272,6 +274,7 @@ impl<'de> Deserialize<'de> for GeoFeature {
                 let mut id = None;
                 let mut geom = None;
                 let mut props = None;
+                let mut updated_at_ms = None;
                 let mut saw_geometry = false;
                 let mut ty: Option<String> = None;
                 while let Some(k) = m.next_key::<&str>()? {
@@ -282,6 +285,7 @@ impl<'de> Deserialize<'de> for GeoFeature {
                             saw_geometry = true;
                             geom = m.next_value::<Option<PointGeom>>()?;
                         }
+                        "updated_at_ms" => updated_at_ms = m.next_value::<Option<u64>>()?,
                         "properties" => props = m.next_value::<Option<Box<RawValue>>>()?,
                         _ => {
                             m.next_value::<IgnoredAny>()?;
@@ -306,7 +310,12 @@ impl<'de> Deserialize<'de> for GeoFeature {
                 if props.as_ref().is_some_and(|p| p.get().trim() == "null") {
                     props = None;
                 }
-                Ok(GeoFeature { id, geom, props })
+                Ok(GeoFeature {
+                    id,
+                    geom,
+                    props,
+                    updated_at_ms,
+                })
             }
         }
         d.deserialize_map(V)
