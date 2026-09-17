@@ -27,6 +27,22 @@ const MAX_CELL_BITS: u32 = 24;
 const KEY_Y: u64 = 1 << MAX_CELL_BITS;
 const KEY_X: u64 = 1 << (MAX_CELL_BITS * 2);
 
+/// How far a drawn cluster may sit from its anchor, as a fraction of `r_z`.
+///
+/// Separation is enforced on anchors -- the actual device that represents a
+/// cluster -- but what is drawn is the centroid of everything under it, and
+/// that is free to wander up to `2·r_z` from the anchor as members move. Two
+/// neighbouring markers could therefore sit almost on top of each other while
+/// the tree is perfectly valid. Bounding the drift caps their approach at
+/// `(1 - 2·CENTROID_DRIFT)·r_z`, trading "the marker sits exactly on the mass"
+/// for "markers stay apart".
+///
+/// Centroids typically sit ~0.4·r_z from their anchor, so this moves most
+/// markers, by a few pixels. It is the value at which marker spacing on a moving
+/// fleet matches what supercluster produces on the same points; 0.5 leaves
+/// neighbours touching several times as often.
+pub const CENTROID_DRIFT: f64 = 0.25;
+
 /// Geometry of the hierarchy. Every process sharing an index must agree on all
 /// of it; changing any field changes what the clusters mean.
 #[derive(Debug, Clone, PartialEq)]
@@ -1202,6 +1218,27 @@ impl NetCluster {
         (c, ax, ay)
     }
 
+    /// Where the cluster `(s, z)` with mass `(count, ax, ay)` is drawn: its
+    /// centroid, pulled back to within `CENTROID_DRIFT · r_z` of the anchor `s`
+    /// when it has drifted further. A single point is never moved.
+    fn centroid(&self, s: Slot, z: i32, count: i32, ax: i64, ay: i64) -> (f64, f64) {
+        let mx = ax as f64 / count as f64;
+        let my = ay as f64 / count as f64;
+        if count <= 1 {
+            return (mx, my);
+        }
+        let si = s as usize;
+        let (px, py) = (self.qx[si] as f64, self.qy[si] as f64);
+        let (dx, dy) = (mx - px, my - py);
+        let lim = CENTROID_DRIFT * self.r[z as usize];
+        let d2 = dx * dx + dy * dy;
+        if d2 <= lim * lim {
+            return (mx, my);
+        }
+        let k = lim / d2.sqrt();
+        (px + dx * k, py + dy * k)
+    }
+
     /// How many points of cell `cat` sit anywhere under `s`.
     #[inline]
     pub(crate) fn subtree_count(&self, s: Slot, cat: i32) -> i32 {
@@ -1328,8 +1365,7 @@ impl NetCluster {
             let (count, ax, ay) = self.cluster_at(s, z, cat);
             if count > 0 {
                 // filtered clusters can be empty
-                let mx = ax as f64 / count as f64;
-                let my = ay as f64 / count as f64;
+                let (mx, my) = self.centroid(s, z, count, ax, ay);
                 if mx >= x0 && mx <= x1 && my >= y0 && my <= y1 {
                     // a filtered cluster of one is often a descendant, not the centre
                     let one = if count == 1 && cat >= 0 {
@@ -1454,7 +1490,8 @@ impl NetCluster {
         }
         let mut res = Vec::new();
         let (c, ax, ay) = self.cluster_at(s, nz, -1);
-        res.push(self.feature(s, nz, c as u32, ax as f64 / c as f64, ay as f64 / c as f64));
+        let (mx, my) = self.centroid(s, nz, c, ax, ay);
+        res.push(self.feature(s, nz, c as u32, mx, my));
         let mut b = self.kid[s as usize];
         while b != NONE {
             let tzb = self.tz[b as usize] as i32;
@@ -1463,7 +1500,8 @@ impl NetCluster {
             }
             if tzb > z {
                 let (c, ax, ay) = self.cluster_at(b, nz, -1);
-                res.push(self.feature(b, nz, c as u32, ax as f64 / c as f64, ay as f64 / c as f64));
+                let (mx, my) = self.centroid(b, nz, c, ax, ay);
+                res.push(self.feature(b, nz, c as u32, mx, my));
             }
             b = self.sib[b as usize];
         }
@@ -1554,13 +1592,8 @@ impl NetCluster {
         if count <= 0 {
             return None;
         }
-        Some(self.feature(
-            s,
-            z,
-            count as u32,
-            ax as f64 / count as f64,
-            ay as f64 / count as f64,
-        ))
+        let (mx, my) = self.centroid(s, z, count, ax, ay);
+        Some(self.feature(s, z, count as u32, mx, my))
     }
 
     /// The level-`z` representative as an internal slot.

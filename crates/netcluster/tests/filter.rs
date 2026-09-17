@@ -6,7 +6,7 @@
 //! exactly one slice per level -- the update cost does not grow with K. These
 //! tests check the answers are right; `bench/` checks the cost claim.
 
-use netcluster::{project, Feature, NetCluster, Options};
+use netcluster::{project, Feature, NetCluster, Options, CENTROID_DRIFT, PREC};
 use std::collections::HashMap;
 
 struct Rng(u32);
@@ -54,8 +54,9 @@ fn build(n: u64, seed: u32, k: usize) -> World {
 }
 
 /// Brute force: group the points of one category by their representative at zoom
-/// `z`, and take each group's exact centroid. That is what a filtered query must
-/// return -- no more, no less.
+/// `z`, and take each group's centroid, held to within `CENTROID_DRIFT · r_z` of
+/// the representative's own position. That is what a filtered query must return
+/// -- no more, no less.
 fn expected(w: &World, z: i32, c: u32) -> Vec<(u32, f64, f64)> {
     let mut groups: HashMap<u64, (u32, i64, i64)> = HashMap::new();
     for (&id, &cat) in &w.cat {
@@ -69,15 +70,42 @@ fn expected(w: &World, z: i32, c: u32) -> Vec<(u32, f64, f64)> {
         e.1 += p.0 as i64;
         e.2 += p.1 as i64;
     }
+    let o = w.nc.options();
+    let lim = CENTROID_DRIFT * PREC * o.radius / (o.extent * (1u64 << z) as f64);
     let mut out: Vec<(u32, f64, f64)> = groups
-        .values()
-        .map(|&(n, sx, sy)| {
-            let (lng, lat) = netcluster::unproject(sx as f64 / n as f64, sy as f64 / n as f64);
+        .iter()
+        .map(|(&rep, &(n, sx, sy))| {
+            let (mut mx, mut my) = (sx as f64 / n as f64, sy as f64 / n as f64);
+            if n > 1 {
+                let (ax, ay) = w.nc.position(rep).unwrap();
+                let (dx, dy) = (mx - ax as f64, my - ay as f64);
+                let d = (dx * dx + dy * dy).sqrt();
+                if d > lim {
+                    mx = ax as f64 + dx * lim / d;
+                    my = ay as f64 + dy * lim / d;
+                }
+            }
+            let (lng, lat) = netcluster::unproject(mx, my);
             (n, lng, lat)
         })
         .collect();
     out.sort_by(|a, b| a.partial_cmp(b).unwrap());
     out
+}
+
+fn assert_same(got: &[(u32, f64, f64)], want: &[(u32, f64, f64)], ctx: &str) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{ctx}: {} clusters, brute force says {}",
+        got.len(),
+        want.len()
+    );
+    for (a, b) in got.iter().zip(want.iter()) {
+        assert_eq!(a.0, b.0, "{ctx}: count");
+        assert!((a.1 - b.1).abs() < 1e-9, "{ctx}: lng {} vs {}", a.1, b.1);
+        assert!((a.2 - b.2).abs() < 1e-9, "{ctx}: lat {} vs {}", a.2, b.2);
+    }
 }
 
 fn actual(w: &World, z: i32, c: u32) -> Vec<(u32, f64, f64)> {
@@ -95,30 +123,11 @@ fn a_filtered_query_matches_brute_force_at_every_zoom() {
     let w = build(700, 5150, K);
     for z in 0..=w.nc.max_zoom() as i32 {
         for c in 0..K as u32 {
-            let want = expected(&w, z, c);
-            let got = actual(&w, z, c);
-            assert_eq!(
-                got.len(),
-                want.len(),
-                "z={z} cat={c}: {} clusters, brute force says {}",
-                got.len(),
-                want.len()
+            assert_same(
+                &actual(&w, z, c),
+                &expected(&w, z, c),
+                &format!("z={z} cat={c}"),
             );
-            for (a, b) in got.iter().zip(want.iter()) {
-                assert_eq!(a.0, b.0, "z={z} cat={c}: count");
-                assert!(
-                    (a.1 - b.1).abs() < 1e-9,
-                    "z={z} cat={c}: lng {} vs {}",
-                    a.1,
-                    b.1
-                );
-                assert!(
-                    (a.2 - b.2).abs() < 1e-9,
-                    "z={z} cat={c}: lat {} vs {}",
-                    a.2,
-                    b.2
-                );
-            }
         }
     }
 }
@@ -267,10 +276,10 @@ fn slices_survive_churn() {
     // and the answers are still right after all that
     for z in [0, 5, 11, 16] {
         for c in 0..K as u32 {
-            assert_eq!(
-                actual(&w, z, c),
-                expected(&w, z, c),
-                "z={z} cat={c} after churn"
+            assert_same(
+                &actual(&w, z, c),
+                &expected(&w, z, c),
+                &format!("z={z} cat={c} after churn"),
             );
         }
     }
