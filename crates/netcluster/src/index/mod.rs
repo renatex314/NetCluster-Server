@@ -41,6 +41,17 @@ const KEY_X: u64 = 1 << (MAX_CELL_BITS * 2);
 /// markers, by a few pixels. It is the value at which marker spacing on a moving
 /// fleet matches what supercluster produces on the same points; 0.5 leaves
 /// neighbours touching several times as often.
+///
+/// Under a filter the anchor is picked for tree structure with no regard to
+/// the filter, so it need not be a matching device at all, and the matching
+/// mass can sit anywhere within `2·r_z` of it. Clamping to a non-member would
+/// drag the marker away from the real filtered centroid by an amount and
+/// direction that changes with which anchor each zoom level visits -- a
+/// marker that jumps across zooms while no device moved. So a filtered
+/// cluster is bounded only when its anchor is itself a match (the common
+/// case for a dense filter, which then keeps its spacing), and otherwise
+/// drawn exactly on its mass. Either way it sits on, or next to, a device
+/// that matches.
 pub const CENTROID_DRIFT: f64 = 0.25;
 
 /// Geometry of the hierarchy. Every process sharing an index must agree on all
@@ -1220,11 +1231,13 @@ impl NetCluster {
 
     /// Where the cluster `(s, z)` with mass `(count, ax, ay)` is drawn: its
     /// centroid, pulled back to within `CENTROID_DRIFT · r_z` of the anchor `s`
-    /// when it has drifted further. A single point is never moved.
-    fn centroid(&self, s: Slot, z: i32, count: i32, ax: i64, ay: i64) -> (f64, f64) {
+    /// when it has drifted further. A single point is never moved, and neither
+    /// is a filtered cluster (`cat >= 0`) whose anchor is not itself in `cat`:
+    /// it would be clamped to a non-member -- see [`CENTROID_DRIFT`].
+    fn centroid(&self, s: Slot, z: i32, cat: i32, count: i32, ax: i64, ay: i64) -> (f64, f64) {
         let mx = ax as f64 / count as f64;
         let my = ay as f64 / count as f64;
-        if count <= 1 {
+        if count <= 1 || (cat >= 0 && !self.in_cell(s, cat)) {
             return (mx, my);
         }
         let si = s as usize;
@@ -1365,7 +1378,7 @@ impl NetCluster {
             let (count, ax, ay) = self.cluster_at(s, z, cat);
             if count > 0 {
                 // filtered clusters can be empty
-                let (mx, my) = self.centroid(s, z, count, ax, ay);
+                let (mx, my) = self.centroid(s, z, cat, count, ax, ay);
                 if mx >= x0 && mx <= x1 && my >= y0 && my <= y1 {
                     // a filtered cluster of one is often a descendant, not the centre
                     let one = if count == 1 && cat >= 0 {
@@ -1490,7 +1503,7 @@ impl NetCluster {
         }
         let mut res = Vec::new();
         let (c, ax, ay) = self.cluster_at(s, nz, -1);
-        let (mx, my) = self.centroid(s, nz, c, ax, ay);
+        let (mx, my) = self.centroid(s, nz, -1, c, ax, ay);
         res.push(self.feature(s, nz, c as u32, mx, my));
         let mut b = self.kid[s as usize];
         while b != NONE {
@@ -1500,7 +1513,7 @@ impl NetCluster {
             }
             if tzb > z {
                 let (c, ax, ay) = self.cluster_at(b, nz, -1);
-                let (mx, my) = self.centroid(b, nz, c, ax, ay);
+                let (mx, my) = self.centroid(b, nz, -1, c, ax, ay);
                 res.push(self.feature(b, nz, c as u32, mx, my));
             }
             b = self.sib[b as usize];
@@ -1592,7 +1605,7 @@ impl NetCluster {
         if count <= 0 {
             return None;
         }
-        let (mx, my) = self.centroid(s, z, count, ax, ay);
+        let (mx, my) = self.centroid(s, z, -1, count, ax, ay);
         Some(self.feature(s, z, count as u32, mx, my))
     }
 

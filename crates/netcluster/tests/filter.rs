@@ -54,9 +54,10 @@ fn build(n: u64, seed: u32, k: usize) -> World {
 }
 
 /// Brute force: group the points of one category by their representative at zoom
-/// `z`, and take each group's centroid, held to within `CENTROID_DRIFT · r_z` of
-/// the representative's own position. That is what a filtered query must return
-/// -- no more, no less.
+/// `z`, and take each group's centroid -- held to within `CENTROID_DRIFT · r_z`
+/// of the representative's own position only when the representative is itself
+/// in the category. That is what a filtered query must return -- no more, no
+/// less.
 fn expected(w: &World, z: i32, c: u32) -> Vec<(u32, f64, f64)> {
     let mut groups: HashMap<u64, (u32, i64, i64)> = HashMap::new();
     for (&id, &cat) in &w.cat {
@@ -76,7 +77,7 @@ fn expected(w: &World, z: i32, c: u32) -> Vec<(u32, f64, f64)> {
         .iter()
         .map(|(&rep, &(n, sx, sy))| {
             let (mut mx, mut my) = (sx as f64 / n as f64, sy as f64 / n as f64);
-            if n > 1 {
+            if n > 1 && w.cat[&rep] == c {
                 let (ax, ay) = w.nc.position(rep).unwrap();
                 let (dx, dy) = (mx - ax as f64, my - ay as f64);
                 let d = (dx * dx + dy * dy).sqrt();
@@ -232,6 +233,145 @@ fn a_sparse_filter_stays_correct() {
     }
     // a category with no members at all must return nothing, not everything
     assert!(nc.get_clusters(WORLD, 5.0, 0).is_empty());
+}
+
+/// A filtered cluster whose anchor is not in the category is drawn on its real
+/// mass, not pulled toward that anchor. Otherwise a sparse filter's marker
+/// would sit next to an unrelated device, and move by up to `2·r_z` between
+/// adjacent zooms while nothing changed (issue #1).
+#[test]
+fn a_filtered_cluster_is_never_pulled_toward_a_non_member() {
+    let o = Options {
+        categories: 2,
+        ..Default::default()
+    };
+    let mut nc = NetCluster::new(o.clone());
+    // one noise device, then two matching devices well past the drift bound
+    // but still inside the cluster radius at z, on the same side of it.
+    let z = 10;
+    let r = PREC * o.radius / (o.extent * (1u64 << z) as f64);
+    let (cx, cy) = project(-46.63, -23.55);
+    let off = (0.8 * r) as i32;
+    nc.insert_projected(1, cx, cy, 0);
+    nc.insert_projected(2, cx + off, cy, 1);
+    nc.insert_projected(3, cx + off, cy + off / 4, 1);
+    nc.verify().unwrap();
+
+    let feats = nc.get_clusters(WORLD, z as f64, 1);
+    assert_eq!(
+        feats.len(),
+        1,
+        "the two matching devices must cluster at z={z}"
+    );
+    let f = &feats[0];
+    assert_eq!(f.count(), 2);
+    let (mx, my) = project(f.lng(), f.lat());
+    let (wx, wy) = (cx + off, cy + off / 8);
+    assert!(
+        (mx - wx).abs() <= 1 && (my - wy).abs() <= 1,
+        "filtered marker at ({mx},{my}), true centroid ({wx},{wy}), anchor ({cx},{cy})"
+    );
+
+    // the unfiltered marker, whose anchor is a member, keeps the drift bound
+    let all = nc.get_clusters(WORLD, z as f64, -1);
+    assert_eq!(all.len(), 1);
+    let (ux, uy) = project(all[0].lng(), all[0].lat());
+    let d = (((ux - cx) as f64).powi(2) + ((uy - cy) as f64).powi(2)).sqrt();
+    assert!(
+        d <= CENTROID_DRIFT * r + 1.0,
+        "unfiltered marker drifted {d} from its anchor, bound is {}",
+        CENTROID_DRIFT * r
+    );
+}
+
+/// The reported symptom: a sparse filter's marker jumping between adjacent
+/// zooms while its members stayed together. Whenever a filtered group is the
+/// same set at `z` and `z + 1` and neither level's anchor is a member, both
+/// levels draw the exact centroid, so the marker must not move at all.
+#[test]
+fn a_filtered_cluster_holds_still_across_zooms_while_it_stays_whole() {
+    let mut rng = Rng(99);
+    let mut nc = NetCluster::new(Options {
+        categories: 50,
+        ..Default::default()
+    });
+    let mut members = Vec::new();
+    let mut cat = HashMap::new();
+    for i in 0..6000u64 {
+        let (lng, lat) = (
+            -46.63 + (rng.next() - 0.5) * 0.4,
+            -23.55 + (rng.next() - 0.5) * 0.4,
+        );
+        let c = if rng.next() < 0.02 {
+            7
+        } else {
+            1 + (rng.next() * 40.0) as u32 % 40
+        };
+        nc.insert_with_category(i, lng, lat, c);
+        cat.insert(i, c);
+        if c == 7 {
+            members.push(i);
+        }
+    }
+    nc.verify().unwrap();
+
+    // members of category 7 grouped by representative slot, per zoom
+    let groups = |z: i32| -> HashMap<u32, Vec<u64>> {
+        let mut g: HashMap<u32, Vec<u64>> = HashMap::new();
+        for &id in &members {
+            g.entry(nc.representative_slot(id, z).unwrap())
+                .or_default()
+                .push(id);
+        }
+        g
+    };
+    let drawn = |z: i32| -> HashMap<u32, (f64, f64)> {
+        nc.get_clusters(WORLD, z as f64, 7)
+            .into_iter()
+            .filter_map(|f| match f {
+                Feature::Cluster {
+                    cluster_id,
+                    lng,
+                    lat,
+                    ..
+                } => Some(((cluster_id / 32) as u32, (lng, lat))),
+                Feature::Point { .. } => None,
+            })
+            .collect()
+    };
+
+    let mut held = 0;
+    for z in 0..nc.max_zoom() as i32 {
+        let (ga, gb) = (groups(z), groups(z + 1));
+        let (da, db) = (drawn(z), drawn(z + 1));
+        for (&sa, ma) in &ga {
+            if ma.len() < 2 {
+                continue;
+            }
+            let sb = nc.representative_slot(ma[0], z + 1).unwrap();
+            if gb[&sb] != *ma {
+                continue; // the group split, or gained members: allowed to move
+            }
+            let anchor_is_member = |s: u32| {
+                // the anchor's external id is whichever member has it as its
+                // own level-(max) representative, if any
+                ma.iter()
+                    .any(|&id| nc.representative_slot(id, nc.max_zoom() as i32 + 1) == Some(s))
+            };
+            if anchor_is_member(sa) || anchor_is_member(sb) {
+                continue; // bounded to a member: may legitimately shift
+            }
+            let (pa, pb) = (da[&sa], db[&sb]);
+            assert!(
+                (pa.0 - pb.0).abs() < 1e-9 && (pa.1 - pb.1).abs() < 1e-9,
+                "z={z}->{}: a whole filtered group of {} moved from {pa:?} to {pb:?}",
+                z + 1,
+                ma.len()
+            );
+            held += 1;
+        }
+    }
+    assert!(held > 20, "only {held} whole cross-zoom groups exercised");
 }
 
 /// Moves and removals must keep the slices in step with the totals. `verify`

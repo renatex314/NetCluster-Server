@@ -269,6 +269,16 @@ unknown filter "plate"; this collection has client, status
 no declared filter combines [client, status]; this collection allows [client], [status]
 ```
 
+**Where a filtered cluster is drawn.** A cluster's marker is normally held to
+within a quarter of the cluster radius of the device that anchors it, so
+neighbouring markers keep their spacing as vehicles move. Under a filter the
+anchor may not match the filter at all, and holding the marker next to a vehicle
+that is not in the result would make it sit — and jump between zooms — somewhere
+its members are not. So a filtered cluster is drawn exactly on the centroid of
+its matching members, unless the anchor itself matches, in which case the usual
+bound applies. Either way the marker is on, or beside, a vehicle that is in the
+result.
+
 ### From the CLI
 
 ```bash
