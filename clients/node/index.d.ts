@@ -230,6 +230,42 @@ export interface ReportResult {
   /** Reports ignored because their source version was older than the stored one. */
   stale?: number;
   devices?: number;
+  /**
+   * Items that carried no coordinates and so updated only values and properties.
+   * Present only when the batch actually contained some.
+   */
+  patched?: number;
+  /** Ids of patches that named no live device. Present alongside `patched`. */
+  unknown?: string[];
+}
+
+/** One metadata-only update. See {@link NetClusterClient.patch}. */
+export interface PatchUpdate {
+  id: string;
+  /**
+   * Strictly increasing source version, as on {@link Point}. An older retry is
+   * ignored rather than undoing the newer value.
+   */
+  updatedAt?: number;
+  /** Filter values to re-file the device into. Omit to leave them alone. */
+  dims?: Record<string, string | number | Array<string | number>>;
+  /** Replacement properties. Omit to leave them alone; `{}` clears. */
+  props?: Record<string, unknown>;
+}
+
+export interface PatchResult {
+  patched: number;
+  /** Patches ignored because their source version was older than the stored one. */
+  stale: number;
+  /**
+   * Ids that named no live device.
+   *
+   * A device that has expired is reported here rather than resurrected: a patch
+   * is not a heartbeat, because the position stream is what proves a vehicle is
+   * still there. Returned rather than thrown so one stale vehicle does not reject
+   * the rest of the batch.
+   */
+  unknown: string[];
 }
 
 export interface QueryOptions {
@@ -263,7 +299,69 @@ export interface QueryOptions {
    * O(markers). Reach for `filter` whenever the values can be declared.
    */
   where?: string | Record<string, string | number | { eq: string | number }>;
+  /**
+   * An explicit whitelist of device ids, independent of any declared dimension.
+   *
+   * For a set that is not a category -- "the forty vehicles flagged in another
+   * system right now". Answered by looking each id up rather than scanning, so it
+   * costs what the list is long and nothing in memory. Intersects with `filter`
+   * and `where`.
+   *
+   * An id that names no live device is skipped rather than refused, unlike an
+   * undeclared *filter value*: the list comes from elsewhere, and a vehicle may
+   * expire between that read and this query.
+   *
+   * **An empty array matches nothing, not everything.** Your list is legitimately
+   * empty sometimes, and rendering "nothing is flagged" as the whole fleet is the
+   * one answer that would be actively wrong. Note this is the opposite of
+   * `filter`, where an empty value means none was named and the filter drops.
+   *
+   * Not available on tiles: a tile is cached by coordinate, a whitelist is per
+   * request.
+   */
+  ids?: Array<string | number>;
 }
+
+/** What {@link NetClusterClient.listDevices} asks for. */
+export interface ListDevicesOptions {
+  /** [west, south, east, north]. Defaults to the whole world. */
+  bbox?: [number, number, number, number];
+  cat?: number | string;
+  filter?: Record<string, string | number>;
+  where?: string | Record<string, string | number | { eq: string | number }>;
+  ids?: Array<string | number>;
+  /** Page size. Defaults to 1000 server-side; the maximum is 10,000. */
+  limit?: number;
+  offset?: number;
+  /**
+   * `'compact'` returns {@link DeviceListCompact} -- meaningfully smaller than
+   * GeoJSON on a large page. Omit for a `FeatureCollection`.
+   */
+  format?: 'compact';
+  /** `false` leaves properties out entirely. */
+  props?: boolean;
+}
+
+/** Paging counters returned by every device listing. */
+export interface DeviceListPage {
+  /** How many devices matched in total, not how many came back. */
+  total: number;
+  returned: number;
+  limit: number;
+  offset: number;
+}
+
+export interface DeviceListCompact extends DeviceListPage {
+  devices: Array<{
+    id: string;
+    lng: number;
+    lat: number;
+    /** Absent when the device has none, or when `props: false` was passed. */
+    props?: Record<string, unknown>;
+  }>;
+}
+
+export type DeviceList = FeatureCollection & DeviceListPage;
 
 /** The filter half of {@link QueryOptions}, for tiles. */
 export interface TileOptions {
@@ -347,6 +445,7 @@ export interface BoundCollection {
   verify(): Promise<{ ok: boolean; detail?: string; violation?: string }>;
   snapshot(): Promise<{ snapshot: string; bytes: number }>;
   report(points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
+  patch(updates: PatchUpdate | PatchUpdate[], opts?: { maxBatch?: number }): Promise<PatchResult>;
   /** Report positions as GeoJSON. Same endpoint and upsert semantics as `report`. */
   reportGeoJSON(
     geojson: InputFeatureCollection | InputFeature[] | InputFeature,
@@ -356,6 +455,8 @@ export interface BoundCollection {
   has(id: string): Promise<boolean>;
   getDevice(id: string): Promise<DeviceInfo | null>;
   getClusters(opts?: QueryOptions): Promise<FeatureCollection>;
+  listDevices(opts: ListDevicesOptions & { format: 'compact' }): Promise<DeviceListCompact>;
+  listDevices(opts?: ListDevicesOptions): Promise<DeviceList>;
   getTile(z: number, x: number, y: number, opts?: TileOptions & { format?: 'mvt' }): Promise<Uint8Array>;
   getTile(z: number, x: number, y: number, opts: TileOptions & { format: 'json' }): Promise<FeatureCollection>;
   getChildren(clusterId: number): Promise<ChildrenResult>;
@@ -379,6 +480,26 @@ export declare class NetClusterClient {
   snapshot(name: string): Promise<{ snapshot: string; bytes: number }>;
 
   report(name: string, points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
+
+  /**
+   * Update values and properties without a position, against the one the server
+   * already holds.
+   *
+   * For state that changes on its own schedule and does not move the vehicle: the
+   * system that knows a flag changed usually does not know where the vehicle is,
+   * and `report` would need a position -- either a lookup you should not have to
+   * do, or a stale one that teleports the marker. Costs less than a report, not
+   * more.
+   *
+   * **Not a heartbeat.** It does not renew the device's TTL, because the position
+   * stream is what proves the vehicle is still there. An expired device comes back
+   * in `unknown` rather than being resurrected.
+   */
+  patch(
+    name: string,
+    updates: PatchUpdate | PatchUpdate[],
+    opts?: { maxBatch?: number }
+  ): Promise<PatchResult>;
   /** Report positions as GeoJSON. Same endpoint and upsert semantics as `report`. */
   reportGeoJSON(
     name: string,
@@ -393,6 +514,22 @@ export declare class NetClusterClient {
   getDevice(name: string, id: string): Promise<DeviceInfo | null>;
 
   getClusters(name: string, opts?: QueryOptions): Promise<FeatureCollection>;
+
+  /**
+   * Every device matching a filter, flat, in one request.
+   *
+   * The listing `getClusters` cannot be. Clusters group, and a group selected by
+   * `where` or `ids` carries no `cluster_id`, so there is nothing to expand --
+   * vehicles parked in one yard are one marker with no way to reach the members.
+   * This returns them one per row, which is what a list view, a search result or
+   * an export actually wants.
+   *
+   * Selecting the devices is cheap and serialising them is not, so `limit`
+   * defaults to 1000: ask for what you will show, and reach for
+   * `format: 'compact'` or `props: false` when the page is large.
+   */
+  listDevices(name: string, opts: ListDevicesOptions & { format: 'compact' }): Promise<DeviceListCompact>;
+  listDevices(name: string, opts?: ListDevicesOptions): Promise<DeviceList>;
   getTile(name: string, z: number, x: number, y: number, opts?: TileOptions & { format?: 'mvt' }): Promise<Uint8Array>;
   getTile(name: string, z: number, x: number, y: number, opts: TileOptions & { format: 'json' }): Promise<FeatureCollection>;
   getChildren(name: string, clusterId: number): Promise<ChildrenResult>;

@@ -206,3 +206,103 @@ test('an unexplained short acknowledgement must be surfaced as an error', async 
   const client = new NetClusterClient({ fetch: async () => response({ accepted: 0, stale: 0 }) });
   await assert.rejects(client.report('fleet', { id: 'vehicle', lng: 1, lat: 1 }));
 });
+
+// ---------------------------------------------------------------------------
+// The declarations ship as this package's types, and nothing else checks them.
+//
+// They drifted exactly once, silently: `ids`, `listDevices` and `patch` were
+// added to index.js and the .d.ts was not touched, so a TypeScript consumer
+// could not call them at all while every other test passed. This is the check
+// that would have caught it -- structural, so it needs no toolchain.
+
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const DTS = readFileSync(join(HERE, 'index.d.ts'), 'utf8');
+
+/** Public method names on a prototype: no constructor, nothing underscored. */
+function publicMethods(proto) {
+  return Object.getOwnPropertyNames(proto)
+    .filter((k) => k !== 'constructor' && !k.startsWith('_'))
+    .filter((k) => typeof Object.getOwnPropertyDescriptor(proto, k).value === 'function')
+    .sort();
+}
+
+/** Names declared as members inside `declare class <name>`. */
+function declaredIn(cls) {
+  const at = DTS.indexOf(`declare class ${cls}`);
+  assert.ok(at !== -1, `index.d.ts declares no class ${cls}`);
+  // to the start of the next top-level declaration, or the end
+  const rest = DTS.slice(at);
+  const end = rest.search(/\n(?:export )?declare /);
+  const body = end === -1 ? rest : rest.slice(0, end);
+  const names = new Set();
+  for (const m of body.matchAll(/^ {2}(?:readonly )?([A-Za-z][A-Za-z0-9]*)\s*[(<:]/gm)) {
+    if (m[1] !== 'constructor') names.add(m[1]);
+  }
+  return names;
+}
+
+test('index.d.ts declares every public method of NetClusterClient', () => {
+  const declared = declaredIn('NetClusterClient');
+  const missing = publicMethods(NetClusterClient.prototype).filter((m) => !declared.has(m));
+  assert.deepEqual(missing, [],
+    `index.d.ts is missing ${missing.join(', ')} -- a typed consumer cannot call them`);
+});
+
+test('index.d.ts declares every public method of Reporter', async () => {
+  const { Reporter } = await import('./index.js');
+  const declared = declaredIn('Reporter');
+  const missing = publicMethods(Reporter.prototype).filter((m) => !declared.has(m));
+  assert.deepEqual(missing, [], `index.d.ts is missing Reporter.${missing.join(', Reporter.')}`);
+});
+
+test('index.d.ts declares nothing NetClusterClient does not have', () => {
+  const have = new Set(publicMethods(NetClusterClient.prototype));
+  // `urls` and `collection`'s return shape are declared properties, not methods
+  const known = new Set(['urls']);
+  const stale = [...declaredIn('NetClusterClient')].filter((d) => !have.has(d) && !known.has(d));
+  assert.deepEqual(stale, [],
+    `index.d.ts declares ${stale.join(', ')}, which no longer exists on the client`);
+});
+
+test('the bound collection declares the same surface it returns', () => {
+  const client = new NetClusterClient({ fetch: async () => response({}) });
+  const bound = Object.keys(client.collection('fleet')).filter((k) => k !== 'name').sort();
+  const at = DTS.indexOf('interface BoundCollection');
+  assert.ok(at !== -1, 'index.d.ts has no BoundCollection interface');
+  const body = DTS.slice(at, DTS.indexOf('\n}', at));
+  const missing = bound.filter((m) => !new RegExp(`^ {2}${m}\\s*[(<:]`, 'm').test(body));
+  assert.deepEqual(missing, [],
+    `collection() returns ${missing.join(', ')} but BoundCollection does not declare them`);
+});
+
+test('the package version moved when the client surface did', () => {
+  const pkg = JSON.parse(readFileSync(join(HERE, 'package.json'), 'utf8'));
+  const have = publicMethods(NetClusterClient.prototype);
+  // 0.6.1 is published on npm and predates ids/listDevices/patch. Shipping those
+  // under that number is what issue #6 was about: semver stops telling a consumer
+  // anything at all if a behaviour change does not move it.
+  if (have.includes('listDevices') || have.includes('patch')) {
+    assert.notEqual(pkg.version, '0.6.1',
+      'package.json still claims 0.6.1, the published version without ids/listDevices/patch');
+  }
+});
+
+/**
+ * The client and the server ship from one repository and one release, so their
+ * versions are kept in lockstep -- that is what makes "client 0.8.0 pairs with
+ * server 0.8.0" a statement a consumer can rely on, and it is why the client
+ * cannot silently stay behind the way it did before issue #6. `scripts/release.sh`
+ * sets both; this is what fails if something sets only one.
+ */
+test('the package version matches the Cargo workspace version', () => {
+  const cargo = readFileSync(join(HERE, '..', '..', 'Cargo.toml'), 'utf8');
+  const want = cargo.match(/^version = "(\d+\.\d+\.\d+)"/m)?.[1];
+  assert.ok(want, 'no workspace version found in Cargo.toml');
+  const pkg = JSON.parse(readFileSync(join(HERE, 'package.json'), 'utf8'));
+  assert.equal(pkg.version, want,
+    `package.json is ${pkg.version} and the workspace is ${want}; run scripts/release.sh rather than bumping one by hand`);
+});

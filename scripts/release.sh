@@ -54,7 +54,7 @@ fi
 bumped=""
 restore() {
   if [[ -n "$bumped" ]]; then
-    git checkout -- Cargo.toml Cargo.lock 2>/dev/null || true
+    git checkout -- Cargo.toml Cargo.lock clients/node/package.json 2>/dev/null || true
     echo "reverted the version bump" >&2
   fi
 }
@@ -74,6 +74,16 @@ echo "==> setting workspace version to $V"
 bumped=1
 perl -0pi -e "s/^version = \"[0-9]+\.[0-9]+\.[0-9]+\"/version = \"$V\"/m" Cargo.toml
 grep -m1 '^version = ' Cargo.toml
+
+# The npm package ships from this repository and this release, so it carries the
+# same number. It used to be bumped by hand and once was not: 0.7.0 through 0.8.0
+# added `ids`, `listDevices` and `patch` to the client while npm still said 0.6.1,
+# so a consumer could not tell "I have not updated" from "the published package
+# does not have it" (issue #6). One script sets both, and a test fails if they
+# ever disagree.
+echo "==> setting client package version to $V"
+perl -0pi -e "s/\"version\": \"[0-9]+\.[0-9]+\.[0-9]+\"/\"version\": \"$V\"/" clients/node/package.json
+grep -m1 '"version"' clients/node/package.json
 
 # Building refreshes Cargo.lock, which must be committed with the bump: CI builds
 # --locked and will reject a lockfile that disagrees with the manifests.
@@ -103,6 +113,20 @@ git commit -q -m "$V"
 git tag -a "v$V" -m "v$V"
 bumped=""   # committed: nothing left to revert
 
+# Whether the npm package actually changed, so an unchanged client is not
+# republished for nothing and a changed one is not forgotten. Compared against the
+# previous tag rather than the previous commit: a release is the unit here.
+prev=$(git describe --tags --abbrev=0 "HEAD^" 2>/dev/null || true)
+client_changed=""
+if [[ -n "$prev" ]]; then
+  if ! git diff --quiet "$prev" HEAD -- clients/node/index.js clients/node/index.d.ts \
+       clients/node/cli.js clients/node/README.md clients/node/package.json; then
+    client_changed=1
+  fi
+else
+  client_changed=1
+fi
+
 cat <<MSG
 
   v$V is tagged locally and everything passed.
@@ -113,3 +137,20 @@ cat <<MSG
   verifies both are in the pushed manifest, runs the published image, and syncs
   the Docker Hub overview.
 MSG
+
+if [[ -n "$client_changed" ]]; then
+  cat <<MSG
+  The Node client changed since ${prev:-the beginning}, so publish it too:
+
+    npm publish ./clients/node --access public
+
+  The workflow does not do this: npm publishing is irreversible per version, so it
+  stays a deliberate step. The package is already at $V.
+MSG
+else
+  cat <<MSG
+  The Node client is unchanged since $prev, so there is nothing to publish to npm.
+  The package version still moves to $V with the release, which is what keeps
+  "client $V pairs with server $V" true.
+MSG
+fi

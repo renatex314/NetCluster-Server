@@ -10,6 +10,15 @@ npm install netcluster-client      # library + the `netcluster` command
 npx netcluster-client health       # or use the CLI without installing
 ```
 
+**Versions match the server's.** Client and server ship from one repository and one
+release, so `netcluster-client@0.8.0` is the client that went out with
+`netcluster-server:0.8.0`. A release sets both numbers from one place and a test
+fails if they ever disagree, so the version tells you which server generation a
+client was written against — and a feature landing in the client cannot leave npm
+behind at an older number while appearing to be current. npm may skip a number when
+a release changed nothing on this side; that is the version pairing holding, not a
+missed publish.
+
 ## CLI
 
 ```bash
