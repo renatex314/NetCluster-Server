@@ -204,6 +204,51 @@ impl TextPred {
     }
 }
 
+/// Which devices a scanning query looks at.
+///
+/// The two arms are the same query with a different candidate source, which is the
+/// whole point: a whitelist of fifty ids must not cost a pass over the fleet to
+/// answer. `All` is `O(devices)`, `Ids` is `O(ids)`, and both produce identical
+/// output for the devices they have in common.
+#[derive(Debug, Clone, Copy)]
+pub enum Candidates<'a> {
+    /// Every live device, in interned order.
+    All,
+    /// Only these external ids, in the order given.
+    ///
+    /// An id that names nothing live is skipped, not an error. A whitelist is
+    /// computed somewhere else -- "the vehicles flagged in the billing system" --
+    /// and a vehicle expiring between that read and this query is a race, not a
+    /// typo. This is deliberately unlike an undeclared *filter value*, which is a
+    /// 400 precisely because it can only be a mistake.
+    Ids(&'a [String]),
+}
+
+/// What a device listing asks for beyond the predicate: which slice, and whether
+/// to carry properties.
+///
+/// Grouped rather than passed loose because these three travel together and mean
+/// nothing apart, and because the shape of a page is the part a caller is most
+/// likely to get wrong.
+#[derive(Debug, Clone, Copy)]
+pub struct Page {
+    pub limit: usize,
+    pub offset: usize,
+    /// Properties dominate the response on a fleet that carries any, and a listing
+    /// that only needs ids and positions should not pay for them.
+    pub with_props: bool,
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Page {
+            limit: 1000,
+            offset: 0,
+            with_props: true,
+        }
+    }
+}
+
 pub struct Collection {
     pub name: String,
     pub config: Config,
@@ -242,6 +287,9 @@ pub struct Collection {
     pub restored: AtomicU64,
     /// Reports ignored because their source version was older than the stored one.
     pub stale_reports: AtomicU64,
+    /// Metadata-only updates applied. Separate from `ingested`, which counts
+    /// position reports: the two have different costs and different meanings.
+    pub patched: AtomicU64,
     /// Defensive index rebuilds triggered by a position mismatch.
     pub repairs: AtomicU64,
 }
@@ -273,6 +321,38 @@ pub struct Report<'a> {
     /// Optional source-side monotonic version, in milliseconds since the epoch.
     /// Unversioned reports use arrival order only until the device becomes versioned.
     pub updated_at_ms: Option<u64>,
+}
+
+/// One metadata-only update: filter values and/or properties for a device that is
+/// already live, carrying no position.
+///
+/// Separate from [`Report`] rather than a `Report` with optional coordinates,
+/// because it is a different operation and not a weaker one. It does not move the
+/// device, and it deliberately does **not** refresh the TTL: the position stream
+/// is what proves a vehicle is still there, and an external system flipping a flag
+/// on a vehicle that stopped reporting must not keep that ghost on the map. A
+/// device that has already expired is reported back as unknown rather than
+/// resurrected.
+#[derive(Debug, Clone)]
+pub struct Patch<'a> {
+    pub id: &'a str,
+    /// The filter cells to re-file the device into. `None` leaves them alone.
+    pub cells: Option<&'a [u32]>,
+    /// Replacement properties. `None` leaves them alone, `Some` replaces the whole
+    /// object -- the same asymmetry a position report has.
+    pub props: Option<&'a RawValue>,
+    pub updated_at_ms: Option<u64>,
+}
+
+/// What a batch of patches did. Unknown ids are collected rather than failing the
+/// batch: a device expiring between the moment an external system read it and the
+/// moment the patch lands is a race, not a malformed request, and one stale
+/// vehicle must not reject ninety-nine good updates.
+#[derive(Debug, Clone, Default)]
+pub struct PatchOutcome {
+    pub applied: usize,
+    pub stale: usize,
+    pub unknown: Vec<String>,
 }
 
 /// One thing to draw.
@@ -343,6 +423,8 @@ pub struct CollectionStats {
     pub snapshot_failures: u64,
     pub restored: u64,
     pub stale_reports: u64,
+    /// Metadata-only updates applied, as opposed to position reports.
+    pub patched: u64,
     pub repairs: u64,
     /// Number of dynamic values currently interned per dimension.
     pub interned: Vec<usize>,
@@ -440,6 +522,7 @@ impl Collection {
             snapshot_failures: AtomicU64::new(0),
             restored: AtomicU64::new(0),
             stale_reports: AtomicU64::new(0),
+            patched: AtomicU64::new(0),
             repairs: AtomicU64::new(0),
         }
     }
@@ -664,78 +747,17 @@ impl Collection {
     }
 
     pub fn upsert(&self, reports: &[Report<'_>]) -> Result<usize, String> {
-        let cells = self.schema.cells;
-        let cap = self.config.max_props_bytes;
         for r in reports {
             if !r.lng.is_finite() || !r.lat.is_finite() {
                 return Err(format!("device {:?} sent a non-finite coordinate", r.id));
             }
-            if let Some(cs) = r.cells {
-                if cs.len() > self.schema.max_cells_per_device {
-                    return Err(format!(
-                        "device {:?} lands in {} filter cells, over the {} this collection allows",
-                        r.id,
-                        cs.len(),
-                        self.schema.max_cells_per_device
-                    ));
-                }
-                for &c in cs {
-                    if c as usize >= cells {
-                        return Err(format!(
-                            "device {:?} has filter cell {c} but this collection has {cells}",
-                            r.id
-                        ));
-                    }
-                }
-            }
-            if let Some(p) = r.props {
-                let raw = p.get();
-                // GeoJSON properties is an object. serde already proved the text is
-                // valid JSON, so the first character settles the type without a parse.
-                if !raw.trim_start().starts_with('{') {
-                    return Err(format!(
-                        "device {:?}: props must be a JSON object, got {}",
-                        r.id,
-                        raw.chars().take(20).collect::<String>()
-                    ));
-                }
-                if cap == 0 {
-                    return Err(format!(
-                        "device {:?} sent props but this collection has max_props_bytes = 0",
-                        r.id
-                    ));
-                }
-                if raw.len() > cap {
-                    return Err(format!(
-                        "device {:?}: props are {} bytes, the limit is {cap}",
-                        r.id,
-                        raw.len()
-                    ));
-                }
-            }
+            self.check_cells(r.id, r.cells)?;
+            self.check_props(r.id, r.props)?;
         }
         // Extracted out here: parsing JSON while holding the write lock would
         // stall every reporter for the duration of the batch.
         let names: Vec<&str> = self.config.text.iter().map(|s| s.as_str()).collect();
-        let mut text: Vec<Vec<Option<String>>> = Vec::new();
-        if !names.is_empty() {
-            text.reserve(reports.len());
-            for r in reports {
-                match r.props {
-                    Some(p) => {
-                        let mut got = crate::geojson::peek_text(p.get(), &names).map_err(|e| {
-                            format!("device {:?}: properties are unreadable: {e}", r.id)
-                        })?;
-                        // lowercased once here rather than per device per query
-                        for t in got.iter_mut().flatten() {
-                            *t = t.to_lowercase();
-                        }
-                        text.push(got);
-                    }
-                    None => text.push(Vec::new()),
-                }
-            }
-        }
+        let text = Self::extract_text(&names, reports.iter().map(|r| (r.id, r.props)))?;
 
         let now = now_ms();
         let mut accepted = 0usize;
@@ -829,6 +851,156 @@ impl Collection {
         }
         fresh.stats = stats;
         st.index = fresh;
+    }
+
+    /// Filter cells a report or patch may name.
+    fn check_cells(&self, id: &str, cells: Option<&[u32]>) -> Result<(), String> {
+        let Some(cs) = cells else { return Ok(()) };
+        if cs.len() > self.schema.max_cells_per_device {
+            return Err(format!(
+                "device {id:?} lands in {} filter cells, over the {} this collection allows",
+                cs.len(),
+                self.schema.max_cells_per_device
+            ));
+        }
+        let cells = self.schema.cells;
+        for &c in cs {
+            if c as usize >= cells {
+                return Err(format!(
+                    "device {id:?} has filter cell {c} but this collection has {cells}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Properties a report or patch may carry.
+    fn check_props(&self, id: &str, props: Option<&RawValue>) -> Result<(), String> {
+        let Some(p) = props else { return Ok(()) };
+        let cap = self.config.max_props_bytes;
+        let raw = p.get();
+        // GeoJSON properties is an object. serde already proved the text is
+        // valid JSON, so the first character settles the type without a parse.
+        if !raw.trim_start().starts_with('{') {
+            return Err(format!(
+                "device {id:?}: props must be a JSON object, got {}",
+                raw.chars().take(20).collect::<String>()
+            ));
+        }
+        if cap == 0 {
+            return Err(format!(
+                "device {id:?} sent props but this collection has max_props_bytes = 0"
+            ));
+        }
+        if raw.len() > cap {
+            return Err(format!(
+                "device {id:?}: props are {} bytes, the limit is {cap}",
+                raw.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Searchable fields for a batch, pulled out of `props` before any lock is
+    /// taken and lowercased once so a query never allocates per device.
+    fn extract_text<'r>(
+        names: &[&str],
+        items: impl Iterator<Item = (&'r str, Option<&'r RawValue>)>,
+    ) -> Result<Vec<Vec<Option<String>>>, String> {
+        let mut out: Vec<Vec<Option<String>>> = Vec::new();
+        if names.is_empty() {
+            return Ok(out);
+        }
+        for (id, props) in items {
+            match props {
+                Some(p) => {
+                    let mut got = crate::geojson::peek_text(p.get(), names)
+                        .map_err(|e| format!("device {id:?}: properties are unreadable: {e}"))?;
+                    for t in got.iter_mut().flatten() {
+                        *t = t.to_lowercase();
+                    }
+                    out.push(got);
+                }
+                None => out.push(Vec::new()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply metadata-only updates: filter values and properties, no position.
+    ///
+    /// The point of this is external state. "Is this vehicle flagged in the
+    /// billing system" changes on its own schedule and the thing that knows it
+    /// changed usually does not know where the vehicle is, so requiring a position
+    /// to write it either forces a lookup the caller should not need or invites a
+    /// stale one that teleports the marker.
+    ///
+    /// Costs less than a report, not more: the stored position is already
+    /// projected, so nothing is re-projected and a patch that names no cells does
+    /// not touch the tree at all.
+    pub fn patch(&self, patches: &[Patch<'_>]) -> Result<PatchOutcome, String> {
+        for p in patches {
+            self.check_cells(p.id, p.cells)?;
+            self.check_props(p.id, p.props)?;
+        }
+        let names: Vec<&str> = self.config.text.iter().map(|s| s.as_str()).collect();
+        let text = Self::extract_text(&names, patches.iter().map(|p| (p.id, p.props)))?;
+
+        let mut out = PatchOutcome::default();
+        let mut st = self.state.write().unwrap();
+        for (i, p) in patches.iter().enumerate() {
+            let Some(&n) = st.ids.to_num.get(p.id) else {
+                out.unknown.push(p.id.to_string());
+                continue;
+            };
+            let ni = n as usize;
+            // Live, and with a position to keep. A device that has expired is not
+            // brought back by a flag change -- see `Patch`.
+            let (Some((x, y)), true) = (st.ids.positions[ni], st.ids.last_seen[ni] != u64::MAX)
+            else {
+                out.unknown.push(p.id.to_string());
+                continue;
+            };
+            if let Some(current) = st.ids.last_update[ni] {
+                if p.updated_at_ms.map_or(true, |incoming| incoming <= current) {
+                    out.stale += 1;
+                    continue;
+                }
+            }
+            if let Some(cells) = p.cells {
+                st.index.move_to_projected_cells(n, x, y, Some(cells));
+                st.ids.cells[ni] = cells.to_vec();
+                // Same materialised-view guard the write path has: if the tree
+                // disagrees with the record we just wrote, rebuild from the
+                // records rather than serving a filter that silently lost a device.
+                if st.index.cells_of(n) != Some(st.ids.cells[ni].as_slice()) {
+                    Self::rebuild_index(&mut st);
+                    self.repairs.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[repair] collection {} rebuilt after a cell mismatch for device {:?}",
+                        self.name, p.id
+                    );
+                }
+            }
+            if let Some(version) = p.updated_at_ms {
+                st.ids.last_update[ni] = Some(version);
+            }
+            if let Some(pr) = p.props {
+                st.ids.props[ni] = Some(Arc::new(pr.to_owned()));
+                if !names.is_empty() {
+                    let base = ni * st.ids.fields;
+                    for (f, v) in text[i].iter().enumerate() {
+                        st.ids.text[base + f] = v.as_deref().map(Box::from);
+                    }
+                }
+            }
+            out.applied += 1;
+        }
+        self.patched
+            .fetch_add(out.applied as u64, Ordering::Relaxed);
+        self.stale_reports
+            .fetch_add(out.stale as u64, Ordering::Relaxed);
+        Ok(out)
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -983,12 +1155,87 @@ impl Collection {
     /// The cost is `O(devices)`, not `O(markers)`. That is the whole trade and it
     /// is why this is a separate entry point rather than another argument to
     /// `clusters`: nobody should reach it by accident.
+    /// Every live device in `cands` that passes `cat` and `preds`, with its
+    /// projected position, handed to `f` in candidate order.
+    ///
+    /// One place where "what matches" is decided, so the clustered answer, the flat
+    /// listing and the id whitelist cannot drift apart. Order is interned-id order
+    /// for `All` and caller order for `Ids`; both are stable, which is what makes
+    /// `offset` paging over them mean anything.
+    fn visit_matches(
+        st: &Inner,
+        cands: Candidates<'_>,
+        cat: i32,
+        preds: &[TextPred],
+        mut f: impl FnMut(u64, (i32, i32)),
+    ) {
+        let fields = st.ids.fields;
+        let test = |n: usize| -> Option<(u64, (i32, i32))> {
+            if st.ids.last_seen[n] == u64::MAX {
+                return None; // interned once, not currently live
+            }
+            let base = n * fields;
+            if !preds
+                .iter()
+                .all(|p| p.test(st.ids.text[base + p.field].as_deref()))
+            {
+                return None;
+            }
+            let id = n as u64;
+            if cat >= 0 {
+                match st.index.cells_of(id) {
+                    Some(cells) if cells.contains(&(cat as u32)) => {}
+                    _ => return None,
+                }
+            }
+            Some((id, st.ids.positions[n]?))
+        };
+        match cands {
+            Candidates::All => {
+                for n in 0..st.ids.to_str.len() {
+                    if let Some((id, pos)) = test(n) {
+                        f(id, pos);
+                    }
+                }
+            }
+            Candidates::Ids(ids) => {
+                for want in ids {
+                    // A direct lookup per id rather than a pass over the fleet.
+                    if let Some(&n) = st.ids.to_num.get(want.as_str()) {
+                        if let Some((id, pos)) = test(n as usize) {
+                            f(id, pos);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `?where=` over the whole fleet.
     pub fn search(
         &self,
         bbox: [f64; 4],
         zoom: f64,
         cat: i32,
         preds: &[TextPred],
+    ) -> Vec<OutFeature> {
+        self.select_clusters(bbox, zoom, cat, preds, Candidates::All)
+    }
+
+    /// Clusters built from an explicitly selected subset rather than from the
+    /// precomputed aggregates.
+    ///
+    /// Grouping is by the same level-`z` representative the ordinary query uses, so
+    /// the markers land where the unfiltered ones would -- restricted to the
+    /// matches. Two matching vehicles in one yard stay one marker of 2 instead of
+    /// vanishing, which is the whole reason this is not done in the caller.
+    pub fn select_clusters(
+        &self,
+        bbox: [f64; 4],
+        zoom: f64,
+        cat: i32,
+        preds: &[TextPred],
+        cands: Candidates<'_>,
     ) -> Vec<OutFeature> {
         self.queries.fetch_add(1, Ordering::Relaxed);
         if cat == NO_MATCH {
@@ -1003,35 +1250,15 @@ impl Collection {
 
         // marker slot -> (count, sum x, sum y, one member)
         let mut groups: HashMap<u32, (u32, i64, i64, u64)> = HashMap::new();
-        let fields = st.ids.fields;
-        for n in 0..st.ids.to_str.len() {
-            if st.ids.last_seen[n] == u64::MAX {
-                continue; // interned once, not currently live
-            }
-            let base = n * fields;
-            if !preds
-                .iter()
-                .all(|p| p.test(st.ids.text[base + p.field].as_deref()))
-            {
-                continue;
-            }
-            let id = n as u64;
-            if cat >= 0 {
-                match st.index.cells_of(id) {
-                    Some(cells) if cells.contains(&(cat as u32)) => {}
-                    _ => continue,
-                }
-            }
-            let (Some(rep), Some((x, y))) =
-                (st.index.representative_slot(id, z), st.ids.positions[n])
-            else {
-                continue;
+        Self::visit_matches(&st, cands, cat, preds, |id, (x, y)| {
+            let Some(rep) = st.index.representative_slot(id, z) else {
+                return;
             };
             let e = groups.entry(rep).or_insert((0, 0, 0, id));
             e.0 += 1;
             e.1 += x as i64;
             e.2 += y as i64;
-        }
+        });
 
         let mut out = Vec::with_capacity(groups.len());
         for (_, (count, sx, sy, member)) in groups {
@@ -1066,6 +1293,75 @@ impl Collection {
             });
         }
         out
+    }
+
+    /// Matching devices, one feature each, never grouped.
+    ///
+    /// The complement of [`Collection::select_clusters`], and not a convenience:
+    /// a cluster of matches carries no `cluster_id`, so there is no way to reach
+    /// its members from the clustered answer at all. Without this, backing a list
+    /// view meant asking for clusters and then expanding every coincident group
+    /// one HTTP call at a time.
+    ///
+    /// Returns the requested page and how many devices matched in total, since the
+    /// count falls out of a scan that already happened and a pager needs it.
+    ///
+    /// The index work here is small -- the same scan as `?where=`, or a lookup per
+    /// id -- and the response is not: serialising a hundred thousand features costs
+    /// far more than selecting them. Hence a `limit` with a default, rather than an
+    /// endpoint that will happily build a 15 MB body.
+    pub fn list_devices(
+        &self,
+        bbox: [f64; 4],
+        cat: i32,
+        preds: &[TextPred],
+        cands: Candidates<'_>,
+        page: Page,
+    ) -> (Vec<OutFeature>, usize) {
+        let Page {
+            limit,
+            offset,
+            with_props,
+        } = page;
+        self.queries.fetch_add(1, Ordering::Relaxed);
+        if cat == NO_MATCH {
+            return (Vec::new(), 0);
+        }
+        let st = self.state.read().unwrap();
+        let (x0, y0) = netcluster::project(bbox[0], bbox[3]);
+        let (x1, y1) = netcluster::project(bbox[2], bbox[1]);
+        let (x0, x1) = (x0.min(x1), x0.max(x1));
+        let (y0, y1) = (y0.min(y1), y0.max(y1));
+
+        let mut total = 0usize;
+        let mut out = Vec::with_capacity(limit.min(1024));
+        Self::visit_matches(&st, cands, cat, preds, |id, (x, y)| {
+            if x < x0 || x > x1 || y < y0 || y > y1 {
+                return;
+            }
+            let seen = total;
+            total += 1;
+            // Keep counting past the page: the total is what a pager needs, and
+            // it is free once the predicate has already run.
+            if seen < offset || out.len() >= limit {
+                return;
+            }
+            let n = id as usize;
+            let (lng, lat) = netcluster::unproject(x as f64, y as f64);
+            out.push(OutFeature {
+                lng,
+                lat,
+                count: 1,
+                device: Some(st.ids.to_str[n].clone()),
+                cluster_id: None,
+                props: if with_props {
+                    st.ids.props[n].clone()
+                } else {
+                    None
+                },
+            });
+        });
+        (out, total)
     }
 
     pub fn device_cluster(&self, id: &str, zoom: i32) -> Option<OutFeature> {
@@ -1178,6 +1474,7 @@ impl Collection {
             queries: self.queries.load(Ordering::Relaxed),
             expired: self.expired.load(Ordering::Relaxed),
             stale_reports: self.stale_reports.load(Ordering::Relaxed),
+            patched: self.patched.load(Ordering::Relaxed),
             repairs: self.repairs.load(Ordering::Relaxed),
             uptime_ms: now_ms().saturating_sub(self.created_ms),
             moves_fast_pct: if s.moves > 0 {

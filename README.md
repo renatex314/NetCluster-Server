@@ -206,10 +206,11 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `PUT /v1/collections/{name}` | create; idempotent, 409 on a different geometry |
 | `GET /v1/collections` | list, with stats |
 | `DELETE /v1/collections/{name}` | drop |
-| `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson); returns `accepted` and `stale` |
+| `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson); returns `accepted` and `stale`. An item with no `lng`/`lat` is a [values-only update](#updating-values-without-a-position) and comes back in `patched` |
 | `DELETE /v1/collections/{name}/devices/{id}` | remove one device |
 | `GET .../devices/{id}` | is it registered? 200 with position, category, staleness and last accepted source version, or 404 (`HEAD` for a bare check) |
-| `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON; `?f.<name>=` for declared dimensions, `?where=` to search text |
+| `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON; `?f.<name>=` for declared dimensions, `?where=` to search text, `?ids=` for an [explicit whitelist](#filtering-by-an-explicit-list-of-ids) |
+| `GET .../devices?bbox=&limit=&offset=` | the matching devices, [flat and ungrouped](#listing-devices). Takes the same `?f.`, `?where=` and `?ids=`; `?format=compact`, `?props=false` |
 | `GET .../tiles/{z}/{x}/{y}.mvt` | vector tile (`.json` for tile-space GeoJSON) |
 | `GET .../devices/{id}/cluster?zoom=` | which marker contains this device |
 | `GET .../clusters/{id}/children` | one expansion step, plus `expansion_zoom` |
@@ -222,8 +223,83 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 devices.** Zoom is clamped to `max_zoom`, and points closer than the cluster radius
 at that zoom come back as one cluster carrying `point_count` — no device id, no
 `props`. Filtering that response in your own code silently drops every device
-inside such a cluster, and a depot full of parked vehicles is exactly that case. To
-reach members, use `/clusters/{id}/leaves`.
+inside such a cluster, and a depot full of parked vehicles is exactly that case.
+Use `/devices` when you want the devices, and `/clusters/{id}/leaves` to open one
+particular marker.
+
+### Listing devices
+
+```bash
+curl 'localhost:8080/v1/collections/fleet/devices?f.status=enroute&limit=200&format=compact'
+curl 'localhost:8080/v1/collections/fleet/devices?where=plate~abc&props=false'
+curl 'localhost:8080/v1/collections/fleet/devices?ids=truck-1,truck-7'
+```
+
+One request, every match, never grouped. This is not reachable from `/clusters`: a
+marker produced by `?where=` or `?ids=` carries no `cluster_id`, so there is nothing
+to expand, and coincident vehicles at `max_zoom` are one marker either way. Doing it
+the other way round means one `leaves` call per residual group — thousands of
+requests for one logical "give me everyone", and a burst of those against a
+CPU-limited pod is throttled as a whole rather than served.
+
+Alongside the features it returns `total` (matches, not page size), `returned`,
+`limit` and `offset`. Paging order is stable, so pages neither skip nor repeat.
+
+`limit` defaults to **1000** and caps at `NETCLUSTER_MAX_PAGE` because the two halves
+cost very differently: selecting the devices is the same ~1.5 ms scan `?where=` pays
+over 180,000, while serialising 100,000 features is ~100 ms and ~15 MB. Ask for what
+you will show, and use `?format=compact` or `?props=false` when the page is large.
+
+### Filtering by an explicit list of ids
+
+```bash
+curl 'localhost:8080/v1/collections/fleet/clusters?bbox=…&zoom=12&ids=truck-1,truck-7'
+curl 'localhost:8080/v1/collections/fleet/devices?ids=truck-1,truck-7&f.status=idle'
+```
+
+For a set that is not a category: "the forty vehicles flagged in another system
+right now". A dimension is the wrong tool — it is interned and capacity-bounded for
+values many devices share, and an id has one device per value, so declaring one over
+ids makes the aggregates a second copy of the fleet. `?ids=` is answered by looking
+each id up, so it costs what the list is long and nothing in memory, and it
+intersects with `?f.` and `?where=`.
+
+- **`?ids=` with nothing after it matches nothing**, not everything. The list comes
+  from elsewhere and is legitimately empty sometimes; rendering "nothing is flagged"
+  as the whole fleet is the one genuinely dangerous answer. Deliberately unlike
+  `?f.<name>=`, where an empty value means no value was named and the filter drops.
+- **An unknown id is skipped, not a 400** — unlike an undeclared filter *value*,
+  which can only be a typo. A vehicle may expire between the external read and this
+  query.
+- Capped at `NETCLUSTER_MAX_IDS`, and refused on tiles: a tile is cached by
+  coordinate while a whitelist is per request.
+
+### Updating values without a position
+
+`lng` and `lat` are optional, together. An item that carries neither updates only
+its `dims` and `props`, against the position the server already holds:
+
+```bash
+curl -X POST localhost:8080/v1/collections/fleet/positions \
+  -H 'content-type: application/json' \
+  -d '[{"id": "truck-1", "dims": {"flagged": "true"}}]'
+# {"accepted":0,"devices":3,"patched":1,"stale":0,"unknown":[]}
+```
+
+This is for state that changes on its own schedule and does not move the vehicle.
+The system that knows a flag changed usually does not know where the vehicle is;
+requiring a position either forces a lookup it should not have to do or invites a
+stale one that teleports the marker. It costs less than a report, not more — the
+stored position is already projected — and a batch may mix both shapes. One
+coordinate without the other is a 400 rather than a guess.
+
+**A values-only update is not a heartbeat.** It does not renew the device's TTL,
+because the position stream is what proves the vehicle is still there; otherwise a
+fleet whose billing system keeps touching records would never expire anything. A
+device that has already expired is named in `unknown` rather than resurrected, and
+that is a returned value rather than an error so one stale vehicle does not reject
+ninety-nine good updates. `patched` is counted apart from `ingested` in
+`/metrics` and in collection stats.
 
 ## GeoJSON
 
@@ -315,7 +391,8 @@ and large JSON/MVT responses run off the async executor, and report requests
 wait asynchronously for a per-collection writer. Overload returns
 `503 {"code":"overloaded",...}` with `Retry-After: 1`; it is not an acknowledgement.
 Retry the same versioned payload with backoff. The bundled client does so, checks
-`accepted + stale` for every batch, and exposes incomplete acknowledgements as errors.
+`accepted + stale + patched + unknown` for every batch, and exposes incomplete
+acknowledgements as errors.
 Health checks do not wait for collection index locks.
 
 | Environment variable | Default | Purpose |
@@ -323,6 +400,8 @@ Health checks do not wait for collection index locks.
 | `NETCLUSTER_MAX_INFLIGHT` | 64 | Maximum admitted non-health requests |
 | `NETCLUSTER_MAX_BLOCKING` | available CPUs, clamped to 2–8 | Concurrent HTTP CPU/index jobs |
 | `NETCLUSTER_MAX_BATCH` | 5000 | Reports per request; larger batches receive 413 |
+| `NETCLUSTER_MAX_IDS` | 1000 | Ids one `?ids=` may name; longer lists receive 413 |
+| `NETCLUSTER_MAX_PAGE` | 10000 | Largest `?limit=` `/devices` will serve in one page |
 
 Worker and per-collection writer queues each have a one-second wait budget.
 Keep batches near 500–1000. These bounds control queue growth, not the execution
@@ -438,6 +517,13 @@ restricted to the matches. **It costs `O(devices)`, not `O(markers)`** — about
 the fleet grows. Use a dimension whenever the values can be declared and keep
 `where` for the search box. Not available on tiles, which refuse it rather than
 serving an unfiltered one.
+
+**A prefix search is this query.** "The user typed the first characters of a
+plate" is `?where=plate~abc`: a substring match already covers a prefix, so there
+is no prefix index to declare. One would save about a millisecond of the scan
+above and cost a structure to maintain on every properties write. Pair `where`
+with `?where=` on `/devices` below when what you need is the list rather than the
+markers — a cluster of matches carries no `cluster_id` and cannot be expanded.
 
 Still out of reach: ranges, `OR` across values, and anything in `props` that is
 not a declared text field.

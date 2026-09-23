@@ -7,7 +7,10 @@
 //! all*, and because a tile key is stable, an HTTP cache in front of this actually
 //! hits. At coarse zooms one query serves every viewer looking at that region.
 
-use crate::collection::{Collection, Config, OutFeature, Report, TextPred, NO_MATCH};
+use crate::collection::{
+    Candidates, Collection, Config, OutFeature, Page, Patch, PatchOutcome, Report, TextPred,
+    NO_MATCH,
+};
 use crate::geojson::{peek_dims, peek_props, CatVal, DimVal, GeoFeature};
 use crate::mvt;
 use crate::schema::Dimension;
@@ -222,6 +225,7 @@ pub fn router_with_limit(state: Arc<AppState>, max_inflight: usize) -> Router {
             "/v1/collections/{name}/devices/{id}/cluster",
             get(device_cluster),
         )
+        .route("/v1/collections/{name}/devices", get(list_devices))
         .route("/v1/collections/{name}/clusters", get(clusters))
         .route(
             "/v1/collections/{name}/clusters/{cid}/children",
@@ -356,6 +360,10 @@ async fn metrics(State(s): State<Arc<AppState>>) -> ApiResult<impl IntoResponse>
             out.push_str(&format!(
                 "netcluster_stale_reports_total{{collection=\"{n}\"}} {}\n",
                 st.stale_reports
+            ));
+            out.push_str(&format!(
+                "netcluster_patched_total{{collection=\"{n}\"}} {}\n",
+                st.patched
             ));
             out.push_str(&format!(
                 "netcluster_repairs_total{{collection=\"{n}\"}} {}\n",
@@ -574,8 +582,16 @@ async fn verify(
 #[serde(deny_unknown_fields)]
 pub struct ReportBody {
     id: String,
-    lng: f64,
-    lat: f64,
+    /// Optional together. Both present is a position report; both absent is a
+    /// metadata-only patch against the position the device already has, which is
+    /// how external state -- "is this vehicle flagged" -- gets written by something
+    /// that knows the flag changed but not where the vehicle is. One without the
+    /// other is refused: it is always a bug, and guessing the missing half would
+    /// either teleport the marker or silently drop the half that was sent.
+    #[serde(default)]
+    lng: Option<f64>,
+    #[serde(default)]
+    lat: Option<f64>,
     /// Optional source-side monotonic version. A late retry with an older
     /// version is ignored instead of moving the device backwards in time.
     #[serde(default)]
@@ -787,6 +803,78 @@ fn parse_where(c: &Collection, q: &HashMap<String, String>) -> ApiResult<Vec<Tex
     Ok(out)
 }
 
+/// `?ids=a,b,c` -- an explicit whitelist of device ids, independent of any
+/// declared dimension.
+///
+/// This exists because an id is not a category. A dimension is interned,
+/// capacity-bounded and meant for values many devices share; a primary key has one
+/// device per value, so declaring a dimension over it makes the aggregates a second
+/// copy of the fleet. A whitelist is answered by looking each id up instead, which
+/// costs what the list is long and nothing at all in memory.
+///
+/// **An empty `?ids=` matches nothing.** Not the whole fleet -- that is the one
+/// wrong answer here. A caller joins a list it got from somewhere else, that list
+/// is legitimately empty sometimes ("nothing is flagged right now"), and turning
+/// that into every vehicle on the map would show every vehicle as flagged. Note
+/// this is deliberately unlike `?f.<name>=`, where an empty value means the caller
+/// named no value at all and the filter is dropped.
+fn parse_ids(q: &HashMap<String, String>) -> ApiResult<Option<Vec<String>>> {
+    let Some(raw) = q.get("ids") else {
+        return Ok(None);
+    };
+    let ids: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect();
+    let max = env_limit("NETCLUSTER_MAX_IDS", 1000);
+    if ids.len() > max {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "?ids= names {} devices; the maximum is {max}. Raise NETCLUSTER_MAX_IDS, \
+                 or ask for the clusters unfiltered and narrow them by viewport instead",
+                ids.len()
+            ),
+            "too_many_ids",
+        ));
+    }
+    Ok(Some(ids))
+}
+
+/// `?limit=` and `?offset=` for the device listing.
+///
+/// A default limit rather than none: the scan that finds the devices is cheap and
+/// serialising them is not, so an unbounded listing of a large fleet is a
+/// multi-megabyte body built at the server's expense every time someone forgets.
+fn parse_page(q: &HashMap<String, String>) -> ApiResult<(usize, usize)> {
+    let max = env_limit("NETCLUSTER_MAX_PAGE", 10_000);
+    let limit = match q.get("limit") {
+        None => 1000usize.min(max),
+        Some(v) => {
+            let n: usize = v
+                .parse()
+                .map_err(|_| ApiError::bad("limit must be a non-negative integer"))?;
+            if n > max {
+                return Err(ApiError::bad(format!(
+                    "limit {n} is over the {max} this server serves in one page; \
+                     page with ?offset=, or raise NETCLUSTER_MAX_PAGE"
+                ))
+                .code("limit_too_large"));
+            }
+            n
+        }
+    };
+    let offset = match q.get("offset") {
+        None => 0usize,
+        Some(v) => v
+            .parse()
+            .map_err(|_| ApiError::bad("offset must be a non-negative integer"))?,
+    };
+    Ok((limit, offset))
+}
+
 /// The filter cells one compact report belongs to.
 ///
 /// `None` means the report named no filter values, which leaves the device's
@@ -871,37 +959,83 @@ async fn positions(
     let write_guard = tokio::time::timeout(Duration::from_secs(1), write_gate.acquire_write())
         .await
         .map_err(|_| ApiError::overloaded())?;
-    let (n, devices) = run_blocking(move || {
+    let (n, po, devices) = run_blocking(move || {
         // Move the guard into the blocking task. If the HTTP client disconnects,
         // the task may outlive this handler; the next writer must still wait until
         // this mutation has actually finished.
         let _write_guard = write_guard;
-        let n = match body {
-            PositionsBody::Compact(reports) => {
+        let (n, po) = match body {
+            PositionsBody::Compact(items) => {
+                // Coordinates are optional but come as a pair. Settle which items
+                // are position reports and which are metadata patches before
+                // anything is resolved, so a half-sent coordinate is a 400 naming
+                // the device rather than an update that quietly went nowhere.
+                let mut pos: Vec<Option<(f64, f64)>> = Vec::with_capacity(items.len());
+                for r in &items {
+                    match (r.lng, r.lat) {
+                        (Some(lng), Some(lat)) => pos.push(Some((lng, lat))),
+                        (None, None) => pos.push(None),
+                        (lng, _) => {
+                            let (sent, missing) =
+                                if lng.is_some() { ("lng", "lat") } else { ("lat", "lng") };
+                            return Err(ApiError::bad(format!(
+                                "device {:?} sent {sent} without {missing}; send both to move it, \
+                                 or neither to update only its values",
+                                r.id
+                            ))
+                            .code("half_position"));
+                        }
+                    }
+                }
                 // Cells are built into one owned buffer first so the reports can
                 // borrow slices of it; a report that names no filter values at all
                 // gets None, which leaves the device where it is.
-                let mut store: Vec<Option<Vec<u32>>> = Vec::with_capacity(reports.len());
+                let mut store: Vec<Option<Vec<u32>>> = Vec::with_capacity(items.len());
                 let mut vals: HashMap<String, Vec<String>> = HashMap::new();
-                for r in &reports {
+                for r in &items {
                     store.push(
                         compact_cells(&c, r, &mut vals)
                             .map_err(|e| ApiError::bad(format!("device {:?}: {e}", r.id)))?,
                     );
                 }
-                let resolved: Vec<Report<'_>> = reports
+                let resolved: Vec<Report<'_>> = items
                     .iter()
                     .zip(&store)
-                    .map(|(r, cells)| Report {
+                    .zip(&pos)
+                    .filter_map(|((r, cells), p)| {
+                        p.map(|(lng, lat)| Report {
+                            id: &r.id,
+                            lng,
+                            lat,
+                            props: r.props.as_deref(),
+                            cells: cells.as_deref(),
+                            updated_at_ms: r.updated_at_ms,
+                        })
+                    })
+                    .collect();
+                let patches: Vec<Patch<'_>> = items
+                    .iter()
+                    .zip(&store)
+                    .zip(&pos)
+                    .filter(|(_, p)| p.is_none())
+                    .map(|((r, cells), _)| Patch {
                         id: &r.id,
-                        lng: r.lng,
-                        lat: r.lat,
                         props: r.props.as_deref(),
                         cells: cells.as_deref(),
                         updated_at_ms: r.updated_at_ms,
                     })
                     .collect();
-                c.upsert(&resolved).map_err(ApiError::bad)?
+                let accepted = if resolved.is_empty() {
+                    0
+                } else {
+                    c.upsert(&resolved).map_err(ApiError::bad)?
+                };
+                let outcome = if patches.is_empty() {
+                    PatchOutcome::default()
+                } else {
+                    c.patch(&patches).map_err(ApiError::bad)?
+                };
+                (accepted, outcome)
             }
             PositionsBody::Geo(feats) => {
                 let id_prop = q.get("id_property").map(|s| s.as_str());
@@ -1042,17 +1176,33 @@ async fn positions(
                         updated_at_ms: f.updated_at_ms,
                     });
                 }
-                c.upsert(&resolved).map_err(ApiError::bad)?
+                // GeoJSON always carries geometry -- a null one is refused rather
+                // than treated as "leave it where it is" -- so there are no
+                // patches on this path. The compact form is where they belong.
+                (
+                    c.upsert(&resolved).map_err(ApiError::bad)?,
+                    PatchOutcome::default(),
+                )
             }
         };
-        Ok((n, c.len()))
+        Ok((n, po, c.len()))
     })
     .await?;
-    Ok(Json(json!({
+    let mut ack = json!({
         "accepted": n,
-        "stale": submitted.saturating_sub(n),
+        "stale": submitted.saturating_sub(n + po.applied + po.unknown.len()),
         "devices": devices,
-    })))
+    });
+    // Only when patches were actually sent, so the response to an ordinary batch
+    // of position reports is byte for byte what it has always been. Reported even
+    // when every one of them was stale or unknown: a caller that sent patches and
+    // got no word about them cannot tell the difference between "all rejected" and
+    // "this server does not do patches".
+    if po.applied > 0 || po.stale > 0 || !po.unknown.is_empty() {
+        ack["patched"] = json!(po.applied);
+        ack["unknown"] = json!(po.unknown);
+    }
+    Ok(Json(ack))
 }
 
 /// Is this device registered, and what does the index know about it?
@@ -1186,6 +1336,68 @@ fn collection_json(fs: &[OutFeature]) -> Value {
     })
 }
 
+/// Every device matching a filter, flat, in one round trip.
+///
+/// The listing the clustered query cannot be: `getClusters` groups, zoom is clamped
+/// to `maxZoom`, and vehicles parked closer together than the radius at that zoom
+/// come back as one marker -- with no `cluster_id` when they were selected by
+/// `?where=` or `?ids=`, so there is nothing left to expand. Reaching the members
+/// used to mean one `leaves` call per residual group, which on a real fleet is
+/// thousands of requests for one logical "give me everyone", and a burst of those
+/// against a CPU-limited pod is throttled as a whole rather than served.
+///
+/// Takes the same `?f.`, `?where=` and `?ids=` as the clustered query, so a list
+/// view and the markers beside it are answered from one set of parameters.
+async fn list_devices(
+    State(s): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Response> {
+    let c = s.get(&name)?;
+    let bbox = parse_bbox(&q)?;
+    run_blocking(move || {
+        let cat = parse_filter(&c, &q)?;
+        let preds = parse_where(&c, &q)?;
+        let ids = parse_ids(&q)?;
+        let (limit, offset) = parse_page(&q)?;
+        // Properties dominate the response on a fleet that carries any, and a list
+        // that only needs ids and positions should not pay for them.
+        let with_props = !matches!(q.get("props").map(String::as_str), Some("false" | "0"));
+        let compact = matches!(q.get("format").map(String::as_str), Some("compact"));
+        let cands = match &ids {
+            Some(v) => Candidates::Ids(v),
+            None => Candidates::All,
+        };
+        let page = Page {
+            limit,
+            offset,
+            with_props,
+        };
+        let (fs, total) = c.list_devices(bbox, cat, &preds, cands, page);
+        let mut v = if compact {
+            json!({ "devices": fs.iter().map(compact_device).collect::<Vec<_>>() })
+        } else {
+            collection_json(&fs)
+        };
+        v["total"] = json!(total);
+        v["returned"] = json!(fs.len());
+        v["limit"] = json!(limit);
+        v["offset"] = json!(offset);
+        Ok(Json(v).into_response())
+    })
+    .await
+}
+
+/// A device in the compact listing: the same information as the GeoJSON form
+/// without the envelope, which on a page of thousands is most of the bytes.
+fn compact_device(f: &OutFeature) -> Value {
+    let mut v = json!({ "id": f.device, "lng": f.lng, "lat": f.lat });
+    if let Some(p) = &f.props {
+        v["props"] = json!(p);
+    }
+    v
+}
+
 async fn clusters(
     State(s): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1196,13 +1408,15 @@ async fn clusters(
     run_blocking(move || {
         let cat = parse_filter(&c, &q)?;
         let preds = parse_where(&c, &q)?;
-        // Two paths on purpose. Without `?where=` this reads precomputed aggregates
-        // and costs what it always did; with one it scans, and that is the only way a
-        // substring can be answered exactly.
-        let fs = if preds.is_empty() {
-            c.clusters(bbox, zoom, cat)
-        } else {
-            c.search(bbox, zoom, cat, &preds)
+        let ids = parse_ids(&q)?;
+        // Two paths on purpose. With neither `?where=` nor `?ids=` this reads
+        // precomputed aggregates and costs exactly what it always did. With either,
+        // it selects and groups -- the only way a substring can be answered exactly,
+        // and the only way an arbitrary id set can be answered at all.
+        let fs = match &ids {
+            Some(v) => c.select_clusters(bbox, zoom, cat, &preds, Candidates::Ids(v)),
+            None if preds.is_empty() => c.clusters(bbox, zoom, cat),
+            None => c.search(bbox, zoom, cat, &preds),
         };
         Ok(Json(collection_json(&fs)).into_response())
     })
@@ -1295,6 +1509,14 @@ async fn tile(
                 .to_string(),
         )
         .code("where_not_supported"));
+    }
+    // Same reason, same answer: a tile is cached by coordinate, and a whitelist is
+    // per request. Serving the unfiltered tile would silently show every vehicle.
+    if q.contains_key("ids") {
+        return Err(ApiError::bad(
+            "?ids= is not supported on tiles; use /clusters or /devices, which take it".to_string(),
+        )
+        .code("ids_not_supported"));
     }
     let extent = c.config.extent as u32;
     let ext = ext.to_owned();

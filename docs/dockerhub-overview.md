@@ -90,9 +90,20 @@ many can coexist, not how large an id can get. A substring gets its own query �
 reading an aggregate. Still out of reach: ranges, `OR` across values, anything in
 `props` that is not a declared text field, and any field whose distinct values
 never stop growing as a *dimension* (a per-trip id gives every device its own
-bucket). Note too that `clusters` is not a device listing:
-co-located devices come back as one cluster with no id and no props at every
-zoom.
+bucket). An arbitrary set of device ids is not a dimension either — pass it as
+`?ids=truck-1,truck-7`, which looks each one up rather than scanning, and note that
+an empty `?ids=` matches nothing rather than everything.
+
+`clusters` is not a device listing: co-located devices come back as one cluster with
+no id and no props at every zoom, and a marker selected by `?where=` or `?ids=`
+carries no `cluster_id` to expand. `GET .../devices` is the listing — every match,
+flat, one request, taking the same filters plus `?limit=`, `?offset=`,
+`?format=compact` and `?props=false`.
+
+`lng` and `lat` are optional together: an item carrying neither updates only its
+`dims` and `props`, against the position already held, for external state that
+changes without moving the vehicle. It does not renew the TTL — the position stream
+is what proves a device is still there.
 
 ## Tuning the clustering
 

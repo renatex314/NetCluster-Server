@@ -18,6 +18,9 @@ netcluster seed fleet --count 50000          # a simulated fleet, for demos and 
 netcluster load fleet points.geojson         # bulk-load GeoJSON
 netcluster clusters fleet --zoom 6           # what the map would draw
 netcluster clusters fleet --zoom 6 --filter client=7 --filter status=enroute
+netcluster clusters fleet --zoom 6 --ids v1,v42       # only these devices
+netcluster devices fleet --where plate~abc --limit 50 # the list, not the markers
+netcluster patch fleet v42 --dim flagged=true         # a value, without a position
 netcluster where fleet v42 --zoom 10         # which marker holds this device
 netcluster watch                             # live devices, ingest rate, memory, snapshot age
 ```
@@ -25,8 +28,8 @@ netcluster watch                             # live devices, ingest rate, memory
 ```
 SERVER       health, collections, watch
 COLLECTIONS  create, drop, stats, verify, snapshot
-DEVICES      report, import, load, seed, get, has, rm
-QUERIES      clusters, where, children, leaves, tile
+DEVICES      report, patch, import, load, seed, get, has, rm
+QUERIES      clusters, devices, where, children, leaves, tile
 ```
 
 Points at `http://localhost:8080` unless you set `--url` or `NETCLUSTER_URL`.
@@ -143,8 +146,8 @@ The server counts older, equal, and unversioned-after-versioned reports in
 Equal versions must identify the same update. Deletion/expiry clears history.
 Reporter includes stale counts in `reporter.stats.stale`.
 
-The client rejects acknowledgements unless `accepted + stale` matches the
-submitted batch. Network errors, 429 and 5xx retry with bounded exponential
+The client rejects acknowledgements unless every item comes back accounted for:
+`accepted + stale + patched + unknown` must match the submitted batch. Network errors, 429 and 5xx retry with bounded exponential
 backoff/jitter and respect Retry-After (capped at 30 seconds). Explicit cancellation
 does not retry. Default retry count remains one; handle final failures and alert
 on repeated stale/error results rather than silently dropping them.
@@ -248,6 +251,63 @@ vehicle**, so re-reporting it where it already is *is* the whole update:
 await fleet.report([{ id: 'truck-1', lng, lat, dims: { status: 'idle' } }]);
 ```
 
+#### When you do not know where the vehicle is
+
+The line above needs a position, and the thing that knows a value changed often
+does not have one. "Is this vehicle flagged in the billing system" arrives from the
+billing system, which tracks invoices, not GPS — and looking the position up just
+to send it back is work you should not have to do, while guessing it teleports the
+marker. `patch` keeps the position the server already holds:
+
+```js
+await fleet.patch([
+  { id: 'truck-1', dims: { flagged: 'true' } },        // values only
+  { id: 'truck-2', props: { plate: 'ABC-1234' } },     // properties only
+]);
+// -> { patched: 2, stale: 0, unknown: [] }
+```
+
+It costs *less* than a report, not more: the stored position is already projected,
+and a patch that names no values does not touch the tree at all. A single batch may
+mix both shapes — `report` accepts entries without coordinates and treats them the
+same way — and sending one coordinate without the other is refused rather than
+guessed.
+
+**A patch is not a heartbeat.** It deliberately does not renew the device's TTL,
+because the position stream is what proves the vehicle is still out there. If
+flipping an external flag renewed it, a fleet whose billing system keeps touching
+records would never expire anything and the map would fill with vehicles that
+stopped reporting hours ago. A device that has already expired comes back in
+`unknown` rather than being resurrected:
+
+```js
+const { patched, unknown } = await fleet.patch([{ id: 'gone', dims: { flagged: 'true' } }]);
+// -> patched: 0, unknown: ['gone']
+```
+
+That is a returned value and not an error on purpose: a vehicle expiring between the
+moment an external system read it and the moment the patch lands is a race, and one
+stale vehicle must not reject ninety-nine good updates.
+
+#### A flag is just a dimension
+
+Nothing special is needed for boolean or small-enum state that your own application
+owns — declare it like any other dimension and it filters natively:
+
+```js
+await fleet.create({
+  dimensions: [
+    { name: 'flagged', values: ['true', 'false'] },
+    { name: 'status', values: ['idle', 'enroute'] },
+  ],
+  filters: [['flagged'], ['status'], ['flagged', 'status']],
+});
+await fleet.getClusters({ bbox, zoom, filter: { flagged: 'true' } });
+```
+
+Declare the two values rather than a `capacity`: interning exists for values you
+cannot enumerate, and `true`/`false` you can.
+
 ### Querying
 
 ```js
@@ -263,6 +323,81 @@ is two.
 The combination must match a declared shape exactly. Anything else is a 400 naming
 what is declared, never an empty result: a filter that silently matched nothing
 looks exactly like a fleet that has gone quiet.
+
+#### Filtering by an explicit list of ids
+
+Sometimes the set is not a category at all — "the forty vehicles flagged in another
+system right now". That is not a dimension: a dimension is interned and
+capacity-bounded for values many devices share, and an id has exactly one device
+per value, so declaring one over ids makes the aggregates a second copy of the
+fleet. Pass the list instead:
+
+```js
+await fleet.getClusters({ bbox, zoom, ids: ['truck-1', 'truck-7'] });
+await fleet.getClusters({ bbox, zoom, ids: flagged, filter: { status: 'enroute' } });
+```
+
+It is answered by looking each id up, so it costs what the list is long rather than
+a pass over the fleet, and nothing in memory. Combine it with `filter` and `where`
+freely; the conditions intersect. The results cluster like any other query, so two
+whitelisted vehicles in one yard are one marker of 2.
+
+Three things to know:
+
+- **An empty `ids: []` matches nothing**, not everything. Your list is legitimately
+  empty sometimes, and "nothing is flagged" must not render as every vehicle on the
+  map wearing the flagged badge. Note this is the opposite of `filter`, where an
+  empty value means you named none and the filter is dropped.
+- **An id that names no live device is skipped, not an error** — unlike an
+  undeclared *filter value*, which is a 400 because it can only be a typo. A
+  whitelist comes from elsewhere and a vehicle may expire between that read and this
+  query.
+- **Not available on tiles.** A tile is cached by coordinate and a whitelist is per
+  request, so it is refused rather than served unfiltered.
+
+Where the set is state your own application owns rather than a list you compute per
+request, prefer [a dimension and `patch`](#a-flag-is-just-a-dimension): the server
+then keeps the flag and nothing has to be resolved on the way in.
+
+### Listing devices
+
+`getClusters` answers in markers. To get the devices themselves — a list under the
+map, a search result, an export — ask for them flat:
+
+```js
+const { devices, total, returned } = await fleet.listDevices({
+  filter: { status: 'enroute' },
+  where: { plate: 'abc' },
+  limit: 200,
+  format: 'compact',
+});
+```
+
+This is not a convenience wrapper. **You cannot get here from the clustered
+answer:** zoom is clamped to `maxZoom`, vehicles parked closer than the radius at
+that zoom come back as one marker, and a marker produced by `where` or `ids` carries
+no `clusterId` at all — so there is nothing to pass to `getLeaves`. Before this,
+"give me everyone" meant one `getLeaves` call per residual group, which on a real
+fleet is thousands of requests, and a burst of those against a CPU-limited pod gets
+throttled as a whole rather than served.
+
+Takes the same `bbox`, `filter`, `where` and `ids` as `getClusters`, so a list and
+the markers beside it come from one set of parameters.
+
+| option | |
+|---|---|
+| `limit` | page size, default **1000**, server maximum 10,000 |
+| `offset` | paging; the order is stable, so pages neither skip nor repeat |
+| `format: 'compact'` | `{ devices: [{ id, lng, lat, props }] }` — smaller than GeoJSON on a large page |
+| `props: false` | leave properties out entirely |
+
+`total` is how many devices matched, not how many came back, so a pager has what it
+needs in the first response.
+
+**Ask for what you will show.** Selecting the devices is cheap — the same scan
+`where` pays, about 1.5 ms over 180,000 — and serialising them is not: a hundred
+thousand features is roughly 100 ms and 15 MB of JSON. That asymmetry is why `limit`
+has a default at all, and why `format: 'compact'` and `props: false` exist.
 
 ```
 unknown filter "plate"; this collection has client, status
@@ -328,6 +463,19 @@ Terms are ANDed, matching ignores case, and the results cluster exactly as an
 unfiltered query would — restricted to the matches — so two matching vehicles
 parked in the same yard come back as one marker of 2 rather than disappearing.
 
+**A search box is already this.** "The user typed the first few characters of a
+plate" is `where: { plate: 'abc' }` — a substring match covers a prefix, so there
+is no separate prefix index to declare and nothing to enable. A trie would only
+narrow what is already matched: the scan is ~1.5 ms over 180,000 devices, and a
+prefix-only index would save about a millisecond of that while adding a structure
+to maintain on every properties write. If you want the match *anchored* to the
+start, compare the field's length yourself on the way out; the server does not
+spell that today.
+
+To back the list *under* the search box rather than markers on the map, pair this
+with [`listDevices`](#listing-devices) — `where` answers in clusters, and a
+cluster of matches cannot be expanded (see below).
+
 **It costs `O(devices)`, not `O(markers)`.** Measured on a 180,000-device fleet,
 the scan itself is about **1.5 ms**; the declared filters above are a lookup and
 stay flat however large the fleet grows. That is the whole trade, and it is why
@@ -361,8 +509,9 @@ And **do not reach for the whole fleet and filter it yourself.** `getClusters`
 clusters at every zoom, so it is not a device listing: zoom is clamped to
 `maxZoom`, and vehicles parked closer than the radius at that zoom (~44 m at the
 defaults) come back as a single cluster with no id and no props, which a filter of
-your own silently skips — a depot disappears. Use `getLeaves(clusterId)` to reach
-the members.
+your own silently skips — a depot disappears. Use
+[`listDevices`](#listing-devices) when you want the devices, and
+`getLeaves(clusterId)` to open one particular marker.
 
 ## Tuning the clustering
 
@@ -471,11 +620,13 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 | `dropCollection(name)` | |
 | `listCollections()` / `stats(name)` | |
 | `report(name, points, { maxBatch })` | upserts; chunked. A point may carry `dims` and `props` |
+| `patch(name, updates, { maxBatch })` | `{ id, dims?, props? }` with no position — see [above](#when-you-do-not-know-where-the-vehicle-is). Does not renew the TTL |
 | `reportGeoJSON(name, geojson, { maxBatch, idProperty, catProperty })` | the same, with GeoJSON on the wire |
 | `remove(name, id)` | |
 | `has(name, id)` | is this device registered? |
 | `getDevice(name, id)` | position, category and staleness, or `null` |
-| `getClusters(name, { bbox, zoom, cat, filter })` | GeoJSON `FeatureCollection` |
+| `getClusters(name, { bbox, zoom, cat, filter, where, ids })` | GeoJSON `FeatureCollection` |
+| `listDevices(name, { bbox, filter, where, ids, limit, offset, format, props })` | matching devices, [flat and ungrouped](#listing-devices), plus `total` |
 | `getTile(name, z, x, y, { cat, filter, format })` | `Uint8Array` of MVT, or `format: 'json'` |
 | `getChildren(name, clusterId)` | one expansion step, plus `expansion_zoom` |
 | `getLeaves(name, clusterId, { limit, offset })` | the individual devices |

@@ -68,6 +68,22 @@ function queryFilter(flags) {
   return Object.keys(out).length ? out : undefined;
 }
 
+/**
+ * `--ids v1,v2` -- an explicit device whitelist, repeatable.
+ *
+ * `undefined` when the flag is absent, so the query is unrestricted. An empty
+ * `--ids` is an empty array, which matches nothing: the list usually comes from
+ * another system, it is legitimately empty sometimes, and showing the whole fleet
+ * instead is the one answer that would be actively wrong.
+ */
+function idsFlag(flags) {
+  if (flags.ids === undefined) return undefined;
+  return list(flags, 'ids')
+    .flatMap((raw) => raw.split(','))
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
 /** `name=a,b` pairs into an object of name -> values. */
 function pairs(flags, name, what) {
   const out = {};
@@ -578,14 +594,18 @@ cmd('has', {
 
 cmd('clusters', {
   usage: 'clusters <name> [--zoom 8] [--bbox w,s,e,n] [--cat X] [--filter client=7]\n' +
-         '                      [--where plate~abc] [--limit 20]\n' +
+         '                      [--where plate~abc] [--ids v1,v2] [--limit 20]\n' +
          '\n' +
          '  --filter may be repeated, and must name exactly the dimensions of one declared\n' +
          '  shape. An undeclared combination is an error, not an empty map.\n' +
          '\n' +
          '  --where searches a declared text field: field~substring or field=value, both\n' +
          '  ignoring case. It may be repeated, and it SCANS -- O(devices), not O(markers) --\n' +
-         '  because a substring cannot be precomputed. Use --filter where you can.',
+         '  because a substring cannot be precomputed. Use --filter where you can.\n' +
+         '\n' +
+         '  --ids restricts the answer to an explicit list of devices, looked up one by one\n' +
+         '  rather than scanned. An unknown id is skipped; --ids with nothing after it\n' +
+         '  matches nothing rather than everything.',
   blurb: 'what would be drawn on the map at this zoom',
   async run(nc, [name], flags) {
     if (!name) throw new UsageError('clusters needs a collection name');
@@ -593,7 +613,7 @@ cmd('clusters', {
     const where = list(flags, 'where').join(',');
     const fc = await nc.getClusters(name, {
       zoom, bbox: parseBbox(flags.bbox), cat: flags.cat, filter: queryFilter(flags),
-      where: where || undefined,
+      where: where || undefined, ids: idsFlag(flags),
     });
     if (out(fc, flags)) return;
     const total = fc.features.reduce((a, f) => a + (f.properties.point_count ?? 1), 0);
@@ -666,6 +686,76 @@ cmd('leaves', {
       r.features.map((f) => [f.id, f.geometry.coordinates[0].toFixed(4), f.geometry.coordinates[1].toFixed(4)]),
       ['DEVICE', 'LNG', 'LAT']
     );
+  },
+});
+
+cmd('devices', {
+  usage: 'devices <name> [--bbox w,s,e,n] [--filter client=7] [--where plate~abc]\n' +
+         '                      [--ids v1,v2] [--limit 50] [--offset 0] [--no-props]\n' +
+         '\n' +
+         '  Every matching device, flat. Unlike clusters this never groups, which is why\n' +
+         '  it exists: co-located devices are one marker there, and a marker selected by\n' +
+         '  --where or --ids has no cluster id to expand.',
+  blurb: 'list matching devices, ungrouped',
+  async run(nc, [name], flags) {
+    if (!name) throw new UsageError('devices needs a collection name');
+    const where = list(flags, 'where').join(',');
+    const limit = num(flags, 'limit', 50);
+    const r = await nc.listDevices(name, {
+      bbox: parseBbox(flags.bbox), cat: flags.cat, filter: queryFilter(flags),
+      where: where || undefined, ids: idsFlag(flags),
+      limit, offset: num(flags, 'offset', 0),
+      // `--no-props`: the flag parser has no negation, so it arrives under its own name
+      format: 'compact', props: flags['no-props'] ? false : undefined,
+    });
+    if (out(r, flags)) return;
+    table(
+      r.devices.map((d) => [
+        d.id,
+        d.lng.toFixed(4),
+        d.lat.toFixed(4),
+        d.props ? JSON.stringify(d.props).slice(0, 40) : '',
+      ]),
+      ['DEVICE', 'LNG', 'LAT', 'PROPS']
+    );
+    const shown = r.offset + r.returned;
+    console.log(`\n  ${bold(n(r.returned))} of ${bold(n(r.total))} devices` +
+      (shown < r.total ? dim(`  (next: --offset ${shown})`) : ''));
+  },
+});
+
+cmd('patch', {
+  usage: 'patch <name> <id> [--dim flagged=true] [--props \'{"k":"v"}\']\n' +
+         '\n' +
+         '  Updates values and properties without a position, against the one the server\n' +
+         '  already holds. For state that changes on its own schedule and does not move\n' +
+         '  the vehicle. It does NOT renew the TTL: the position stream is what proves a\n' +
+         '  device is still there, so a device that has expired is reported unknown\n' +
+         '  rather than resurrected.',
+  blurb: 'change values or props without a position',
+  async run(nc, [name, id], flags) {
+    if (!name || !id) throw new UsageError('patch needs <name> <id>');
+    const u = { id };
+    const dims = pairs(flags, 'dim', 'name=value[,value]');
+    if (Object.keys(dims).length) u.dims = dims;
+    const props = parseProps(flags.props);
+    if (props !== undefined) u.props = props;
+    if (u.dims === undefined && u.props === undefined) {
+      throw new UsageError('patch needs --dim or --props, or it would do nothing');
+    }
+    const r = await nc.patch(name, [u]);
+    if (out(r, flags)) return;
+    if (r.unknown.length) {
+      console.log(`  ${yellow('unknown')} ${id} is not currently live in ${name}`);
+      process.exitCode = EXIT_FAIL;
+      return;
+    }
+    if (!r.patched) {
+      console.log(`  ${yellow('stale')} ${id} already holds a newer update`);
+      process.exitCode = EXIT_FAIL;
+      return;
+    }
+    console.log(`  ${green('ok')} ${id} updated in ${name}`);
   },
 });
 
@@ -761,9 +851,9 @@ ${dim('SERVER')}`);
   console.log(`\n${dim('COLLECTIONS')}`);
   for (const k of ['create', 'drop', 'stats', 'verify', 'snapshot']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
   console.log(`\n${dim('DEVICES')}`);
-  for (const k of ['report', 'import', 'load', 'seed', 'get', 'has', 'rm']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
+  for (const k of ['report', 'patch', 'import', 'load', 'seed', 'get', 'has', 'rm']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
   console.log(`\n${dim('QUERIES')}`);
-  for (const k of ['clusters', 'where', 'children', 'leaves', 'tile']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
+  for (const k of ['clusters', 'devices', 'where', 'children', 'leaves', 'tile']) console.log(`  ${k.padEnd(12)} ${dim(commands[k].blurb)}`);
   console.log(`
 ${dim('OPTIONS')}
   --url <u>      server address, or NETCLUSTER_URL (default http://localhost:8080)

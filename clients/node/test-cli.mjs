@@ -250,6 +250,77 @@ test('dimensions, --dim and --filter work from the command line', () => {
   cli(['drop', 'owners', '--yes']);
 });
 
+test('devices lists flat, takes --ids and pages', () => {
+  let r = cli(['create', 'flat', '--dimension', 'status=idle,enroute',
+               '--shape', 'status', '--text', 'plate', '--ttl', '0']);
+  assert.equal(r.status, 0, r.stderr);
+  // d2 and d3 share a coordinate, so clusters collapses them and devices must not
+  for (const [id, lng, lat, st, plate] of [
+    ['d1', '-46.63', '-23.55', 'idle', 'ABC1111'],
+    ['d2', '-46.70', '-23.60', 'enroute', 'ABC2222'],
+    ['d3', '-46.70', '-23.60', 'idle', 'XYZ3333'],
+  ]) {
+    r = cli(['report', 'flat', id, lng, lat, '--dim', `status=${st}`,
+             '--props', JSON.stringify({ plate })]);
+    assert.equal(r.status, 0, r.stderr);
+  }
+
+  const all = JSON.parse(cli(['devices', 'flat', '--json']).stdout);
+  assert.equal(all.total, 3);
+  assert.deepEqual(all.devices.map((d) => d.id).sort(), ['d1', 'd2', 'd3']);
+
+  // the same three as markers: the shared yard is one
+  const fc = JSON.parse(cli(['clusters', 'flat', '--zoom', '16', '--json']).stdout);
+  assert.equal(fc.features.length, 2, 'the yard should have collapsed');
+
+  const some = JSON.parse(cli(['devices', 'flat', '--ids', 'd3,d1', '--no-props', '--json']).stdout);
+  assert.deepEqual(some.devices.map((d) => d.id), ['d3', 'd1']);
+  assert.ok(some.devices.every((d) => d.props === undefined), '--no-props still sent props');
+
+  const filtered = JSON.parse(cli(['devices', 'flat', '--filter', 'status=idle', '--json']).stdout);
+  assert.deepEqual(filtered.devices.map((d) => d.id).sort(), ['d1', 'd3']);
+
+  const searched = JSON.parse(cli(['devices', 'flat', '--where', 'plate~abc', '--json']).stdout);
+  assert.equal(searched.total, 2);
+
+  const page = JSON.parse(cli(['devices', 'flat', '--limit', '2', '--offset', '2', '--json']).stdout);
+  assert.equal(page.total, 3, 'total is of matches, not of the page');
+  assert.equal(page.returned, 1);
+
+  cli(['drop', 'flat', '--yes']);
+});
+
+test('patch changes values without a position and refuses a dead device', () => {
+  let r = cli(['create', 'flags', '--dimension', 'flagged=true,false',
+               '--shape', 'flagged', '--ttl', '0']);
+  assert.equal(r.status, 0, r.stderr);
+  r = cli(['report', 'flags', 'p1', '-46.63', '-23.55', '--dim', 'flagged=false']);
+  assert.equal(r.status, 0, r.stderr);
+
+  const flagged = () =>
+    JSON.parse(cli(['devices', 'flags', '--filter', 'flagged=true', '--json']).stdout).total;
+  assert.equal(flagged(), 0);
+
+  r = cli(['patch', 'flags', 'p1', '--dim', 'flagged=true']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(flagged(), 1, 'the patch did not reach the filter');
+
+  // it must not have moved
+  const d = JSON.parse(cli(['devices', 'flags', '--ids', 'p1', '--json']).stdout).devices[0];
+  assert.ok(Math.abs(d.lng - -46.63) < 1e-4 && Math.abs(d.lat - -23.55) < 1e-4);
+
+  // a device that is not live is reported, and the exit code says so
+  r = cli(['patch', 'flags', 'nobody', '--dim', 'flagged=true']);
+  assert.equal(r.status, 1, 'patching an unknown device should fail');
+  assert.match(r.stdout + r.stderr, /unknown/);
+
+  // and it needs something to change
+  r = cli(['patch', 'flags', 'p1']);
+  assert.equal(r.status, 2, 'a patch with nothing to set is a usage error');
+
+  cli(['drop', 'flags', '--yes']);
+});
+
 test('a filter the collection cannot answer fails loudly', () => {
   cli(['create', 'strict', '--dimension', 'client=1,7', '--dimension', 'status=idle', '--ttl', '0']);
   cli(['report', 'strict', 'v', '0', '0', '--dim', 'client=7']);

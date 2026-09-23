@@ -71,13 +71,23 @@ function checkBatchSize(maxBatch) {
     throw new TypeError('netcluster: maxBatch must be a positive safe integer');
   }
 }
+/**
+ * Every item sent must come back accounted for, as exactly one of: accepted (it
+ * carried a position), patched (it carried only values), stale (an older version
+ * than the server holds) or unknown (a patch for a device that is not live).
+ * Anything else means a report went missing in a way worth failing over.
+ */
 function checkAck(ack, submitted) {
   const accepted = ack?.accepted;
   const stale = ack?.stale ?? 0;
+  const patched = ack?.patched ?? 0;
+  const unknown = ack?.unknown?.length ?? 0;
   if (!Number.isSafeInteger(accepted) || accepted < 0 ||
-      !Number.isSafeInteger(stale) || stale < 0 || accepted + stale !== submitted) {
+      !Number.isSafeInteger(stale) || stale < 0 ||
+      !Number.isSafeInteger(patched) || patched < 0 ||
+      accepted + stale + patched + unknown !== submitted) {
     throw new NetClusterError('netcluster: incomplete position acknowledgement', {
-      body: { code: 'incomplete_ack', submitted, accepted, stale },
+      body: { code: 'incomplete_ack', submitted, accepted, stale, patched, unknown },
     });
   }
 }
@@ -120,6 +130,23 @@ function whereTerms(where) {
     else parts.push(`${field}~${v}`);
   }
   return parts.length ? parts.join(',') : null;
+}
+
+/**
+ * `ids` onto `?ids=`.
+ *
+ * An empty array is sent as an empty parameter, and the server answers with
+ * nothing. That is deliberate and it is the only safe reading: the list comes from
+ * somewhere else, it is legitimately empty sometimes, and treating "nothing is
+ * flagged" as "show every vehicle" would put the whole fleet on the map wearing
+ * the wrong label.
+ */
+function applyIds(q, ids) {
+  if (ids === undefined || ids === null) return;
+  if (!Array.isArray(ids)) {
+    throw new TypeError('netcluster: ids takes an array of device ids');
+  }
+  q.set('ids', ids.map(String).join(','));
 }
 
 function applyFilter(q, filter) {
@@ -358,6 +385,8 @@ export class NetClusterClient {
     if (list.length === 0) return { accepted: 0 };
     let accepted = 0;
     let stale = 0;
+    let patched = 0;
+    const unknown = [];
     let last = null;
     for (let i = 0; i < list.length; i += maxBatch) {
       last = await this._write(`/v1/collections/${enc(name)}/positions`, {
@@ -367,8 +396,70 @@ export class NetClusterClient {
       checkAck(last, Math.min(maxBatch, list.length - i));
       accepted += last.accepted;
       stale += last?.stale ?? 0;
+      patched += last?.patched ?? 0;
+      if (Array.isArray(last?.unknown)) unknown.push(...last.unknown);
     }
-    return { accepted, stale, devices: last?.devices };
+    const ack = { accepted, stale, devices: last?.devices };
+    // Only when the batch actually carried some: an ordinary report should not
+    // grow keys that mean nothing to it.
+    if (patched > 0 || unknown.length > 0) {
+      ack.patched = patched;
+      ack.unknown = unknown;
+    }
+    return ack;
+  }
+
+  /**
+   * Update values and properties without a position.
+   *
+   * For state that changes on its own schedule and does not move the vehicle: "is
+   * this one flagged in the billing system", "its plate was corrected". The thing
+   * that knows the flag changed usually does not know where the vehicle is, and
+   * `report` would need a position -- either a lookup you should not have to do, or
+   * a stale one that teleports the marker.
+   *
+   * Each update is `{ id, dims?, props? }`. Costs less than a report, not more: the
+   * server keeps the position it already has.
+   *
+   * **It is not a heartbeat.** A patch does not renew the device's TTL, because the
+   * position stream is what proves the vehicle is still there. A device that has
+   * already expired comes back in `unknown` rather than being resurrected.
+   *
+   * @returns `{ patched, stale, unknown }` -- `unknown` lists the ids that named
+   *        no live device.
+   */
+  async patch(name, updates, { maxBatch = DEFAULT_MAX_BATCH } = {}) {
+    checkBatchSize(maxBatch);
+    const version = localVersion();
+    const seen = new Set();
+    const list = (Array.isArray(updates) ? updates : [updates]).map(u => {
+      if (u?.lng !== undefined || u?.lat !== undefined) {
+        throw new TypeError(
+          'netcluster: patch takes { id, dims, props } and no coordinates; use report to move a device');
+      }
+      if (u?.dims === undefined && u?.props === undefined) {
+        throw new TypeError(
+          `netcluster: patch for ${JSON.stringify(u?.id)} names neither dims nor props, so it would do nothing`);
+      }
+      const fallback = seen.has(u.id) ? localVersion() : version;
+      seen.add(u.id);
+      return wirePoint(u, fallback);
+    });
+    if (list.length === 0) return { patched: 0, stale: 0, unknown: [] };
+    let patched = 0;
+    let stale = 0;
+    const unknown = [];
+    for (let i = 0; i < list.length; i += maxBatch) {
+      const ack = await this._write(`/v1/collections/${enc(name)}/positions`, {
+        method: 'POST',
+        body: list.slice(i, i + maxBatch),
+      });
+      checkAck(ack, Math.min(maxBatch, list.length - i));
+      patched += ack?.patched ?? 0;
+      stale += ack?.stale ?? 0;
+      if (Array.isArray(ack?.unknown)) unknown.push(...ack.unknown);
+    }
+    return { patched, stale, unknown };
   }
 
   /**
@@ -471,14 +562,51 @@ export class NetClusterClient {
    * Clusters in a bounding box, as a GeoJSON FeatureCollection.
    * @param {[number,number,number,number]} opts.bbox [west, south, east, north]
    */
-  getClusters(name, { bbox, zoom = 0, cat, filter, where } = {}) {
+  getClusters(name, { bbox, zoom = 0, cat, filter, where, ids } = {}) {
     const q = new URLSearchParams({ zoom: String(zoom) });
     if (bbox) q.set('bbox', bbox.join(','));
     if (cat !== undefined && cat !== null && cat !== '') q.set('cat', String(cat));
     applyFilter(q, filter);
     const w = whereTerms(where);
     if (w) q.set('where', w);
+    applyIds(q, ids);
     return this._read(`/v1/collections/${enc(name)}/clusters?${q}`);
+  }
+
+  /**
+   * Every device matching a filter, flat, in one request.
+   *
+   * The listing `getClusters` cannot be. Clusters group, and a group selected by
+   * `where` or `ids` carries no `clusterId`, so there is nothing to expand --
+   * vehicles parked in one yard are one marker with no way to reach the members.
+   * This returns them one per row, which is what a list view, a search result or a
+   * CSV export actually wants.
+   *
+   * Takes the same `filter`, `where` and `ids` as `getClusters`, plus a page.
+   * `limit` defaults to 1000 server-side: selecting the devices is cheap and
+   * serialising them is not, so ask for what you will show.
+   *
+   * @param opts.format `'compact'` for `{ devices: [{ id, lng, lat, props }] }`,
+   *        which is meaningfully smaller than GeoJSON on a large page. Omit for a
+   *        GeoJSON FeatureCollection.
+   * @param opts.props `false` to leave properties out.
+   * @returns the features or devices, plus `total` (matches, not page size),
+   *        `returned`, `limit` and `offset`.
+   */
+  listDevices(name, { bbox, cat, filter, where, ids, limit, offset, format, props } = {}) {
+    const q = new URLSearchParams();
+    if (bbox) q.set('bbox', bbox.join(','));
+    if (cat !== undefined && cat !== null && cat !== '') q.set('cat', String(cat));
+    applyFilter(q, filter);
+    const w = whereTerms(where);
+    if (w) q.set('where', w);
+    applyIds(q, ids);
+    if (limit !== undefined) q.set('limit', String(limit));
+    if (offset !== undefined) q.set('offset', String(offset));
+    if (format === 'compact') q.set('format', 'compact');
+    if (props === false) q.set('props', 'false');
+    const qs = q.toString();
+    return this._read(`/v1/collections/${enc(name)}/devices${qs ? `?${qs}` : ''}`);
   }
 
   /**
@@ -548,11 +676,13 @@ export class NetClusterClient {
       verify: bind(this.verify),
       snapshot: bind(this.snapshot),
       report: bind(this.report),
+      patch: bind(this.patch),
       reportGeoJSON: bind(this.reportGeoJSON),
       remove: bind(this.remove),
       has: bind(this.has),
       getDevice: bind(this.getDevice),
       getClusters: bind(this.getClusters),
+      listDevices: bind(this.listDevices),
       getTile: bind(this.getTile),
       getChildren: bind(this.getChildren),
       getLeaves: bind(this.getLeaves),

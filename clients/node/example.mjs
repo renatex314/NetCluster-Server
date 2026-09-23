@@ -206,6 +206,20 @@ const page2 = await fleet.getLeaves(big.properties.cluster_id, { limit: 5, offse
 p(`first 5:  ${page1.features.map((f) => f.properties.id).join(', ')}`);
 p(`next  5:  ${page2.features.map((f) => f.properties.id).join(', ')}`);
 
+// -- 9b. the flat listing -----------------------------------------------------
+h('9b. listDevices()  — the list under the map, not the markers');
+const listed = await fleet.listDevices({ bbox: BBOX, limit: 5, format: 'compact' });
+p(`${listed.returned} of ${listed.total} devices, page 1: ` +
+  listed.devices.map((d) => d.id).join(', '));
+// Clusters group and a group of matches cannot be expanded; this never groups, so
+// it is what a list view, a search result or an export reads.
+const whitelist = listed.devices.slice(0, 2).map((d) => d.id);
+const only = await fleet.listDevices({ ids: whitelist, format: 'compact', props: false });
+p(`?ids= with ${whitelist.length} named:  ${only.devices.map((d) => d.id).join(', ')}`);
+// The same whitelist restricts the markers, without a dimension declared over ids.
+const pinned = await fleet.getClusters({ bbox: BBOX, zoom: 16, ids: whitelist });
+p(`the same two as markers:  ${pinned.features.length}`);
+
 // -- 10. find one device ------------------------------------------------------
 h('10. deviceCluster()  — which marker is my vehicle inside?');
 for (const zoom of [3, 9, 16]) {
@@ -379,6 +393,12 @@ p(`after truck-2 departs ${devices(await owners.getClusters({ bbox: box, zoom: 1
 // A bare position report keeps the values it already had.
 await owners.report([{ id: 'truck-2', lng: -46.6341, lat: -23.5511 }]);
 p(`after it moves again  ${devices(await owners.getClusters({ bbox: box, zoom: 16, filter: { client: 7, status: 'enroute' } }))}`);
+
+// And a value can change without a position at all: patch() keeps the position the
+// server already has, for state that arrives from somewhere that does not track it.
+const patched = await owners.patch([{ id: 'truck-3', dims: { client: ['1'], status: 'idle' } }]);
+p(`patch() applied ${patched.patched}, unknown ${JSON.stringify(patched.unknown)}`);
+p(`truck-3 now idle      ${devices(await owners.getClusters({ bbox: box, zoom: 16, filter: { status: 'idle' } }))}`);
 await owners.drop();
 
 // -- 17. clean up -------------------------------------------------------------
