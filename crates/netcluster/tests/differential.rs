@@ -60,6 +60,7 @@ fn matches_the_javascript_implementation_device_for_device() {
                     extent: v[3].parse().unwrap(),
                     hysteresis: v[4].parse().unwrap(),
                     categories: v[5].parse().unwrap(),
+                    ..Default::default()
                 }));
                 live.clear();
                 scenarios += 1;

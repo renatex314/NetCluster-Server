@@ -31,7 +31,12 @@ pub enum Feature {
         cluster_id: u64,
         /// How many points this cluster stands for. Always `>= 2`.
         count: u32,
-        /// Centroid, exactly the arithmetic mean of the member coordinates.
+        /// Where the cluster is drawn: the arithmetic mean of the member
+        /// coordinates, held to within `CENTROID_DRIFT · r_z` of the anchor
+        /// device so neighbouring markers keep their spacing. A filtered
+        /// cluster whose anchor is not itself a match is the exact mean.
+        ///
+        /// [`CENTROID_DRIFT`]: crate::CENTROID_DRIFT
         lng: f64,
         lat: f64,
     },

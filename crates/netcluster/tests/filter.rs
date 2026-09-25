@@ -6,7 +6,7 @@
 //! exactly one slice per level -- the update cost does not grow with K. These
 //! tests check the answers are right; `bench/` checks the cost claim.
 
-use netcluster::{project, Feature, NetCluster, Options};
+use netcluster::{project, Feature, NetCluster, Options, CENTROID_DRIFT, PREC};
 use std::collections::HashMap;
 
 struct Rng(u32);
@@ -54,8 +54,10 @@ fn build(n: u64, seed: u32, k: usize) -> World {
 }
 
 /// Brute force: group the points of one category by their representative at zoom
-/// `z`, and take each group's exact centroid. That is what a filtered query must
-/// return -- no more, no less.
+/// `z`, and take each group's centroid -- held to within `CENTROID_DRIFT · r_z`
+/// of the representative's own position only when the representative is itself
+/// in the category. That is what a filtered query must return -- no more, no
+/// less.
 fn expected(w: &World, z: i32, c: u32) -> Vec<(u32, f64, f64)> {
     let mut groups: HashMap<u64, (u32, i64, i64)> = HashMap::new();
     for (&id, &cat) in &w.cat {
@@ -69,15 +71,42 @@ fn expected(w: &World, z: i32, c: u32) -> Vec<(u32, f64, f64)> {
         e.1 += p.0 as i64;
         e.2 += p.1 as i64;
     }
+    let o = w.nc.options();
+    let lim = CENTROID_DRIFT * PREC * o.radius / (o.extent * (1u64 << z) as f64);
     let mut out: Vec<(u32, f64, f64)> = groups
-        .values()
-        .map(|&(n, sx, sy)| {
-            let (lng, lat) = netcluster::unproject(sx as f64 / n as f64, sy as f64 / n as f64);
+        .iter()
+        .map(|(&rep, &(n, sx, sy))| {
+            let (mut mx, mut my) = (sx as f64 / n as f64, sy as f64 / n as f64);
+            if n > 1 && w.cat[&rep] == c {
+                let (ax, ay) = w.nc.position(rep).unwrap();
+                let (dx, dy) = (mx - ax as f64, my - ay as f64);
+                let d = (dx * dx + dy * dy).sqrt();
+                if d > lim {
+                    mx = ax as f64 + dx * lim / d;
+                    my = ay as f64 + dy * lim / d;
+                }
+            }
+            let (lng, lat) = netcluster::unproject(mx, my);
             (n, lng, lat)
         })
         .collect();
     out.sort_by(|a, b| a.partial_cmp(b).unwrap());
     out
+}
+
+fn assert_same(got: &[(u32, f64, f64)], want: &[(u32, f64, f64)], ctx: &str) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{ctx}: {} clusters, brute force says {}",
+        got.len(),
+        want.len()
+    );
+    for (a, b) in got.iter().zip(want.iter()) {
+        assert_eq!(a.0, b.0, "{ctx}: count");
+        assert!((a.1 - b.1).abs() < 1e-9, "{ctx}: lng {} vs {}", a.1, b.1);
+        assert!((a.2 - b.2).abs() < 1e-9, "{ctx}: lat {} vs {}", a.2, b.2);
+    }
 }
 
 fn actual(w: &World, z: i32, c: u32) -> Vec<(u32, f64, f64)> {
@@ -95,30 +124,11 @@ fn a_filtered_query_matches_brute_force_at_every_zoom() {
     let w = build(700, 5150, K);
     for z in 0..=w.nc.max_zoom() as i32 {
         for c in 0..K as u32 {
-            let want = expected(&w, z, c);
-            let got = actual(&w, z, c);
-            assert_eq!(
-                got.len(),
-                want.len(),
-                "z={z} cat={c}: {} clusters, brute force says {}",
-                got.len(),
-                want.len()
+            assert_same(
+                &actual(&w, z, c),
+                &expected(&w, z, c),
+                &format!("z={z} cat={c}"),
             );
-            for (a, b) in got.iter().zip(want.iter()) {
-                assert_eq!(a.0, b.0, "z={z} cat={c}: count");
-                assert!(
-                    (a.1 - b.1).abs() < 1e-9,
-                    "z={z} cat={c}: lng {} vs {}",
-                    a.1,
-                    b.1
-                );
-                assert!(
-                    (a.2 - b.2).abs() < 1e-9,
-                    "z={z} cat={c}: lat {} vs {}",
-                    a.2,
-                    b.2
-                );
-            }
         }
     }
 }
@@ -225,6 +235,145 @@ fn a_sparse_filter_stays_correct() {
     assert!(nc.get_clusters(WORLD, 5.0, 0).is_empty());
 }
 
+/// A filtered cluster whose anchor is not in the category is drawn on its real
+/// mass, not pulled toward that anchor. Otherwise a sparse filter's marker
+/// would sit next to an unrelated device, and move by up to `2·r_z` between
+/// adjacent zooms while nothing changed (issue #1).
+#[test]
+fn a_filtered_cluster_is_never_pulled_toward_a_non_member() {
+    let o = Options {
+        categories: 2,
+        ..Default::default()
+    };
+    let mut nc = NetCluster::new(o.clone());
+    // one noise device, then two matching devices well past the drift bound
+    // but still inside the cluster radius at z, on the same side of it.
+    let z = 10;
+    let r = PREC * o.radius / (o.extent * (1u64 << z) as f64);
+    let (cx, cy) = project(-46.63, -23.55);
+    let off = (0.8 * r) as i32;
+    nc.insert_projected(1, cx, cy, 0);
+    nc.insert_projected(2, cx + off, cy, 1);
+    nc.insert_projected(3, cx + off, cy + off / 4, 1);
+    nc.verify().unwrap();
+
+    let feats = nc.get_clusters(WORLD, z as f64, 1);
+    assert_eq!(
+        feats.len(),
+        1,
+        "the two matching devices must cluster at z={z}"
+    );
+    let f = &feats[0];
+    assert_eq!(f.count(), 2);
+    let (mx, my) = project(f.lng(), f.lat());
+    let (wx, wy) = (cx + off, cy + off / 8);
+    assert!(
+        (mx - wx).abs() <= 1 && (my - wy).abs() <= 1,
+        "filtered marker at ({mx},{my}), true centroid ({wx},{wy}), anchor ({cx},{cy})"
+    );
+
+    // the unfiltered marker, whose anchor is a member, keeps the drift bound
+    let all = nc.get_clusters(WORLD, z as f64, -1);
+    assert_eq!(all.len(), 1);
+    let (ux, uy) = project(all[0].lng(), all[0].lat());
+    let d = (((ux - cx) as f64).powi(2) + ((uy - cy) as f64).powi(2)).sqrt();
+    assert!(
+        d <= CENTROID_DRIFT * r + 1.0,
+        "unfiltered marker drifted {d} from its anchor, bound is {}",
+        CENTROID_DRIFT * r
+    );
+}
+
+/// The reported symptom: a sparse filter's marker jumping between adjacent
+/// zooms while its members stayed together. Whenever a filtered group is the
+/// same set at `z` and `z + 1` and neither level's anchor is a member, both
+/// levels draw the exact centroid, so the marker must not move at all.
+#[test]
+fn a_filtered_cluster_holds_still_across_zooms_while_it_stays_whole() {
+    let mut rng = Rng(99);
+    let mut nc = NetCluster::new(Options {
+        categories: 50,
+        ..Default::default()
+    });
+    let mut members = Vec::new();
+    let mut cat = HashMap::new();
+    for i in 0..6000u64 {
+        let (lng, lat) = (
+            -46.63 + (rng.next() - 0.5) * 0.4,
+            -23.55 + (rng.next() - 0.5) * 0.4,
+        );
+        let c = if rng.next() < 0.02 {
+            7
+        } else {
+            1 + (rng.next() * 40.0) as u32 % 40
+        };
+        nc.insert_with_category(i, lng, lat, c);
+        cat.insert(i, c);
+        if c == 7 {
+            members.push(i);
+        }
+    }
+    nc.verify().unwrap();
+
+    // members of category 7 grouped by representative slot, per zoom
+    let groups = |z: i32| -> HashMap<u32, Vec<u64>> {
+        let mut g: HashMap<u32, Vec<u64>> = HashMap::new();
+        for &id in &members {
+            g.entry(nc.representative_slot(id, z).unwrap())
+                .or_default()
+                .push(id);
+        }
+        g
+    };
+    let drawn = |z: i32| -> HashMap<u32, (f64, f64)> {
+        nc.get_clusters(WORLD, z as f64, 7)
+            .into_iter()
+            .filter_map(|f| match f {
+                Feature::Cluster {
+                    cluster_id,
+                    lng,
+                    lat,
+                    ..
+                } => Some(((cluster_id / 32) as u32, (lng, lat))),
+                Feature::Point { .. } => None,
+            })
+            .collect()
+    };
+
+    let mut held = 0;
+    for z in 0..nc.max_zoom() as i32 {
+        let (ga, gb) = (groups(z), groups(z + 1));
+        let (da, db) = (drawn(z), drawn(z + 1));
+        for (&sa, ma) in &ga {
+            if ma.len() < 2 {
+                continue;
+            }
+            let sb = nc.representative_slot(ma[0], z + 1).unwrap();
+            if gb[&sb] != *ma {
+                continue; // the group split, or gained members: allowed to move
+            }
+            let anchor_is_member = |s: u32| {
+                // the anchor's external id is whichever member has it as its
+                // own level-(max) representative, if any
+                ma.iter()
+                    .any(|&id| nc.representative_slot(id, nc.max_zoom() as i32 + 1) == Some(s))
+            };
+            if anchor_is_member(sa) || anchor_is_member(sb) {
+                continue; // bounded to a member: may legitimately shift
+            }
+            let (pa, pb) = (da[&sa], db[&sb]);
+            assert!(
+                (pa.0 - pb.0).abs() < 1e-9 && (pa.1 - pb.1).abs() < 1e-9,
+                "z={z}->{}: a whole filtered group of {} moved from {pa:?} to {pb:?}",
+                z + 1,
+                ma.len()
+            );
+            held += 1;
+        }
+    }
+    assert!(held > 20, "only {held} whole cross-zoom groups exercised");
+}
+
 /// Moves and removals must keep the slices in step with the totals. `verify`
 /// checks that directly; this drives enough churn to make it meaningful.
 #[test]
@@ -267,11 +416,198 @@ fn slices_survive_churn() {
     // and the answers are still right after all that
     for z in [0, 5, 11, 16] {
         for c in 0..K as u32 {
-            assert_eq!(
-                actual(&w, z, c),
-                expected(&w, z, c),
-                "z={z} cat={c} after churn"
+            assert_same(
+                &actual(&w, z, c),
+                &expected(&w, z, c),
+                &format!("z={z} cat={c} after churn"),
             );
         }
+    }
+}
+
+// ------------------------------------------- several cells per device -------
+//
+// The core knows nothing about dimension names: a caller encodes its own
+// combinations and hands over cell indices. These tests use the same encoding the
+// server does -- one block per filter shape -- so a device that belongs to two
+// clients and one status occupies five cells.
+
+const CLIENTS: u32 = 6;
+const STATUSES: u32 = 3;
+/// shapes: [client] at 0, [status] at CLIENTS, [client, status] after that
+const BASE_STATUS: u32 = CLIENTS;
+const BASE_BOTH: u32 = CLIENTS + STATUSES;
+const CELLS: usize = (CLIENTS + STATUSES + CLIENTS * STATUSES) as usize;
+
+fn cells_of(clients: &[u32], status: u32, out: &mut Vec<u32>) {
+    out.clear();
+    for &c in clients {
+        out.push(c);
+        out.push(BASE_BOTH + c * STATUSES + status);
+    }
+    out.push(BASE_STATUS + status);
+}
+
+fn total(nc: &NetCluster, zoom: f64, cell: i32) -> i32 {
+    nc.get_clusters(WORLD, zoom, cell)
+        .iter()
+        .map(|f| match f {
+            Feature::Cluster { count, .. } => *count as i32,
+            Feature::Point { .. } => 1,
+        })
+        .sum()
+}
+
+fn multi_world(dense_cells: usize) -> (NetCluster, HashMap<u64, (Vec<u32>, u32)>) {
+    let mut rng = Rng(9876);
+    let mut nc = NetCluster::new(Options {
+        cells: CELLS,
+        max_cells_per_device: 8,
+        dense_cells,
+        ..Default::default()
+    });
+    let mut truth: HashMap<u64, (Vec<u32>, u32)> = HashMap::new();
+    let mut buf = Vec::new();
+    for i in 0..600u64 {
+        let lng = -46.63 + (rng.next() - 0.5) * 0.6;
+        let lat = -23.55 + (rng.next() - 0.5) * 0.6;
+        let a = (rng.next() * CLIENTS as f64) as u32 % CLIENTS;
+        let b = (rng.next() * CLIENTS as f64) as u32 % CLIENTS;
+        let clients: Vec<u32> = if a == b { vec![a] } else { vec![a, b] };
+        let status = (rng.next() * STATUSES as f64) as u32 % STATUSES;
+        cells_of(&clients, status, &mut buf);
+        let (x, y) = project(lng, lat);
+        nc.insert_projected_cells(i, x, y, &buf);
+        truth.insert(i, (clients, status));
+    }
+    (nc, truth)
+}
+
+#[test]
+fn a_device_can_hold_several_values_and_filters_combine() {
+    for dense_cells in [64, 0] {
+        let (nc, truth) = multi_world(dense_cells);
+        assert_eq!(nc.options().dense_cells > 0, dense_cells > 0);
+        nc.verify().expect("aggregates must agree with the tree");
+
+        for z in [0.0, 6.0, 11.0, 16.0] {
+            for c in 0..CLIENTS {
+                let want = truth.values().filter(|(cl, _)| cl.contains(&c)).count() as i32;
+                assert_eq!(total(&nc, z, c as i32), want, "client {c} at z{z}");
+            }
+            for s in 0..STATUSES {
+                let want = truth.values().filter(|(_, st)| *st == s).count() as i32;
+                assert_eq!(
+                    total(&nc, z, (BASE_STATUS + s) as i32),
+                    want,
+                    "status {s} at z{z}"
+                );
+            }
+            // the conjunction, which marginal counts cannot answer
+            for c in 0..CLIENTS {
+                for s in 0..STATUSES {
+                    let want = truth
+                        .values()
+                        .filter(|(cl, st)| cl.contains(&c) && *st == s)
+                        .count() as i32;
+                    assert_eq!(
+                        total(&nc, z, (BASE_BOTH + c * STATUSES + s) as i32),
+                        want,
+                        "client {c} and status {s} at z{z}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_standing_device_changes_filters_when_its_values_change() {
+    let mut nc = NetCluster::new(Options {
+        cells: CELLS,
+        max_cells_per_device: 8,
+        ..Default::default()
+    });
+    let (x, y) = project(-46.63, -23.55);
+    let mut buf = Vec::new();
+    cells_of(&[2], 0, &mut buf);
+    nc.insert_projected_cells(1, x, y, &buf);
+    assert_eq!(total(&nc, 16.0, BASE_STATUS as i32), 1);
+
+    // identical position, different status
+    cells_of(&[2], 1, &mut buf);
+    nc.move_to_projected_cells(1, x, y, Some(&buf));
+    assert_eq!(
+        total(&nc, 16.0, BASE_STATUS as i32),
+        0,
+        "left the old status"
+    );
+    assert_eq!(
+        total(&nc, 16.0, (BASE_STATUS + 1) as i32),
+        1,
+        "joined the new status"
+    );
+    assert_eq!(total(&nc, 16.0, 2), 1, "client is unchanged");
+    // and the conjunction moved with it
+    assert_eq!(total(&nc, 16.0, (BASE_BOTH + 2 * STATUSES) as i32), 0);
+    assert_eq!(total(&nc, 16.0, (BASE_BOTH + 2 * STATUSES + 1) as i32), 1);
+    nc.verify().expect("aggregates must survive a re-file");
+
+    // a bare position report leaves the values alone
+    let (x2, y2) = project(-46.64, -23.56);
+    nc.move_to_projected(1, x2, y2);
+    assert_eq!(total(&nc, 16.0, (BASE_STATUS + 1) as i32), 1);
+    nc.verify().unwrap();
+}
+
+#[test]
+fn co_located_devices_are_all_reachable_by_filter() {
+    // 20 vehicles sharing one coordinate cluster at every zoom, so the filter has
+    // to reach inside the cluster rather than read the marker's own properties.
+    let mut nc = NetCluster::new(Options {
+        cells: CELLS,
+        max_cells_per_device: 8,
+        ..Default::default()
+    });
+    let (x, y) = project(-46.6333, -23.5505);
+    let mut buf = Vec::new();
+    cells_of(&[4], 1, &mut buf);
+    for i in 0..20u64 {
+        nc.insert_projected_cells(i, x, y, &buf);
+    }
+    cells_of(&[5], 1, &mut buf);
+    nc.insert_projected_cells(99, x, y, &buf);
+    assert_eq!(total(&nc, 16.0, 4), 20);
+    assert_eq!(total(&nc, 16.0, 5), 1);
+    assert_eq!(total(&nc, 16.0, -1), 21);
+}
+
+#[test]
+fn the_table_empties_when_the_index_does() {
+    let mut nc = NetCluster::new(Options {
+        cells: CELLS,
+        max_cells_per_device: 8,
+        dense_cells: 0,
+        ..Default::default()
+    });
+    let mut buf = Vec::new();
+    for round in 0..3u32 {
+        for i in 0..400u64 {
+            let (x, y) = project(-46.6 + i as f64 * 0.001, -23.5 + i as f64 * 0.001);
+            cells_of(
+                &[(i as u32 + round) % CLIENTS],
+                i as u32 % STATUSES,
+                &mut buf,
+            );
+            nc.insert_projected_cells(i, x, y, &buf);
+        }
+        for i in 0..400u64 {
+            nc.remove(i);
+        }
+        assert_eq!(
+            nc.agg_entries(),
+            0,
+            "round {round}: entries survived an empty index"
+        );
     }
 }

@@ -89,6 +89,12 @@ Each node carries `K` slices instead of one, but a point belongs to exactly one
 category, so an update still touches exactly one slice per level — **update cost
 does not grow with K**.
 
+An unfiltered cluster is drawn within `CENTROID_DRIFT · r_z` of its anchor so
+neighbouring markers keep their spacing; see the constant's docs. A filtered
+cluster's anchor may not be in the category, so it is bounded only when the
+anchor is a match and otherwise drawn exactly on the centroid of its matching
+members — a marker is never pulled toward a device the filter excludes.
+
 ## How it works
 
 For every zoom level `z`, the index maintains a *net* of the live point set at
