@@ -32,7 +32,7 @@ pub const NO_MATCH: i32 = -2;
 use netcluster::{Feature, NetCluster, Options};
 use serde_json::value::RawValue;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,6 +82,10 @@ pub struct Config {
     /// Memory is bounded by devices times this number, so it is a real limit and
     /// not a formality: at a million devices, every kilobyte allowed here is a
     /// gigabyte you have promised to have.
+    ///
+    /// A repeated `PUT` may change this on a live collection; what is in force is
+    /// [`Collection::max_props_bytes`], not this field. Lowering it does not evict
+    /// what was already accepted.
     pub max_props_bytes: usize,
     /// Property fields that can be searched with `?where=`.
     ///
@@ -95,6 +99,10 @@ pub struct Config {
     ///
     /// You almost always want this set. A vehicle that stops reporting does not
     /// stop existing in the index, and clusters quietly fill with ghosts.
+    ///
+    /// A repeated `PUT` may change this on a live collection; what is in force is
+    /// [`Collection::ttl_seconds`], not this field. Shortening it can sweep
+    /// devices on the very next pass, which is the point.
     pub ttl_seconds: u64,
 }
 
@@ -251,7 +259,22 @@ impl Default for Page {
 
 pub struct Collection {
     pub name: String,
+    /// What this collection was created with.
+    ///
+    /// Two of its numbers can be adopted later from a repeated `PUT`, so they are
+    /// a record of the declaration and not of what is in force: read those
+    /// through [`Collection::ttl_seconds`] and [`Collection::max_props_bytes`].
+    /// Everything else here is frozen -- see [`Config::frozen_conflict`].
     pub config: Config,
+    /// The limits currently in force.
+    ///
+    /// Atomics rather than a lock because every reader is a `&self` query on a
+    /// collection shared by N reader threads, and one of the two is read on every
+    /// report. Relaxed ordering throughout: a report that crosses the instant a
+    /// new limit lands may use either value, which is the same latitude a report
+    /// arriving a millisecond earlier already had.
+    ttl_seconds: AtomicU64,
+    max_props_bytes: AtomicUsize,
     /// Resolved filter schema. Derived from `config`, kept beside it so a query
     /// resolves names to a cell without rebuilding it every time.
     pub schema: Schema,
@@ -435,11 +458,76 @@ pub struct CollectionStats {
     /// part of the index whose size you control from outside.
     pub props_bytes: usize,
     pub max_props_bytes: usize,
+    /// Property fields `?where=` can search.
+    ///
+    /// Reported because it is the one part of the configuration a running
+    /// collection cannot adopt: a deployment that adds a searchable field has to
+    /// be able to confirm the collection it is talking to actually has it,
+    /// without reading the server's source to find out where to look.
+    pub text: Vec<String>,
     /// What the searchable fields cost, so a `?where=` collection can be sized.
     pub text_bytes: usize,
 }
 
 impl Config {
+    /// The first thing a live collection with this config cannot become to match
+    /// `other`, or `None` when it can.
+    ///
+    /// Everything named here shapes the index at construction: the tree's levels
+    /// and radii, the cell table every aggregate count hangs off, the per-device
+    /// text slots a `?where=` scan reads. None of it can move under a running
+    /// collection, so a repeated `PUT` that changes one is a conflict rather than
+    /// an idempotent no-op.
+    ///
+    /// Written as a destructure so the compiler refuses a new `Config` field
+    /// until it has been classified as frozen or adoptable. That is the whole
+    /// point: this check used to be a hand-maintained chain of comparisons, and
+    /// four fields had simply never been added to it -- so a deployment that
+    /// changed `text` was told `created: false`, kept the old geometry, and lost
+    /// substring search with no error anywhere.
+    pub fn frozen_conflict(&self, other: &Config) -> Option<&'static str> {
+        let Config {
+            max_zoom,
+            radius,
+            extent,
+            hysteresis,
+            categories,
+            dimensions,
+            filters,
+            text,
+            // Adoptable: read when a report arrives and when the sweep runs, and
+            // nowhere else, so nothing in the tree is derived from them. Applied
+            // by `Collection::adopt` instead of refused here.
+            max_props_bytes: _,
+            ttl_seconds: _,
+        } = other;
+        if self.max_zoom != *max_zoom {
+            return Some("max_zoom");
+        }
+        if self.radius != *radius {
+            return Some("radius");
+        }
+        if self.extent != *extent {
+            return Some("extent");
+        }
+        if self.hysteresis != *hysteresis {
+            return Some("hysteresis");
+        }
+        if self.categories != *categories {
+            return Some("categories");
+        }
+        if self.dimensions != *dimensions {
+            return Some("dimensions");
+        }
+        if self.filters != *filters {
+            return Some("filters");
+        }
+        if self.text != *text {
+            return Some("text");
+        }
+        None
+    }
+
     /// Resolve the declared filters, or say why they cannot be.
     ///
     /// `categories` is the older spelling of one dimension named `cat`; it is
@@ -499,6 +587,8 @@ impl Collection {
             .expect("value 0 exists in every declared dimension");
         Collection {
             name: name.to_string(),
+            ttl_seconds: AtomicU64::new(config.ttl_seconds),
+            max_props_bytes: AtomicUsize::new(config.max_props_bytes),
             schema,
             default_cells,
             interner: RwLock::new(interner),
@@ -512,7 +602,7 @@ impl Collection {
             }),
             write_gate: Arc::new(tokio::sync::Mutex::new(())),
             snapshot_gate: std::sync::Mutex::new(()),
-            live_devices: std::sync::atomic::AtomicUsize::new(0),
+            live_devices: AtomicUsize::new(0),
             created_ms: now_ms(),
             ingested: AtomicU64::new(0),
             queries: AtomicU64::new(0),
@@ -524,6 +614,52 @@ impl Collection {
             stale_reports: AtomicU64::new(0),
             patched: AtomicU64::new(0),
             repairs: AtomicU64::new(0),
+        }
+    }
+
+    /// How long a device may stay silent before the sweep drops it. 0 disables
+    /// expiry. What is in force, which a repeated `PUT` may have changed.
+    pub fn ttl_seconds(&self) -> u64 {
+        self.ttl_seconds.load(Ordering::Relaxed)
+    }
+
+    /// Largest per-device properties blob accepted, in bytes. What is in force.
+    pub fn max_props_bytes(&self) -> usize {
+        self.max_props_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Take on the limits declared by a repeated `PUT`, naming what moved.
+    ///
+    /// Deliberately not a general "apply this config": the caller has already
+    /// established with [`Config::frozen_conflict`] that everything the index is
+    /// built from is unchanged, and these two are all that is left. Returning the
+    /// names rather than a bool is what lets the response say what it did, so a
+    /// deployment can see its change land instead of inferring it.
+    pub fn adopt(&self, cfg: &Config) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.ttl_seconds.swap(cfg.ttl_seconds, Ordering::Relaxed) != cfg.ttl_seconds {
+            changed.push("ttl_seconds");
+        }
+        if self
+            .max_props_bytes
+            .swap(cfg.max_props_bytes, Ordering::Relaxed)
+            != cfg.max_props_bytes
+        {
+            changed.push("max_props_bytes");
+        }
+        changed
+    }
+
+    /// The configuration as it stands, adopted limits included.
+    ///
+    /// This, not `config`, is what a snapshot records. Writing the declaration
+    /// instead would quietly undo an adopted TTL on the next restart -- the same
+    /// silent reversion this whole path exists to prevent.
+    pub fn effective_config(&self) -> Config {
+        Config {
+            ttl_seconds: self.ttl_seconds(),
+            max_props_bytes: self.max_props_bytes(),
+            ..self.config.clone()
         }
     }
 
@@ -552,8 +688,8 @@ impl Collection {
         // Before any record: the cells about to be restored are indices into this
         // table, so it has to be the one that produced them.
         *c.interner.write().unwrap() = Interner::restore(&c.schema, labels);
-        let cutoff = if c.config.ttl_seconds > 0 {
-            now_ms().saturating_sub(c.config.ttl_seconds * 1000)
+        let cutoff = if c.ttl_seconds() > 0 {
+            now_ms().saturating_sub(c.ttl_seconds() * 1000)
         } else {
             0
         };
@@ -654,7 +790,7 @@ impl Collection {
         let records = self.export();
         let meta = crate::snapshot::Meta {
             name: self.name.clone(),
-            config: self.config.clone(),
+            config: self.effective_config(),
             labels: self.interner.read().unwrap().labels(),
         };
         match crate::snapshot::write(path, &meta, &records) {
@@ -877,7 +1013,7 @@ impl Collection {
     /// Properties a report or patch may carry.
     fn check_props(&self, id: &str, props: Option<&RawValue>) -> Result<(), String> {
         let Some(p) = props else { return Ok(()) };
-        let cap = self.config.max_props_bytes;
+        let cap = self.max_props_bytes();
         let raw = p.get();
         // GeoJSON properties is an object. serde already proved the text is
         // valid JSON, so the first character settles the type without a parse.
@@ -1404,10 +1540,11 @@ impl Collection {
     /// in small batches. A single write lock around the whole sweep would stall
     /// every query for as long as the sweep took.
     pub fn sweep(&self) -> usize {
-        if self.config.ttl_seconds == 0 {
+        let ttl = self.ttl_seconds();
+        if ttl == 0 {
             return 0;
         }
-        let cutoff = now_ms().saturating_sub(self.config.ttl_seconds * 1000);
+        let cutoff = now_ms().saturating_sub(ttl * 1000);
         let victims: Vec<u64> = {
             let st = self.state.read().unwrap();
             st.ids
@@ -1466,7 +1603,7 @@ impl Collection {
             max_zoom: self.config.max_zoom,
             radius: self.config.radius,
             categories: self.config.categories.clone(),
-            ttl_seconds: self.config.ttl_seconds,
+            ttl_seconds: self.ttl_seconds(),
             memory_bytes: st.index.memory_bytes(),
             grid_entries: st.index.grid_entries(),
             centers_per_level: st.index.centers_per_level(),
@@ -1494,7 +1631,8 @@ impl Collection {
                 .iter()
                 .filter_map(|p| p.as_ref().map(|v| v.get().len()))
                 .sum(),
-            max_props_bytes: self.config.max_props_bytes,
+            max_props_bytes: self.max_props_bytes(),
+            text: self.config.text.clone(),
             text_bytes: st
                 .ids
                 .text

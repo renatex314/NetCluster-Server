@@ -545,7 +545,23 @@ cluster boundary flickers between two, and 0.25 lets the existing assignment
 survive 25% past the strict constraint.
 
 Geometry is fixed once a collection exists — `create()` is idempotent for the same
-values and rejects **409** for different ones. Full detail in the
+values and rejects **409** (`code: 'config_conflict'`) for a different `maxZoom`,
+`radius`, `extent`, `hysteresis`, `categories`, `dimensions`, `filters` or `text`,
+naming the field that differs. To change one of those, drop and recreate.
+
+`ttlSeconds` and `maxPropsBytes` are not geometry: a later `create()` adopts them
+on the running collection and tells you what moved, so raising a TTL does not cost
+you every device in the collection.
+
+```js
+const r = await fleet.create({ ...config, ttlSeconds: 604800 });
+r.created;  // false
+r.adopted;  // ['ttl_seconds']
+```
+
+A rejected `create()` adopts nothing. `stats()` reports `ttl_seconds`,
+`max_props_bytes` and `text` as they actually stand, which is how a deploy
+confirms its configuration took rather than assuming it did. Full detail in the
 [server README](https://github.com/renatex314/NetCluster-Server#tuning-the-clustering).
 
 ## Reporting a live fleet
@@ -625,7 +641,7 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 
 | | |
 |---|---|
-| `createCollection(name, config)` | idempotent; rejects 409 on a different geometry. `dimensions` / `filters` declare what you can [filter](#filtering) on |
+| `createCollection(name, config)` | idempotent; rejects 409 on a different geometry, adopts a new `ttlSeconds` / `maxPropsBytes`. `dimensions` / `filters` declare what you can [filter](#filtering) on |
 | `dropCollection(name)` | |
 | `listCollections()` / `stats(name)` | |
 | `report(name, points, { maxBatch })` | upserts; chunked. A point may carry `dims` and `props` |

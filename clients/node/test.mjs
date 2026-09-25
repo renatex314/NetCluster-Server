@@ -7,7 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { NetClusterClient, NetClusterError, DEFAULT_MAX_BATCH } from './index.js';
 
@@ -688,6 +688,55 @@ await test('where searches text, and scans to do it', async () => {
   const st = await fleet.stats();
   assert.ok(st.text_bytes > 0, 'stats should report what the text costs');
   await fleet.drop();
+});
+
+// Issue #7: a repeated create used to compare six of the ten config fields, so a
+// deploy that added `text` or raised `ttlSeconds` was answered `created: false`
+// and kept the old config with no error anywhere. The halves are tested together
+// because the bug was in the seam: what must be refused, and what must be applied.
+await test('a repeated create adopts the limits and refuses a new geometry', async () => {
+  const c = nc.collection('reconfigured');
+  const config = { ttlSeconds: 3600, maxPropsBytes: 512, text: ['plate'] };
+  assert.equal((await c.create(config)).created, true);
+
+  const same = await c.create(config);
+  assert.equal(same.created, false);
+  assert.deepEqual(same.adopted, [], 'nothing moved, so nothing to report');
+
+  const moved = await c.create({ ...config, ttlSeconds: 604800 });
+  assert.deepEqual(moved.adopted, ['ttl_seconds']);
+  assert.equal(moved.collection.ttl_seconds, 604800);
+  assert.equal((await c.stats()).ttl_seconds, 604800, 'the adopted TTL must be in force');
+
+  const err = await c.create({ ...config, text: ['plate', 'driver'] }).then(
+    () => null,
+    (e) => e
+  );
+  assert.ok(err, 'adding a searchable field to a live collection must not be accepted');
+  assert.equal(err.status, 409);
+  assert.equal(err.body.code, 'config_conflict');
+  assert.match(err.body.error, /different text/, 'the 409 must name the field');
+  assert.deepEqual((await c.stats()).text, ['plate'], 'the refused text must not have landed');
+  await c.drop();
+});
+
+/**
+ * `CollectionStats` is filled by the server, not by client code, so the method
+ * drift checks in test-unit.mjs cannot see it -- and it had in fact already
+ * drifted: `patched` shipped in 0.8.1 without ever being declared. Only a live
+ * response can catch this, which is why it lives here.
+ */
+await test('index.d.ts declares every field the server puts in stats', async () => {
+  const dts = readFileSync(join(HERE, 'index.d.ts'), 'utf8');
+  const at = dts.indexOf('export interface CollectionStats {');
+  assert.ok(at !== -1, 'index.d.ts has no CollectionStats interface');
+  const body = dts.slice(at, dts.indexOf('\n}', at));
+  const declared = new Set(
+    [...body.matchAll(/^ {2}([a-z][A-Za-z0-9_]*)\??:/gm)].map((m) => m[1])
+  );
+  const missing = Object.keys(await fleet.stats()).filter((k) => !declared.has(k));
+  assert.deepEqual(missing, [],
+    `the server returns ${missing.join(', ')}, which index.d.ts never declares`);
 });
 
 await test('example.mjs exercises every public method', async () => {

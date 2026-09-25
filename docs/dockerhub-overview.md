@@ -125,7 +125,10 @@ clusters; raise `hysteresis` if markers reshuffle while vehicles move — at 0 a
 vehicle idling on a cluster boundary flickers between two.
 
 Geometry is fixed once a collection exists: re-creating with the same values is
-idempotent, different values return 409.
+idempotent, a different one returns 409 naming the field that differs.
+`ttl_seconds` and `max_props_bytes` are not geometry — nothing in the tree is
+built from them — so a repeated create adopts them in place and lists what it
+changed in `adopted`.
 
 ## Configuration
 

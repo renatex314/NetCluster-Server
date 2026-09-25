@@ -62,11 +62,19 @@ export interface CollectionConfig {
   filters?: string[][];
   /**
    * Property fields that `where` can search. Each costs one string per device,
-   * extracted from `props` at ingest, so a scan never parses JSON. Adding one
-   * later means recreating the collection.
+   * extracted from `props` at ingest, so a scan never parses JSON.
+   *
+   * Frozen once the collection exists: adding one later is a 409, not a silent
+   * no-op, and means recreating the collection. `stats().text` is what a running
+   * collection actually has.
    */
   text?: string[];
-  /** Drop a device that has not reported for this long. 0 disables expiry. */
+  /**
+   * Drop a device that has not reported for this long. 0 disables expiry.
+   *
+   * Not geometry: a later `create()` adopts a new value on the running
+   * collection and reports it in `adopted`.
+   */
   ttlSeconds?: number;
   /**
    * Largest per-device `props` blob accepted, in bytes. Default 1024; 0 refuses
@@ -74,6 +82,9 @@ export interface CollectionConfig {
    *
    * Memory is bounded by devices times this number, so it is a real limit: at a
    * million devices every kilobyte allowed here is a gigabyte promised.
+   *
+   * Not geometry: a later `create()` adopts a new value on the running
+   * collection. Lowering it does not evict what was already accepted.
    */
   maxPropsBytes?: number;
 }
@@ -203,6 +214,8 @@ export interface CollectionStats {
   restored: number;
   /** Reports rejected because their source version was older than the stored one. */
   stale_reports: number;
+  /** Metadata-only updates applied, as opposed to position reports. */
+  patched: number;
   /** Defensive index rebuilds after a detected materialized-view mismatch. */
   repairs: number;
   /** Number of currently interned dynamic values per dimension. */
@@ -212,8 +225,27 @@ export interface CollectionStats {
   /** Bytes of device properties currently held. */
   props_bytes: number;
   max_props_bytes: number;
+  /**
+   * Property fields `where` can search, as the collection actually has them.
+   *
+   * The one part of the configuration a running collection cannot adopt, so this
+   * is how a deploy confirms a `text` change took.
+   */
+  text: string[];
   /** Bytes held by the searchable text fields. */
   text_bytes: number;
+}
+
+/** What a `create()` did. */
+export interface CreateResult {
+  created: boolean;
+  /**
+   * Which limits the existing collection took on from this call: `ttl_seconds`,
+   * `max_props_bytes`, or neither. Absent when the collection was just created,
+   * since nothing was adopted.
+   */
+  adopted?: string[];
+  collection: CollectionStats;
 }
 
 export interface Health {
@@ -439,7 +471,7 @@ export interface ReportGeoJSONOptions {
 /** A collection name bound into every call. */
 export interface BoundCollection {
   readonly name: string;
-  create(config?: CollectionConfig): Promise<unknown>;
+  create(config?: CollectionConfig): Promise<CreateResult>;
   drop(): Promise<unknown>;
   stats(): Promise<CollectionStats>;
   verify(): Promise<{ ok: boolean; detail?: string; violation?: string }>;
@@ -472,7 +504,7 @@ export declare class NetClusterClient {
   health(): Promise<Health>;
   listCollections(): Promise<{ collections: CollectionStats[] }>;
 
-  createCollection(name: string, config?: CollectionConfig): Promise<unknown>;
+  createCollection(name: string, config?: CollectionConfig): Promise<CreateResult>;
   dropCollection(name: string): Promise<unknown>;
   stats(name: string): Promise<CollectionStats>;
   verify(name: string): Promise<{ ok: boolean; detail?: string; violation?: string }>;

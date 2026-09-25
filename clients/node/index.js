@@ -321,8 +321,12 @@ export class NetClusterClient {
   // ---------------------------------------------------------- collections --
 
   /**
-   * Create a collection. Idempotent for the same geometry; rejects with a 409 if
-   * one already exists with a different one.
+   * Create a collection.
+   *
+   * Idempotent for the same geometry; rejects with a 409 (`config_conflict`) if
+   * one already exists with a different one, naming the field that differs.
+   * `ttlSeconds` and `maxPropsBytes` are not geometry: an existing collection
+   * adopts them and the result lists what moved in `adopted`.
    */
   createCollection(name, config = {}) {
     const body = {};

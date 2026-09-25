@@ -323,7 +323,7 @@ cmd('create', {
          '  they arrive, and N is how many distinct ones may coexist, not how large an id\n' +
          '  may get. A shape is a combination a query may name; each is stored separately,\n' +
          '  so declare the ones your UI offers and no more. Default: each on its own.',
-  blurb: 'create a collection (idempotent; 409 if the geometry differs)',
+  blurb: 'create a collection (idempotent; 409 if the geometry differs, adopts a new --ttl)',
   async run(nc, [name], flags) {
     if (!name) throw new UsageError('create needs a collection name');
     const cfg = {};
@@ -367,7 +367,12 @@ cmd('create', {
     }
     const r = await nc.createCollection(name, cfg);
     if (out(r, flags)) return;
-    console.log(r.created ? `  ${green('created')} ${name}` : `  ${dim('exists')}  ${name} (same geometry)`);
+    if (r.created) { console.log(`  ${green('created')} ${name}`); return; }
+    // `adopted` names the limits an existing collection took on from this call.
+    // Saying "same geometry" for a create that just moved the TTL would hide the
+    // one thing the caller wanted to know.
+    const moved = r.adopted?.length ? `adopted ${r.adopted.join(', ')}` : 'same config';
+    console.log(`  ${dim('exists')}  ${name} (${moved})`);
   },
 });
 
@@ -403,6 +408,7 @@ cmd('stats', {
       ['grid entries', n(s.grid_entries)],
       ['geometry', `radius ${s.radius}, maxZoom ${s.max_zoom}`],
       ['categories', s.categories.length ? s.categories.join(', ') : dim('none')],
+      ['searchable', s.text?.length ? s.text.join(', ') : dim('none')],
       ['ttl', s.ttl_seconds ? `${s.ttl_seconds}s` : dim('disabled')],
       ['reports', n(s.ingested)],
       ['queries', n(s.queries)],

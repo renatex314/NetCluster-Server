@@ -470,22 +470,27 @@ async fn create_collection(
             // Idempotent for the same geometry, an error for a different one. Silently
             // keeping the old geometry would mean two deployments disagreeing about
             // what a cluster means while both believe they configured it.
-            let e = &existing.config;
-            if e.max_zoom != cfg.max_zoom
-                || e.radius != cfg.radius
-                || e.extent != cfg.extent
-                || e.categories != cfg.categories
-                || e.dimensions != cfg.dimensions
-                || e.filters != cfg.filters
-            {
+            //
+            // `frozen_conflict` decides which is which, and names the field, so a
+            // deploy that changes one gets told what it was rather than having to
+            // diff its config against the server's by hand.
+            if let Some(field) = existing.config.frozen_conflict(&cfg) {
                 return Err(ApiError::conflict(format!(
-                    "collection {name:?} already exists with a different geometry; \
-                 drop it or use another name"
-                )));
+                    "collection {name:?} already exists with a different {field}; \
+                     drop it or use another name"
+                ))
+                .code("config_conflict"));
             }
-            return Ok(Json(
-                json!({ "created": false, "collection": existing.stats() }),
-            ));
+            // The limits are not geometry: nothing in the tree is built from them,
+            // so a PUT that only moves one applies it rather than refusing. Which
+            // is the useful answer -- the alternative for raising a TTL would be
+            // dropping the collection and every device in it.
+            let adopted = existing.adopt(&cfg);
+            return Ok(Json(json!({
+                "created": false,
+                "adopted": adopted,
+                "collection": existing.stats(),
+            })));
         }
         Ok(Json(
             json!({ "created": true, "collection": existing.stats() }),

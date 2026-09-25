@@ -203,7 +203,7 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 
 | | |
 |---|---|
-| `PUT /v1/collections/{name}` | create; idempotent, 409 on a different geometry |
+| `PUT /v1/collections/{name}` | create; idempotent, 409 on a different geometry, adopts a new `ttl_seconds` / `max_props_bytes` |
 | `GET /v1/collections` | list, with stats |
 | `DELETE /v1/collections/{name}` | drop |
 | `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson); returns `accepted` and `stale`. An item with no `lng`/`lat` is a [values-only update](#updating-values-without-a-position) and comes back in `patched` |
@@ -590,11 +590,27 @@ point belongs to exactly one category, so it touches exactly one aggregate slice
 per level regardless of how many categories exist.
 
 **Geometry is fixed once a collection exists.** Re-`PUT`ting the same values is
-idempotent; different values return **409**. That is deliberate — silently keeping
-the old geometry would leave two deployments disagreeing about what a cluster
-means while both believe they configured it. To change it, drop and recreate, or
-use a new name. `ttl_seconds` is not geometry and can be changed the same way, but
-it too requires a recreate today.
+idempotent; a different `max_zoom`, `radius`, `extent`, `hysteresis`,
+`categories`, `dimensions`, `filters` or `text` returns **409** with
+`code: "config_conflict"`, naming the field that differs. That is deliberate —
+silently keeping the old geometry would leave two deployments disagreeing about
+what a cluster means while both believe they configured it. To change any of
+them, drop and recreate, or use a new name.
+
+**`ttl_seconds` and `max_props_bytes` are not geometry** and are adopted in
+place. Nothing in the tree is built from either — they are read when a report
+arrives and when the sweep runs, and nowhere else — so a `PUT` that raises a TTL
+applies it to the running collection rather than making you drop every device to
+change one number. The response lists what moved, so a deploy can see it land:
+
+```jsonc
+{ "created": false, "adopted": ["ttl_seconds"], "collection": { … } }
+```
+
+A rejected `PUT` adopts nothing: a 409 for a `text` change does not quietly move
+the TTL on its way out. `GET /v1/collections/{name}` reports `ttl_seconds`,
+`max_props_bytes` and `text` as they actually stand, which is how a deployment
+confirms its configuration took.
 
 ## Architecture
 
