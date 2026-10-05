@@ -149,6 +149,99 @@ async fn a_full_dimension_never_reassigns_a_pending_batch_or_resolved_query() {
     assert_eq!(c.filter_cell(&selection).unwrap(), Some(cell));
 }
 
+/// Issue #8: a dimension sent as `null` was read as "no value", filed at slot 0
+/// -- on a capacity dimension, the first value ever reported -- and every filter
+/// on that value matched it. It is refused instead, by dimension and device.
+#[tokio::test]
+async fn a_dimension_with_no_value_is_refused_not_filed_under_the_first_one() {
+    let cfg = Config {
+        dimensions: vec![Dimension {
+            name: "cliId".into(),
+            capacity: Some(8192),
+            values: vec![],
+            multi: false,
+        }],
+        ..Config::default()
+    };
+    let (app, c) = app(cfg, 64);
+    let (status, _) = call(
+        &app,
+        "POST",
+        POSITIONS,
+        json!([{"id":"owned","lng":1,"lat":1,"dims":{"cliId":65}}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let feature = |cli: Value| {
+        json!({"type":"FeatureCollection","features":[{
+            "type":"Feature","id":"orphan",
+            "geometry":{"type":"Point","coordinates":[2,2]},
+            "properties":{"cliId":cli}
+        }]})
+    };
+    let bad = StatusCode::BAD_REQUEST;
+    let attempts = [
+        (
+            json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":null}}]),
+            bad,
+            "orphan",
+        ),
+        (
+            json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":[]}}]),
+            bad,
+            "orphan",
+        ),
+        // a metadata patch takes the same route into the schema
+        (json!([{"id":"owned","dims":{"cliId":null}}]), bad, "owned"),
+        (feature(Value::Null), bad, "features[0]"),
+        (feature(json!([])), bad, "features[0]"),
+        // a type error inside the value, caught while the body is parsed
+        (
+            json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":[null]}}]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "null",
+        ),
+    ];
+    for (body, want, names) in attempts {
+        let (status, err) = call(&app, "POST", POSITIONS, body.clone()).await;
+        assert_eq!(status, want, "{body} -> {err}");
+        let msg = err["error"].as_str().unwrap();
+        assert!(msg.contains(names), "{body} -> {msg}");
+        if want == bad {
+            assert!(msg.contains("cliId"), "names the dimension: {msg}");
+        }
+    }
+    assert_eq!(c.len(), 1, "no refused report may land");
+
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/collections/fleet/devices?f.cliId=65&format=compact",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(v["total"], 1, "{v}");
+
+    // The workaround from the issue -- an explicit value -- takes its own slot.
+    let (status, _) = call(
+        &app,
+        "POST",
+        POSITIONS,
+        json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":0}}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, v) = call(
+        &app,
+        "GET",
+        "/v1/collections/fleet/devices?f.cliId=65&format=compact",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(v["total"], 1, "{v}");
+}
+
 #[tokio::test]
 async fn overload_rejects_before_parsing_and_health_stays_available() {
     let (app, c) = app(Config::default(), 1);

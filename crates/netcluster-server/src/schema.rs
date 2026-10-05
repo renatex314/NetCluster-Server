@@ -260,6 +260,11 @@ impl Schema {
     /// A dimension absent from `vals` takes value 0, which is what a missing
     /// `category` has always meant. Declare an explicit "unassigned" label if that
     /// matters.
+    ///
+    /// A dimension that is *present* with no value -- a JSON `null` or `[]` -- is
+    /// refused rather than read as absent. Filing it at 0 would put it under
+    /// whatever value sits there, which on a dimension with a `capacity` is the
+    /// first one ever reported, and every filter on that value would match it.
     pub fn cells_for<V: Values>(
         &self,
         vals: &HashMap<String, Vec<String>>,
@@ -274,7 +279,13 @@ impl Schema {
         for (d, dim) in self.dims.iter().enumerate() {
             match vals.get(&dim.name) {
                 None => resolved.push(vec![0]),
-                Some(list) if list.is_empty() => resolved.push(vec![0]),
+                Some(list) if list.is_empty() => {
+                    return Err(format!(
+                        "{:?} has no value (null or an empty list); report an explicit \
+                         value, such as \"none\", for a device that has none",
+                        dim.name
+                    ))
+                }
                 Some(list) => {
                     if !dim.multi && list.len() > 1 {
                         return Err(format!(
