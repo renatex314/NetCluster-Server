@@ -207,6 +207,36 @@ test('an unexplained short acknowledgement must be surfaced as an error', async 
   await assert.rejects(client.report('fleet', { id: 'vehicle', lng: 1, lat: 1 }));
 });
 
+test('a rejected report accounts for itself, renumbered across chunks', async () => {
+  const urls = [];
+  const client = new NetClusterClient({
+    fetch: async (url, init) => {
+      urls.push(String(url));
+      const sent = JSON.parse(init.body);
+      // the second item of every chunk is refused
+      return response({
+        accepted: sent.length - 1,
+        stale: 0,
+        rejected: [{ index: 1, id: sent[1].id, code: 'bad_request', error: 'no' }],
+      });
+    },
+  });
+  const points = ['a', 'b', 'c', 'd'].map((id) => ({ id, lng: 1, lat: 1 }));
+  const r = await client.report('fleet', points, { maxBatch: 2, partial: true });
+  assert.ok(urls.every((u) => u.endsWith('/positions?partial=true')), urls.join(' '));
+  assert.equal(r.accepted, 2);
+  assert.deepEqual(r.rejected.map((x) => [x.index, x.id]), [[1, 'b'], [3, 'd']]);
+
+  // Without the flag nothing is asked for, and the key is not added.
+  const plain = new NetClusterClient({ fetch: async () => response({ accepted: 1, stale: 0 }) });
+  const ack = await plain.report('fleet', { id: 'v', lng: 1, lat: 1 });
+  assert.equal(ack.rejected, undefined);
+  await assert.rejects(
+    () => plain.report('fleet', { id: 'v', lng: 1, lat: 1 }, { partial: 'yes' }),
+    TypeError,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // The declarations ship as this package's types, and nothing else checks them.
 //

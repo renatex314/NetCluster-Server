@@ -1014,7 +1014,7 @@ impl Collection {
     }
 
     /// Properties a report or patch may carry.
-    fn check_props(&self, id: &str, props: Option<&RawValue>) -> Result<(), String> {
+    pub fn check_props(&self, id: &str, props: Option<&RawValue>) -> Result<(), String> {
         let Some(p) = props else { return Ok(()) };
         let cap = self.max_props_bytes();
         let raw = p.get();

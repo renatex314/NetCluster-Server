@@ -260,6 +260,36 @@ export interface Health {
   persistence: boolean;
 }
 
+/**
+ * A report the server refused on its own, under `partial: true`. The rest of its
+ * batch was applied.
+ */
+export interface RejectedReport {
+  /** Position in the list you passed, across every chunk it was sent in. */
+  index: number;
+  /** The device's id, or null for a GeoJSON Feature that carried none. */
+  id: string | null;
+  /** Stable slug, e.g. `half_position`, `bad_geojson`, `bad_request`. */
+  code: string;
+  /** Human-readable reason, naming the device and what was wrong. */
+  error: string;
+}
+
+/**
+ * Options shared by the writes: `report`, `patch` and `reportGeoJSON`.
+ */
+export interface WriteOptions {
+  /** Reports per request. Default {@link DEFAULT_MAX_BATCH}. */
+  maxBatch?: number;
+  /**
+   * Apply each report on its own: one the server refuses comes back in
+   * `rejected` and the rest of the batch lands. Without it, one refused report
+   * rejects its whole chunk. Needs server 0.10; an older one ignores it and
+   * refuses a bad chunk whole, as before.
+   */
+  partial?: boolean;
+}
+
 export interface ReportResult {
   accepted: number;
   /** Reports ignored because their source version was older than the stored one. */
@@ -272,6 +302,8 @@ export interface ReportResult {
   patched?: number;
   /** Ids of patches that named no live device. Present alongside `patched`. */
   unknown?: string[];
+  /** Reports the server refused. Present, possibly empty, with `partial: true`. */
+  rejected?: RejectedReport[];
 }
 
 /** One metadata-only update. See {@link NetClusterClient.patch}. */
@@ -304,6 +336,8 @@ export interface PatchResult {
    * the rest of the batch.
    */
   unknown: string[];
+  /** Patches the server refused. Present, possibly empty, with `partial: true`. */
+  rejected?: RejectedReport[];
 }
 
 export interface QueryOptions {
@@ -412,7 +446,17 @@ export interface ReporterOptions {
   flushMs?: number;
   /** Points per request. Default {@link DEFAULT_MAX_BATCH}. */
   maxBatch?: number;
-  /** Without this, a failed flush rejects the `flush()` promise instead. */
+  /**
+   * Send with `partial: true`. A report the server refuses is then dropped from
+   * the queue rather than put back -- it would be refused again, and without
+   * this one such report fails every flush after it -- and passed to `onError`
+   * as a NetClusterError whose `body` is `{ code: 'rejected', rejected }`.
+   */
+  partial?: boolean;
+  /**
+   * Without this, a failed flush rejects the `flush()` promise instead. Called
+   * for rejected reports too, under `partial`; those do not fail the flush.
+   */
   onError?: (err: Error) => void;
 }
 
@@ -423,6 +467,8 @@ export interface ReporterStats {
   sent: number;
   /** Reports ignored because their source version was older than the stored one. */
   stale: number;
+  /** Reports the server refused and that were dropped, under `partial`. */
+  rejected: number;
   requests: number;
   errors: number;
 }
@@ -462,8 +508,7 @@ export interface InputFeatureCollection {
   features: InputFeature[];
 }
 
-export interface ReportGeoJSONOptions {
-  maxBatch?: number;
+export interface ReportGeoJSONOptions extends WriteOptions {
   /**
    * Which property holds the id, when a Feature has no `id` of its own. Naming
    * it is strict: a Feature missing that property is rejected rather than
@@ -482,8 +527,8 @@ export interface BoundCollection {
   stats(): Promise<CollectionStats>;
   verify(): Promise<{ ok: boolean; detail?: string; violation?: string }>;
   snapshot(): Promise<{ snapshot: string; bytes: number }>;
-  report(points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
-  patch(updates: PatchUpdate | PatchUpdate[], opts?: { maxBatch?: number }): Promise<PatchResult>;
+  report(points: Point | Point[], opts?: WriteOptions): Promise<ReportResult>;
+  patch(updates: PatchUpdate | PatchUpdate[], opts?: WriteOptions): Promise<PatchResult>;
   /** Report positions as GeoJSON. Same endpoint and upsert semantics as `report`. */
   reportGeoJSON(
     geojson: InputFeatureCollection | InputFeature[] | InputFeature,
@@ -517,7 +562,7 @@ export declare class NetClusterClient {
   /** Force a snapshot now. Rejects with code 'persistence_disabled' if the server has none. */
   snapshot(name: string): Promise<{ snapshot: string; bytes: number }>;
 
-  report(name: string, points: Point | Point[], opts?: { maxBatch?: number }): Promise<ReportResult>;
+  report(name: string, points: Point | Point[], opts?: WriteOptions): Promise<ReportResult>;
 
   /**
    * Update values and properties without a position, against the one the server
@@ -536,7 +581,7 @@ export declare class NetClusterClient {
   patch(
     name: string,
     updates: PatchUpdate | PatchUpdate[],
-    opts?: { maxBatch?: number }
+    opts?: WriteOptions
   ): Promise<PatchResult>;
   /** Report positions as GeoJSON. Same endpoint and upsert semantics as `report`. */
   reportGeoJSON(
