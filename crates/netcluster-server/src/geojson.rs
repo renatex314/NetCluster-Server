@@ -584,6 +584,11 @@ impl<'de> Deserialize<'de> for DimVal {
             fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<DimVal, A::Error> {
                 let mut out = Vec::new();
                 while let Some(v) = a.next_element::<DimVal>()? {
+                    // A null in a list would otherwise vanish, and `[null]`
+                    // would read as a value when it is none.
+                    if v.0.is_empty() {
+                        return Err(de::Error::custom("a list of filter values cannot hold null"));
+                    }
                     out.extend(v.0);
                 }
                 Ok(DimVal(out))
@@ -655,7 +660,9 @@ pub fn peek_dims(
             })? {
                 match which {
                     Which::Id => id = m.next_value::<Option<IdString>>()?.map(|v| v.0),
-                    Which::Cat(i) => out[i] = m.next_value::<Option<DimVal>>()?,
+                    // Not `Option<DimVal>`: that would read a null as an absent
+                    // property, and an absent dimension is filed at value 0.
+                    Which::Cat(i) => out[i] = Some(m.next_value::<DimVal>()?),
                     Which::Other => {
                         m.next_value::<IgnoredAny>()?;
                     }
@@ -696,11 +703,18 @@ mod dim_tests {
     }
 
     #[test]
-    fn a_null_value_is_an_absence_not_a_zero() {
+    fn a_null_value_is_present_and_empty_not_absent() {
+        // Present-but-empty, so the schema can refuse it by name; read as absent
+        // it would be filed at value 0 instead.
         let raw = r#"{"client":null}"#;
         let (_, vals) = peek_dims(raw, None, &["client"]).unwrap();
-        // serde maps a JSON null through Option, so the property reads as absent
-        assert!(vals[0].is_none() || vals[0] == Some(DimVal(Vec::new())));
+        assert_eq!(vals[0], Some(DimVal(Vec::new())));
+    }
+
+    #[test]
+    fn a_null_inside_a_list_is_refused() {
+        assert!(peek_dims(r#"{"client":[1,null]}"#, None, &["client"]).is_err());
+        assert!(peek_dims(r#"{"client":[null]}"#, None, &["client"]).is_err());
     }
 
     #[test]
