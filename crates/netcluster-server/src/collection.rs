@@ -278,10 +278,11 @@ pub struct Collection {
     /// Resolved filter schema. Derived from `config`, kept beside it so a query
     /// resolves names to a cell without rebuilding it every time.
     pub schema: Schema,
-    /// Where a device with no filter values at all goes: value 0 in every
-    /// dimension, which is what a missing `category` has always meant. Without
-    /// this a device reported without values would hold no cells and vanish from
-    /// every filter while still appearing unfiltered.
+    /// Where a device with no filter values at all goes: value 0 on every
+    /// declared dimension, which is what a missing `category` has always meant,
+    /// and no value on a `capacity` one (see [`Schema::cells_for`]). Empty when
+    /// every dimension has a capacity: such a device shows unfiltered and under
+    /// no filter, because it has no value to be filtered by.
     default_cells: Vec<u32>,
     /// Value indices for dimensions declared with a `capacity` rather than a list.
     ///
@@ -717,7 +718,9 @@ impl Collection {
                 // If the declaration changed enough that nothing survived, the
                 // device still has to land somewhere filterable rather than
                 // disappearing from every filter while showing up unfiltered.
-                if kept.is_empty() {
+                // A device saved with no cells had no values, and restoring it
+                // into the defaults would file it under one on every restart.
+                if kept.is_empty() && !r.cells.is_empty() {
                     kept.extend_from_slice(&c.default_cells);
                 }
                 let n = st.ids.intern(&r.id);

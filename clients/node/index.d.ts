@@ -125,8 +125,11 @@ export interface Point {
    * Omit it and the device keeps the values it already had, exactly as omitting
    * `props` keeps its properties -- a bare position report must not re-file a
    * vehicle into whatever value happens to sit at index 0.
+   *
+   * `null` or `[]` for a dimension means the device has no value on it: it
+   * matches no filter on that dimension, and still shows unfiltered.
    */
-  dims?: Record<string, string | number | Array<string | number>>;
+  dims?: Record<string, string | number | Array<string | number> | null>;
   /**
    * Free-form attributes for this device. Any JSON object.
    *
@@ -279,8 +282,11 @@ export interface PatchUpdate {
    * ignored rather than undoing the newer value.
    */
   updatedAt?: number;
-  /** Filter values to re-file the device into. Omit to leave them alone. */
-  dims?: Record<string, string | number | Array<string | number>>;
+  /**
+   * Filter values to re-file the device into. Omit to leave them alone; `null` or
+   * `[]` for a dimension clears it to no value.
+   */
+  dims?: Record<string, string | number | Array<string | number> | null>;
   /** Replacement properties. Omit to leave them alone; `{}` clears. */
   props?: Record<string, unknown>;
 }

@@ -149,97 +149,255 @@ async fn a_full_dimension_never_reassigns_a_pending_batch_or_resolved_query() {
     assert_eq!(c.filter_cell(&selection).unwrap(), Some(cell));
 }
 
-/// Issue #8: a dimension sent as `null` was read as "no value", filed at slot 0
-/// -- on a capacity dimension, the first value ever reported -- and every filter
-/// on that value matched it. It is refused instead, by dimension and device.
+fn capacity_dim(name: &str, multi: bool) -> Dimension {
+    Dimension {
+        name: name.into(),
+        capacity: Some(64),
+        values: vec![],
+        multi,
+    }
+}
+
+async fn total(app: &Router, query: &str) -> Value {
+    let (status, v) = call(
+        app,
+        "GET",
+        &format!("/v1/collections/fleet/devices?format=compact&limit=50{query}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    v["total"].clone()
+}
+
+/// Issues #8 and #10: on a `capacity` dimension, slot 0 is only the first value
+/// ever reported. A device with no value -- `null`, `[]`, or the dimension left
+/// out -- used to be filed there, so every filter on that value matched it; 0.9.1
+/// refused the first two instead. It now holds no value: it shows unfiltered and
+/// matches no filter on that dimension, and takes no slot.
 #[tokio::test]
-async fn a_dimension_with_no_value_is_refused_not_filed_under_the_first_one() {
+async fn a_device_with_no_value_matches_no_filter_on_a_capacity_dimension() {
     let cfg = Config {
-        dimensions: vec![Dimension {
-            name: "cliId".into(),
-            capacity: Some(8192),
-            values: vec![],
-            multi: false,
-        }],
+        dimensions: vec![capacity_dim("cliId", false)],
         ..Config::default()
     };
     let (app, c) = app(cfg, 64);
-    let (status, _) = call(
-        &app,
-        "POST",
-        POSITIONS,
-        json!([{"id":"owned","lng":1,"lat":1,"dims":{"cliId":65}}]),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let feature = |cli: Value| {
+    let geo = |id: &str, cli: Value| {
         json!({"type":"FeatureCollection","features":[{
-            "type":"Feature","id":"orphan",
-            "geometry":{"type":"Point","coordinates":[2,2]},
+            "type":"Feature","id":id,
+            "geometry":{"type":"Point","coordinates":[3,3]},
             "properties":{"cliId":cli}
         }]})
     };
-    let bad = StatusCode::BAD_REQUEST;
-    let attempts = [
-        (
-            json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":null}}]),
-            bad,
-            "orphan",
-        ),
-        (
-            json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":[]}}]),
-            bad,
-            "orphan",
-        ),
-        // a metadata patch takes the same route into the schema
-        (json!([{"id":"owned","dims":{"cliId":null}}]), bad, "owned"),
-        (feature(Value::Null), bad, "features[0]"),
-        (feature(json!([])), bad, "features[0]"),
-        // a type error inside the value, caught while the body is parsed
-        (
-            json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":[null]}}]),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "null",
-        ),
-    ];
-    for (body, want, names) in attempts {
-        let (status, err) = call(&app, "POST", POSITIONS, body.clone()).await;
-        assert_eq!(status, want, "{body} -> {err}");
-        let msg = err["error"].as_str().unwrap();
-        assert!(msg.contains(names), "{body} -> {msg}");
-        if want == bad {
-            assert!(msg.contains("cliId"), "names the dimension: {msg}");
-        }
+    for body in [
+        json!([{"id":"owned","lng":1,"lat":1,"dims":{"cliId":65}}]),
+        json!([{"id":"null","lng":2,"lat":2,"dims":{"cliId":null}}]),
+        json!([{"id":"empty","lng":2,"lat":2,"dims":{"cliId":[]}}]),
+        json!([{"id":"absent","lng":2,"lat":2}]),
+        geo("geo-null", Value::Null),
+    ] {
+        let (status, ack) = call(&app, "POST", POSITIONS, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body} -> {ack}");
+        assert_eq!(ack["accepted"], 1, "{body} -> {ack}");
     }
-    assert_eq!(c.len(), 1, "no refused report may land");
+    assert_eq!(total(&app, "").await, 5);
+    assert_eq!(total(&app, "&f.cliId=65").await, 1);
+    assert_eq!(c.interned(), vec![1], "no value takes no slot");
 
-    let (_, v) = call(
-        &app,
-        "GET",
-        "/v1/collections/fleet/devices?f.cliId=65&format=compact",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(v["total"], 1, "{v}");
-
-    // The workaround from the issue -- an explicit value -- takes its own slot.
-    let (status, _) = call(
+    // Clearing a value re-files the device out of the filter, not off the map.
+    let (status, ack) = call(
         &app,
         "POST",
         POSITIONS,
-        json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":0}}]),
+        json!([{"id":"owned","dims":{"cliId":null}}]),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{ack}");
+    assert_eq!(ack["patched"], 1, "{ack}");
+    assert_eq!(total(&app, "&f.cliId=65").await, 0);
+    assert_eq!(total(&app, "").await, 5);
+
+    // A null inside a list is still a type error, not "no value".
+    let (status, err) = call(
+        &app,
+        "POST",
+        POSITIONS,
+        json!([{"id":"x","lng":2,"lat":2,"dims":{"cliId":[1, null]}}]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{err}");
+    c.verify().unwrap();
+}
+
+/// The reproduction from #10, on a `multi` dimension: `[]` is "belongs to no
+/// client", and one such device no longer costs the rest of its batch.
+#[tokio::test]
+async fn an_empty_multi_value_is_no_client_and_does_not_sink_the_batch() {
+    let cfg = Config {
+        dimensions: vec![capacity_dim("clientId", true)],
+        ..Config::default()
+    };
+    let (app, c) = app(cfg, 64);
+    let p = |id: &str, dims: Option<Value>| {
+        let mut r = json!({"id": id, "lng": -46.63, "lat": -23.55});
+        if let Some(d) = dims {
+            r["dims"] = d;
+        }
+        r
+    };
+    for body in [
+        json!([p("a", Some(json!({"clientId": [7]})))]),
+        json!([p("b", Some(json!({"clientId": []})))]),
+        json!([p("d", None)]),
+        json!([
+            p("e1", Some(json!({"clientId": []}))),
+            p("e2", Some(json!({"clientId": [7]})))
+        ]),
+    ] {
+        let (status, ack) = call(&app, "POST", POSITIONS, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body} -> {ack}");
+    }
+    assert_eq!(total(&app, "").await, 5);
     let (_, v) = call(
         &app,
         "GET",
-        "/v1/collections/fleet/devices?f.cliId=65&format=compact",
+        "/v1/collections/fleet/devices?format=compact&limit=50&f.clientId=7",
         Value::Null,
     )
     .await;
-    assert_eq!(v["total"], 1, "{v}");
+    let mut ids: Vec<&str> = v["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["a", "e2"], "{v}");
+    c.verify().unwrap();
+}
+
+/// On a declared dimension an absent value still takes value 0, as documented --
+/// that label is one the collection chose. An explicit `[]` is no value.
+#[tokio::test]
+async fn a_declared_dimension_keeps_value_zero_for_an_absent_value() {
+    let dim = |name: &str, values: &[&str]| Dimension {
+        name: name.into(),
+        capacity: None,
+        values: values.iter().map(|v| v.to_string()).collect(),
+        multi: true,
+    };
+    let cfg = Config {
+        dimensions: vec![
+            dim("client", &["a", "b"]),
+            dim("status", &["idle", "enroute"]),
+        ],
+        filters: vec![
+            vec!["client".into()],
+            vec!["status".into()],
+            vec!["client".into(), "status".into()],
+        ],
+        ..Config::default()
+    };
+    let (app, c) = app(cfg, 64);
+    let (status, ack) = call(
+        &app,
+        "POST",
+        POSITIONS,
+        json!([
+            {"id":"absent","lng":1,"lat":1,"dims":{"status":"enroute"}},
+            {"id":"empty","lng":2,"lat":2,"dims":{"client":[],"status":"idle"}}
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ack}");
+    assert_eq!(total(&app, "&f.client=a").await, 1, "only `absent`, at 0");
+    assert_eq!(
+        total(&app, "&f.status=idle").await,
+        1,
+        "`empty` keeps status"
+    );
+    assert_eq!(total(&app, "&f.client=a&f.status=idle").await, 0);
+    assert_eq!(total(&app, "&f.client=a&f.status=enroute").await, 1);
+    c.verify().unwrap();
+}
+
+/// A device saved with no value must come back with none. Restore used to fill
+/// any device without cells with the defaults -- the first label of a declared
+/// dimension -- which would file it under that label on every restart.
+#[test]
+fn a_device_with_no_value_survives_a_snapshot_without_one() {
+    let status = Dimension {
+        name: "status".into(),
+        capacity: None,
+        values: vec!["idle".into(), "enroute".into()],
+        multi: false,
+    };
+    let cfg = Config {
+        dimensions: vec![capacity_dim("cliId", false), status],
+        ttl_seconds: 0,
+        ..Config::default()
+    };
+    let c = Collection::new("fleet", cfg);
+    let resolve = |cli: &[&str], status: &[&str]| {
+        let vals = HashMap::from([
+            (
+                "cliId".to_string(),
+                cli.iter().map(|v| v.to_string()).collect(),
+            ),
+            (
+                "status".to_string(),
+                status.iter().map(|v| v.to_string()).collect(),
+            ),
+        ]);
+        let mut cells = Vec::new();
+        c.cells_for_report(&vals, &mut cells).unwrap();
+        cells
+    };
+    let owned = resolve(&["65"], &["idle"]);
+    let none = resolve(&[], &[]);
+    assert!(none.is_empty(), "no value anywhere is no cell at all");
+    let owned = Report {
+        id: "owned",
+        lng: 1.,
+        lat: 1.,
+        props: None,
+        cells: Some(owned.as_slice()),
+        updated_at_ms: None,
+    };
+    let orphan = Report {
+        id: "orphan",
+        lng: 2.,
+        cells: Some(none.as_slice()),
+        ..owned
+    };
+    c.upsert(&[owned, orphan]).unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "nc-novalue-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = snapshot::path_for(&dir, "fleet");
+    c.snapshot_to(&path).unwrap();
+    let (meta, records) = snapshot::read(&path).unwrap();
+    let (restored, skipped) = Collection::restore(&meta.name, meta.config, &meta.labels, &records);
+    assert_eq!(skipped, 0);
+    assert_eq!(restored.len(), 2);
+    for (name, value) in [("cliId", "65"), ("status", "idle")] {
+        let selection = HashMap::from([(name.into(), value.into())]);
+        let cell = restored.filter_cell(&selection).unwrap().unwrap();
+        assert_eq!(
+            restored.clusters(WORLD, 20., cell).len(),
+            1,
+            "only `owned` has {name}={value}"
+        );
+    }
+    assert_eq!(restored.clusters(WORLD, 20., -1).len(), 2);
+    restored.verify().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

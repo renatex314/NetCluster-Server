@@ -251,6 +251,7 @@ await fleet.reportGeoJSON({
 |---|---|
 | omitted | unchanged — the ordinary position update |
 | `{...}` | re-files the device, even if it has not moved |
+| `{ name: null }` or `{ name: [] }` | no value on that dimension: matches no filter on it, still shows unfiltered |
 
 Both directions matter. A GPS ping every two seconds must not re-file a vehicle
 into whatever sits at the first value; and **a status change does not move the

@@ -663,7 +663,8 @@ pub fn peek_dims(
                 match which {
                     Which::Id => id = m.next_value::<Option<IdString>>()?.map(|v| v.0),
                     // Not `Option<DimVal>`: that would read a null as an absent
-                    // property, and an absent dimension is filed at value 0.
+                    // property, which leaves a device's values alone (or files it
+                    // at 0 on a declared dimension). A null is "no value".
                     Which::Cat(i) => out[i] = Some(m.next_value::<DimVal>()?),
                     Which::Other => {
                         m.next_value::<IgnoredAny>()?;
@@ -706,8 +707,8 @@ mod dim_tests {
 
     #[test]
     fn a_null_value_is_present_and_empty_not_absent() {
-        // Present-but-empty, so the schema can refuse it by name; read as absent
-        // it would be filed at value 0 instead.
+        // Present-but-empty, which the schema reads as "no value"; read as
+        // absent it would leave the device's values alone instead.
         let raw = r#"{"client":null}"#;
         let (_, vals) = peek_dims(raw, None, &["client"]).unwrap();
         assert_eq!(vals[0], Some(DimVal(Vec::new())));
