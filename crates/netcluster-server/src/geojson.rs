@@ -587,7 +587,9 @@ impl<'de> Deserialize<'de> for DimVal {
                     // A null in a list would otherwise vanish, and `[null]`
                     // would read as a value when it is none.
                     if v.0.is_empty() {
-                        return Err(de::Error::custom("a list of filter values cannot hold null"));
+                        return Err(de::Error::custom(
+                            "a list of filter values cannot hold null",
+                        ));
                     }
                     out.extend(v.0);
                 }

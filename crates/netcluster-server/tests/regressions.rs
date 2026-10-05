@@ -182,8 +182,16 @@ async fn a_dimension_with_no_value_is_refused_not_filed_under_the_first_one() {
     };
     let bad = StatusCode::BAD_REQUEST;
     let attempts = [
-        (json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":null}}]), bad, "orphan"),
-        (json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":[]}}]), bad, "orphan"),
+        (
+            json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":null}}]),
+            bad,
+            "orphan",
+        ),
+        (
+            json!([{"id":"orphan","lng":2,"lat":2,"dims":{"cliId":[]}}]),
+            bad,
+            "orphan",
+        ),
         // a metadata patch takes the same route into the schema
         (json!([{"id":"owned","dims":{"cliId":null}}]), bad, "owned"),
         (feature(Value::Null), bad, "features[0]"),
