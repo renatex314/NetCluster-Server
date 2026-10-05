@@ -495,9 +495,14 @@ fails explicitly with the dimension and value named in the error.
 three clients — which a single category cannot express. Values ride in `dims` on
 the compact form, or in `properties` under the dimension's own name in GeoJSON,
 and re-reporting a device with different values **re-files it** even if it has not
-moved: a status change never moves the vehicle. A dimension sent with no value —
-`null` or `[]` — is refused with a 400 naming it, rather than filed under whatever
-value sits first; report an explicit value such as `"none"` for a device that has none.
+moved: a status change never moves the vehicle.
+
+A device can hold **no value** on a dimension: it still shows unfiltered and under
+filters on its other dimensions, but matches no filter on that one, and it takes no
+slot of the `capacity`. Send `null` or `[]` for it. On a `capacity` dimension, leaving
+the dimension out of a report that names others also means no value. On a dimension
+declared with `values`, a dimension left out still takes the first label, which is
+what a missing `category` has always meant.
 
 Each declared shape is a separate aggregate, which is what filtering costs.
 

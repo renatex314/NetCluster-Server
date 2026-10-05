@@ -257,14 +257,18 @@ impl Schema {
 
     /// Every cell a device holding `vals` belongs to.
     ///
-    /// A dimension absent from `vals` takes value 0, which is what a missing
-    /// `category` has always meant. Declare an explicit "unassigned" label if that
-    /// matters.
+    /// A dimension can hold *no value*: the device then has no cell in any shape
+    /// that includes it, so it still shows unfiltered and under filters on its
+    /// other dimensions, but matches no filter on this one. That is what an
+    /// explicit `null` or `[]` means on any dimension, and what an absent one
+    /// means on a dimension with a `capacity`. Neither takes a slot, so nothing
+    /// is reserved and the snapshot format is unchanged.
     ///
-    /// A dimension that is *present* with no value -- a JSON `null` or `[]` -- is
-    /// refused rather than read as absent. Filing it at 0 would put it under
-    /// whatever value sits there, which on a dimension with a `capacity` is the
-    /// first one ever reported, and every filter on that value would match it.
+    /// An absent *declared* dimension still takes value 0, which is what a
+    /// missing `category` has always meant: there the label at 0 is one the
+    /// collection chose. On a `capacity` dimension slot 0 is merely the first
+    /// value ever reported, and filing a device there made every filter on that
+    /// value match it.
     pub fn cells_for<V: Values>(
         &self,
         vals: &HashMap<String, Vec<String>>,
@@ -278,14 +282,9 @@ impl Schema {
         let mut resolved: Vec<Vec<u32>> = Vec::with_capacity(self.dims.len());
         for (d, dim) in self.dims.iter().enumerate() {
             match vals.get(&dim.name) {
+                None if dim.is_dynamic() => resolved.push(Vec::new()),
                 None => resolved.push(vec![0]),
-                Some(list) if list.is_empty() => {
-                    return Err(format!(
-                        "{:?} has no value (null or an empty list); report an explicit \
-                         value, such as \"none\", for a device that has none",
-                        dim.name
-                    ))
-                }
+                Some(list) if list.is_empty() => resolved.push(Vec::new()),
                 Some(list) => {
                     if !dim.multi && list.len() > 1 {
                         return Err(format!(
