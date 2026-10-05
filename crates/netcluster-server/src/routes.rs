@@ -924,14 +924,76 @@ fn compact_cells(
 /// `category`, and a file exported from one should load into the other.
 const CAT_PROPERTIES: [&str; 2] = ["cat", "category"];
 
+/// Reports in a batch that the server would not apply, by place in the batch.
+///
+/// Without `?partial=true` the first one fails the whole request, exactly as
+/// before this existed: a 0.9 client counts every device it sent in the
+/// acknowledgement, and an answer that left some out would read to it as a short
+/// one. With it, the rest of the batch is applied and these come back in
+/// `rejected`, so one bad device no longer costs every good one sent beside it.
+///
+/// Only what can be pinned on one report is set aside. A body that does not
+/// parse, a batch over the size limit or a busy server still fail the request.
+struct Rejects {
+    partial: bool,
+    bad: Vec<bool>,
+    list: Vec<(usize, Option<String>, ApiError)>,
+}
+
+impl Rejects {
+    fn new(partial: bool, n: usize) -> Self {
+        Rejects {
+            partial,
+            bad: vec![false; n],
+            list: Vec::new(),
+        }
+    }
+
+    /// Fail the request, or set report `i` aside and carry on with the rest.
+    fn refuse(&mut self, i: usize, id: Option<&str>, e: ApiError) -> ApiResult<()> {
+        if !self.partial {
+            return Err(e);
+        }
+        self.bad[i] = true;
+        self.list.push((i, id.map(str::to_owned), e));
+        Ok(())
+    }
+
+    fn ok(&self, i: usize) -> bool {
+        !self.bad[i]
+    }
+
+    /// In batch order. Checks run in passes, so they are found out of order.
+    fn to_json(&self) -> Value {
+        let mut list: Vec<_> = self.list.iter().collect();
+        list.sort_by_key(|(i, _, _)| *i);
+        list.into_iter()
+            .map(|(i, id, e)| json!({ "index": i, "id": id, "code": e.2, "error": e.1 }))
+            .collect()
+    }
+}
+
 async fn positions(
     State(s): State<Arc<AppState>>,
     Path(name): Path<String>,
     Query(q): Query<HashMap<String, String>>,
     JsonBody(body): JsonBody<PositionsBody>,
 ) -> ApiResult<Json<Value>> {
+    let partial = match q.get("partial").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(v) => {
+            return Err(ApiError::bad(format!(
+                "partial must be true or false, got {v:?}"
+            )))
+        }
+    };
     if body.is_empty() {
-        return Ok(Json(json!({ "accepted": 0 })));
+        let mut ack = json!({ "accepted": 0 });
+        if partial {
+            ack["rejected"] = json!([]);
+        }
+        return Ok(Json(ack));
     }
 
     let c = match s.get(&name) {
@@ -964,11 +1026,12 @@ async fn positions(
     let write_guard = tokio::time::timeout(Duration::from_secs(1), write_gate.acquire_write())
         .await
         .map_err(|_| ApiError::overloaded())?;
-    let (n, po, devices) = run_blocking(move || {
+    let (n, po, devices, rejects) = run_blocking(move || {
         // Move the guard into the blocking task. If the HTTP client disconnects,
         // the task may outlive this handler; the next writer must still wait until
         // this mutation has actually finished.
         let _write_guard = write_guard;
+        let mut rejects = Rejects::new(partial, submitted);
         let (n, po) = match body {
             PositionsBody::Compact(items) => {
                 // Coordinates are optional but come as a pair. Settle which items
@@ -976,20 +1039,36 @@ async fn positions(
                 // anything is resolved, so a half-sent coordinate is a 400 naming
                 // the device rather than an update that quietly went nowhere.
                 let mut pos: Vec<Option<(f64, f64)>> = Vec::with_capacity(items.len());
-                for r in &items {
+                for (i, r) in items.iter().enumerate() {
                     match (r.lng, r.lat) {
                         (Some(lng), Some(lat)) => pos.push(Some((lng, lat))),
                         (None, None) => pos.push(None),
                         (lng, _) => {
+                            pos.push(None);
                             let (sent, missing) =
                                 if lng.is_some() { ("lng", "lat") } else { ("lat", "lng") };
-                            return Err(ApiError::bad(format!(
-                                "device {:?} sent {sent} without {missing}; send both to move it, \
-                                 or neither to update only its values",
-                                r.id
-                            ))
-                            .code("half_position"));
+                            rejects.refuse(
+                                i,
+                                Some(&r.id),
+                                ApiError::bad(format!(
+                                    "device {:?} sent {sent} without {missing}; send both to move it, \
+                                     or neither to update only its values",
+                                    r.id
+                                ))
+                                .code("half_position"),
+                            )?;
                         }
+                    }
+                }
+                // Before any value is resolved: resolving interns a new value on a
+                // dimension with a capacity, and a slot, once taken, is never given
+                // back -- so a report about to be refused must not take one.
+                for (i, r) in items.iter().enumerate() {
+                    if !rejects.ok(i) {
+                        continue;
+                    }
+                    if let Err(e) = c.check_props(&r.id, r.props.as_deref()) {
+                        rejects.refuse(i, Some(&r.id), ApiError::bad(e))?;
                     }
                 }
                 // Cells are built into one owned buffer first so the reports can
@@ -997,36 +1076,46 @@ async fn positions(
                 // gets None, which leaves the device where it is.
                 let mut store: Vec<Option<Vec<u32>>> = Vec::with_capacity(items.len());
                 let mut vals: HashMap<String, Vec<String>> = HashMap::new();
-                for r in &items {
-                    store.push(
-                        compact_cells(&c, r, &mut vals)
-                            .map_err(|e| ApiError::bad(format!("device {:?}: {e}", r.id)))?,
-                    );
+                for (i, r) in items.iter().enumerate() {
+                    if !rejects.ok(i) {
+                        store.push(None);
+                        continue;
+                    }
+                    match compact_cells(&c, r, &mut vals) {
+                        Ok(cells) => store.push(cells),
+                        Err(e) => {
+                            store.push(None);
+                            rejects.refuse(
+                                i,
+                                Some(&r.id),
+                                ApiError::bad(format!("device {:?}: {e}", r.id)),
+                            )?;
+                        }
+                    }
                 }
                 let resolved: Vec<Report<'_>> = items
                     .iter()
-                    .zip(&store)
-                    .zip(&pos)
-                    .filter_map(|((r, cells), p)| {
-                        p.map(|(lng, lat)| Report {
+                    .enumerate()
+                    .filter(|&(i, _)| rejects.ok(i))
+                    .filter_map(|(i, r)| {
+                        pos[i].map(|(lng, lat)| Report {
                             id: &r.id,
                             lng,
                             lat,
                             props: r.props.as_deref(),
-                            cells: cells.as_deref(),
+                            cells: store[i].as_deref(),
                             updated_at_ms: r.updated_at_ms,
                         })
                     })
                     .collect();
                 let patches: Vec<Patch<'_>> = items
                     .iter()
-                    .zip(&store)
-                    .zip(&pos)
-                    .filter(|(_, p)| p.is_none())
-                    .map(|((r, cells), _)| Patch {
+                    .enumerate()
+                    .filter(|&(i, _)| rejects.ok(i) && pos[i].is_none())
+                    .map(|(i, r)| Patch {
                         id: &r.id,
                         props: r.props.as_deref(),
-                        cells: cells.as_deref(),
+                        cells: store[i].as_deref(),
                         updated_at_ms: r.updated_at_ms,
                     })
                     .collect();
@@ -1071,39 +1160,107 @@ async fn positions(
                         continue;
                     }
                     let id_key = if want_id { id_prop.or(Some("id")) } else { None };
-                    match &f.props {
-                        Some(p) => {
-                            if legacy_cat || dim_names.is_empty() {
-                                let keys: &[&str] = if legacy_cat { &cat_keys } else { &[] };
-                                peeked.push(peek_props(p.get(), id_key, keys).map_err(|e| {
-                                    ApiError::bad(format!(
-                                        "features[{i}]: properties are unreadable: {e}"
-                                    ))
-                                })?);
-                                peeked_dims.push(Vec::new());
-                            } else {
-                                let (id, vals) =
-                                    peek_dims(p.get(), id_key, &dim_names).map_err(|e| {
-                                        ApiError::bad(format!(
-                                            "features[{i}]: properties are unreadable: {e}"
-                                        ))
-                                    })?;
-                                peeked.push((id, None));
-                                peeked_dims.push(vals);
-                            }
+                    let unreadable = |e: serde_json::Error| {
+                        ApiError::bad(format!("features[{i}]: properties are unreadable: {e}"))
+                    };
+                    let got = match &f.props {
+                        Some(p) if legacy_cat || dim_names.is_empty() => {
+                            let keys: &[&str] = if legacy_cat { &cat_keys } else { &[] };
+                            peek_props(p.get(), id_key, keys)
+                                .map(|got| (got, Vec::new()))
+                                .map_err(unreadable)
                         }
-                        None => {
+                        Some(p) => peek_dims(p.get(), id_key, &dim_names)
+                            .map(|(id, vals)| ((id, None), vals))
+                            .map_err(unreadable),
+                        None => Ok(((None, None), Vec::new())),
+                    };
+                    match got {
+                        Ok((p, d)) => {
+                            peeked.push(p);
+                            peeked_dims.push(d);
+                        }
+                        Err(e) => {
                             peeked.push((None, None));
                             peeked_dims.push(Vec::new());
+                            rejects.refuse(i, f.id.as_deref(), e)?;
                         }
                     }
                 }
 
-                // Cells first, into one owned buffer the reports borrow from.
+                // Where and who, before anything is resolved -- for the reason the
+                // compact form checks first: a refused Feature must not take a slot.
+                let mut ids: Vec<Option<&str>> = Vec::with_capacity(feats.len());
+                for (i, f) in feats.iter().enumerate() {
+                    ids.push(None);
+                    if !rejects.ok(i) {
+                        continue;
+                    }
+                    let Some(geom) = f.geom.as_ref() else {
+                        rejects.refuse(
+                            i,
+                            f.id.as_deref(),
+                            ApiError::bad(format!(
+                                "features[{i}] has a null geometry, so it has no position to cluster"
+                            ))
+                            .code("bad_geojson"),
+                        )?;
+                        continue;
+                    };
+                    // A GeoJSON coordinates array is positional, so the pair can be
+                    // -- and often is -- written the wrong way round. Web Mercator
+                    // clamps latitude, so without this the point silently lands at a
+                    // pole instead of failing. Only catches a swap that puts a
+                    // longitude past +-90 into the latitude slot.
+                    if !(-90.0..=90.0).contains(&geom.lat) {
+                        rejects.refuse(
+                            i,
+                            f.id.as_deref(),
+                            ApiError::bad(format!(
+                                "features[{i}] has latitude {}, outside [-90, 90]. GeoJSON coordinates are \
+                                 [longitude, latitude] -- are yours the other way round?",
+                                geom.lat
+                            ))
+                            .code("bad_geojson"),
+                        )?;
+                        continue;
+                    }
+                    let id = match (id_prop, &peeked[i].0, &f.id) {
+                        (Some(k), p, _) => p.as_deref().ok_or_else(|| {
+                            ApiError::bad(format!(
+                                "features[{i}] has no properties.{k}, which id_property named as the id"
+                            ))
+                            .code("bad_geojson")
+                        }),
+                        (None, _, Some(v)) => Ok(v.as_str()),
+                        (None, p, None) => p.as_deref().ok_or_else(|| {
+                            ApiError::bad(format!(
+                                "features[{i}] has no id. Put it on the feature (\"id\": \"vehicle-7\", \
+                                 where GeoJSON says it goes) or in properties.id, or name the property \
+                                 with ?id_property="
+                            ))
+                            .code("bad_geojson")
+                        }),
+                    };
+                    let id = match id {
+                        Ok(id) => id,
+                        Err(e) => {
+                            rejects.refuse(i, f.id.as_deref(), e)?;
+                            continue;
+                        }
+                    };
+                    if let Err(e) = c.check_props(id, f.props.as_deref()) {
+                        rejects.refuse(i, Some(id), ApiError::bad(e))?;
+                        continue;
+                    }
+                    ids[i] = Some(id);
+                }
+
+                // Cells next, into one owned buffer the reports borrow from.
                 let mut cell_store: Vec<Option<Vec<u32>>> = Vec::with_capacity(feats.len());
                 let mut vals: HashMap<String, Vec<String>> = HashMap::new();
                 for i in 0..feats.len() {
-                    if !c.schema.enabled() {
+                    if !c.schema.enabled() || !rejects.ok(i) {
                         cell_store.push(None);
                         continue;
                     }
@@ -1128,74 +1285,53 @@ async fn positions(
                         continue;
                     }
                     let mut out = Vec::new();
-                    c.cells_for_report(&vals, &mut out).map_err(|e| {
-                        ApiError::bad(format!("features[{i}]: {e}")).code("bad_geojson")
-                    })?;
-                    cell_store.push(Some(out));
+                    match c.cells_for_report(&vals, &mut out) {
+                        Ok(()) => cell_store.push(Some(out)),
+                        Err(e) => {
+                            cell_store.push(None);
+                            rejects.refuse(
+                                i,
+                                ids[i],
+                                ApiError::bad(format!("features[{i}]: {e}")).code("bad_geojson"),
+                            )?;
+                        }
+                    }
                 }
 
-                let mut resolved = Vec::with_capacity(feats.len());
-                for (i, f) in feats.iter().enumerate() {
-                    let geom = f.geom.as_ref().ok_or_else(|| {
-                        ApiError::bad(format!(
-                            "features[{i}] has a null geometry, so it has no position to cluster"
-                        ))
-                        .code("bad_geojson")
-                    })?;
-                    // A GeoJSON coordinates array is positional, so the pair can be
-                    // -- and often is -- written the wrong way round. Web Mercator
-                    // clamps latitude, so without this the point silently lands at a
-                    // pole instead of failing. Only catches a swap that puts a
-                    // longitude past +-90 into the latitude slot.
-                    if !(-90.0..=90.0).contains(&geom.lat) {
-                        return Err(ApiError::bad(format!(
-                            "features[{i}] has latitude {}, outside [-90, 90]. GeoJSON coordinates are \
-                             [longitude, latitude] -- are yours the other way round?",
-                            geom.lat
-                        ))
-                        .code("bad_geojson"));
-                    }
-                    let id = match (id_prop, &peeked[i].0, &f.id) {
-                        (Some(k), p, _) => p.as_deref().ok_or_else(|| {
-                            ApiError::bad(format!(
-                                "features[{i}] has no properties.{k}, which id_property named as the id"
-                            ))
-                            .code("bad_geojson")
-                        })?,
-                        (None, _, Some(v)) => v.as_str(),
-                        (None, p, None) => p.as_deref().ok_or_else(|| {
-                            ApiError::bad(format!(
-                                "features[{i}] has no id. Put it on the feature (\"id\": \"vehicle-7\", \
-                                 where GeoJSON says it goes) or in properties.id, or name the property \
-                                 with ?id_property="
-                            ))
-                            .code("bad_geojson")
-                        })?,
-                    };
-                    resolved.push(Report {
-                        id,
-                        lng: geom.lng,
-                        lat: geom.lat,
-                        props: f.props.as_deref(),
-                        cells: cell_store[i].as_deref(),
-                        updated_at_ms: f.updated_at_ms,
-                    });
-                }
+                let resolved: Vec<Report<'_>> = feats
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| rejects.ok(i))
+                    .filter_map(|(i, f)| {
+                        let geom = f.geom.as_ref()?;
+                        Some(Report {
+                            id: ids[i]?,
+                            lng: geom.lng,
+                            lat: geom.lat,
+                            props: f.props.as_deref(),
+                            cells: cell_store[i].as_deref(),
+                            updated_at_ms: f.updated_at_ms,
+                        })
+                    })
+                    .collect();
                 // GeoJSON always carries geometry -- a null one is refused rather
                 // than treated as "leave it where it is" -- so there are no
                 // patches on this path. The compact form is where they belong.
-                (
-                    c.upsert(&resolved).map_err(ApiError::bad)?,
-                    PatchOutcome::default(),
-                )
+                let accepted = if resolved.is_empty() {
+                    0
+                } else {
+                    c.upsert(&resolved).map_err(ApiError::bad)?
+                };
+                (accepted, PatchOutcome::default())
             }
         };
-        Ok((n, po, c.len()))
+        Ok((n, po, c.len(), rejects))
     })
     .await?;
+    let refused = rejects.list.len();
     let mut ack = json!({
         "accepted": n,
-        "stale": submitted.saturating_sub(n + po.applied + po.unknown.len()),
+        "stale": submitted.saturating_sub(n + po.applied + po.unknown.len() + refused),
         "devices": devices,
     });
     // Only when patches were actually sent, so the response to an ordinary batch
@@ -1206,6 +1342,11 @@ async fn positions(
     if po.applied > 0 || po.stale > 0 || !po.unknown.is_empty() {
         ack["patched"] = json!(po.applied);
         ack["unknown"] = json!(po.unknown);
+    }
+    // Always when asked for, empty or not: its presence is how a client tells a
+    // server that applied the batch per device from one that ignored the flag.
+    if partial {
+        ack["rejected"] = rejects.to_json();
     }
     Ok(Json(ack))
 }

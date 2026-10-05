@@ -156,10 +156,29 @@ Equal versions must identify the same update. Deletion/expiry clears history.
 Reporter includes stale counts in `reporter.stats.stale`.
 
 The client rejects acknowledgements unless every item comes back accounted for:
-`accepted + stale + patched + unknown` must match the submitted batch. Network errors, 429 and 5xx retry with bounded exponential
+`accepted + stale + patched + unknown + rejected` must match the submitted batch. Network errors, 429 and 5xx retry with bounded exponential
 backoff/jitter and respect Retry-After (capped at 30 seconds). Explicit cancellation
 does not retry. Default retry count remains one; handle final failures and alert
 on repeated stale/error results rather than silently dropping them.
+
+**One bad report in a batch.** By default one report the server refuses — an
+unknown value, a full dimension, oversized `props` — rejects its whole chunk, and
+the `Reporter` puts the chunk back and fails on it again at every flush. Pass
+`partial: true` (to `report`, `patch`, `reportGeoJSON` or `reporter`) and the rest
+lands; the refused ones come back in `rejected`, with `index` into the list you
+passed:
+
+```js
+const r = await fleet.report(points, { partial: true });
+for (const { index, id, code, error } of r.rejected) log.warn({ index, id, code }, error);
+
+// The reporter drops a refused report rather than requeueing it, counts it in
+// stats.rejected, and hands it to onError as { code: 'rejected', rejected }.
+const reporter = fleet.reporter({ partial: true, onError: (e) => log.warn(e.body ?? e) });
+```
+
+It needs server 0.10. An older server ignores the flag and refuses a bad chunk
+whole, as before, so it is safe to turn on before the servers are upgraded.
 
 Deploy the updated server BEFORE this client. Then upgrade all writers together:
 old unversioned writers cannot modify a device once versioned writes start.
@@ -644,9 +663,9 @@ bound collection (`nc.collection('fleet').getClusters(…)`).
 | `createCollection(name, config)` | idempotent; rejects 409 on a different geometry, adopts a new `ttlSeconds` / `maxPropsBytes`. `dimensions` / `filters` declare what you can [filter](#filtering) on |
 | `dropCollection(name)` | |
 | `listCollections()` / `stats(name)` | |
-| `report(name, points, { maxBatch })` | upserts; chunked. A point may carry `dims` and `props` |
-| `patch(name, updates, { maxBatch })` | `{ id, dims?, props? }` with no position — see [above](#when-you-do-not-know-where-the-vehicle-is). Does not renew the TTL |
-| `reportGeoJSON(name, geojson, { maxBatch, idProperty, catProperty })` | the same, with GeoJSON on the wire |
+| `report(name, points, { maxBatch, partial })` | upserts; chunked. A point may carry `dims` and `props` |
+| `patch(name, updates, { maxBatch, partial })` | `{ id, dims?, props? }` with no position — see [above](#when-you-do-not-know-where-the-vehicle-is). Does not renew the TTL |
+| `reportGeoJSON(name, geojson, { maxBatch, idProperty, catProperty, partial })` | the same, with GeoJSON on the wire |
 | `remove(name, id)` | |
 | `has(name, id)` | is this device registered? |
 | `getDevice(name, id)` | position, category and staleness, or `null` |

@@ -739,6 +739,63 @@ await test('index.d.ts declares every field the server puts in stats', async () 
     `the server returns ${missing.join(', ')}, which index.d.ts never declares`);
 });
 
+// Issue #10, point 1: with `partial`, one refused report no longer costs its batch.
+const picky = nc.collection('picky');
+await picky.create({ maxZoom: 16, dimensions: [{ name: 'status', values: ['idle', 'enroute'] }] });
+
+await test('partial: refused reports come back by index, the rest land', async () => {
+  const batch = [
+    { id: 'p-a', lng: 1, lat: 1, dims: { status: 'idle' } },
+    { id: 'p-b', lng: 2, lat: 2, dims: { status: 'idel' } },
+    { id: 'p-c', lng: 3, lat: 3, dims: { status: 'enroute' } },
+    { id: 'p-d', lng: 4 },
+  ];
+  await assert.rejects(
+    () => picky.report(batch, { maxBatch: 2 }),
+    (e) => e instanceof NetClusterError && e.status === 400,
+    'without partial a bad report still rejects its chunk',
+  );
+  const r = await picky.report(batch, { maxBatch: 2, partial: true });
+  assert.equal(r.accepted, 2);
+  // p-d is the second item of the second chunk: its index is into the whole list
+  assert.deepEqual(r.rejected.map((x) => [x.index, x.id, x.code]),
+    [[1, 'p-b', 'bad_request'], [3, 'p-d', 'half_position']]);
+  assert.equal(await picky.has('p-c'), true);
+  assert.equal(await picky.has('p-b'), false);
+});
+
+await test('partial: patch and reportGeoJSON answer per item too', async () => {
+  const p = await picky.patch([
+    { id: 'p-a', dims: { status: 'nope' } },
+    { id: 'p-c', dims: { status: 'idle' } },
+  ], { partial: true });
+  assert.equal(p.patched, 1);
+  assert.deepEqual(p.rejected.map((x) => x.id), ['p-a']);
+
+  const g = await picky.reportGeoJSON([
+    { type: 'Feature', id: 'g-1', geometry: { type: 'Point', coordinates: [1, 1] }, properties: {} },
+    { type: 'Feature', id: 'g-2', geometry: null, properties: {} },
+  ], { partial: true });
+  assert.equal(g.accepted, 1);
+  assert.deepEqual(g.rejected.map((x) => [x.index, x.code]), [[1, 'bad_geojson']]);
+});
+
+await test('partial reporter: a refused report is dropped, not requeued forever', async () => {
+  const errs = [];
+  const r = picky.reporter({ flushMs: 60_000, partial: true, onError: (e) => errs.push(e) });
+  r.report({ id: 'q-good', lng: 1, lat: 1, dims: { status: 'idle' } });
+  r.report({ id: 'q-bad', lng: 2, lat: 2, dims: { status: 'idel' } });
+  const out = await r.flush();
+  assert.equal(out.accepted, 1);
+  assert.equal(errs.length, 1);
+  assert.equal(errs[0].body.code, 'rejected');
+  assert.deepEqual(errs[0].body.rejected.map((x) => x.id), ['q-bad']);
+  assert.equal(r.stats.rejected, 1);
+  assert.equal(r.pending.size, 0, 'the refused report must not go back in the queue');
+  await r.close();
+  assert.equal(errs.length, 1, 'and so is not sent again');
+});
+
 await test('example.mjs exercises every public method', async () => {
   const { status, stdout, stderr } = spawnSync(
     process.execPath,

@@ -206,7 +206,7 @@ curl 'localhost:8080/v1/collections/fleet/devices/truck-1/cluster?zoom=12'
 | `PUT /v1/collections/{name}` | create; idempotent, 409 on a different geometry, adopts a new `ttl_seconds` / `max_props_bytes` |
 | `GET /v1/collections` | list, with stats |
 | `DELETE /v1/collections/{name}` | drop |
-| `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson); returns `accepted` and `stale`. An item with no `lng`/`lat` is a [values-only update](#updating-values-without-a-position) and comes back in `patched` |
+| `POST /v1/collections/{name}/positions` | batch ingest — compact **or** GeoJSON, see [GeoJSON](#geojson); returns `accepted` and `stale`. An item with no `lng`/`lat` is a [values-only update](#updating-values-without-a-position) and comes back in `patched`. `?partial=true` applies each report on its own — see **One bad report in a batch** under [GeoJSON](#geojson) |
 | `DELETE /v1/collections/{name}/devices/{id}` | remove one device |
 | `GET .../devices/{id}` | is it registered? 200 with position, category, staleness and last accepted source version, or 404 (`HEAD` for a bare check) |
 | `GET .../clusters?bbox=&zoom=&cat=` | GeoJSON; `?f.<name>=` for declared dimensions, `?where=` to search text, `?ids=` for an [explicit whitelist](#filtering-by-an-explicit-list-of-ids) |
@@ -394,6 +394,26 @@ Retry the same versioned payload with backoff. The bundled client does so, check
 `accepted + stale + patched + unknown` for every batch, and exposes incomplete
 acknowledgements as errors.
 Health checks do not wait for collection index locks.
+
+**One bad report in a batch:** by default the batch is all-or-nothing. A report
+the server refuses (half a position, an unknown value, a full `capacity`
+dimension, oversized `props`, or for GeoJSON a null geometry, a missing id or a
+latitude outside ±90) fails the whole request with a 400 naming it, and nothing
+in the batch is applied. Add `?partial=true` to apply each report on its own
+instead: the good ones land, and the refused ones come back in `rejected`, in
+batch order, each with its position in the batch:
+
+```json
+{"accepted":2,"stale":0,"devices":2,
+ "rejected":[{"index":1,"id":"truck-9","code":"bad_request","error":"device \"truck-9\": unknown value \"idel\" ..."}]}
+```
+
+`accepted + stale + patched + unknown + rejected` then equals the batch size, and
+`rejected` is present, possibly empty, whenever the flag is set; that is how a
+client tells a server that honoured it from one that predates it. A body that does
+not parse, a batch over the size limit and an overloaded server still fail the
+whole request. A refused report never takes a `capacity` slot: values are
+resolved only after every other check passes.
 
 | Environment variable | Default | Purpose |
 |---|---|---|

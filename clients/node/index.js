@@ -74,22 +74,39 @@ function checkBatchSize(maxBatch) {
 /**
  * Every item sent must come back accounted for, as exactly one of: accepted (it
  * carried a position), patched (it carried only values), stale (an older version
- * than the server holds) or unknown (a patch for a device that is not live).
- * Anything else means a report went missing in a way worth failing over.
+ * than the server holds), unknown (a patch for a device that is not live) or
+ * rejected (refused on its own, under `partial`). Anything else means a report
+ * went missing in a way worth failing over.
  */
 function checkAck(ack, submitted) {
   const accepted = ack?.accepted;
   const stale = ack?.stale ?? 0;
   const patched = ack?.patched ?? 0;
   const unknown = ack?.unknown?.length ?? 0;
+  const rejected = ack?.rejected?.length ?? 0;
   if (!Number.isSafeInteger(accepted) || accepted < 0 ||
       !Number.isSafeInteger(stale) || stale < 0 ||
       !Number.isSafeInteger(patched) || patched < 0 ||
-      accepted + stale + patched + unknown !== submitted) {
+      accepted + stale + patched + unknown + rejected !== submitted) {
     throw new NetClusterError('netcluster: incomplete position acknowledgement', {
-      body: { code: 'incomplete_ack', submitted, accepted, stale, patched, unknown },
+      body: { code: 'incomplete_ack', submitted, accepted, stale, patched, unknown, rejected },
     });
   }
+}
+function checkPartial(partial) {
+  if (typeof partial !== 'boolean') {
+    throw new TypeError('netcluster: partial must be true or false');
+  }
+}
+/**
+ * One chunk's rejections, renumbered from the chunk to the caller's whole list.
+ *
+ * A server older than 0.10 ignores `?partial=true` and answers without
+ * `rejected`; it refuses a bad batch whole, so a 200 from it means none were.
+ */
+function collectRejected(into, ack, offset) {
+  if (!Array.isArray(ack?.rejected)) return;
+  for (const r of ack.rejected) into.push({ ...r, index: r.index + offset });
 }
 const pause = (ms, signal) => new Promise((resolve, reject) => {
   if (signal?.aborted) { reject(signal.reason); return; }
@@ -376,9 +393,14 @@ export class NetClusterClient {
    *
    * Chunked at `maxBatch`, because one huge request holds the server's write lock
    * for its whole duration and every reader waits behind it.
+   *
+   * With `partial: true` a report the server refuses -- an unknown value, a full
+   * dimension, oversized props -- is returned in `rejected` and the rest of the
+   * batch lands. Without it, one such report rejects its whole chunk.
    */
-  async report(name, points, { maxBatch = DEFAULT_MAX_BATCH } = {}) {
+  async report(name, points, { maxBatch = DEFAULT_MAX_BATCH, partial = false } = {}) {
     checkBatchSize(maxBatch);
+    checkPartial(partial);
     const version = localVersion();
     const seen = new Set();
     const list = (Array.isArray(points) ? points : [points]).map(p => {
@@ -386,14 +408,16 @@ export class NetClusterClient {
       seen.add(p.id);
       return wirePoint(p, fallback);
     });
-    if (list.length === 0) return { accepted: 0 };
+    if (list.length === 0) return partial ? { accepted: 0, rejected: [] } : { accepted: 0 };
+    const path = `/v1/collections/${enc(name)}/positions${partial ? '?partial=true' : ''}`;
     let accepted = 0;
     let stale = 0;
     let patched = 0;
     const unknown = [];
+    const rejected = [];
     let last = null;
     for (let i = 0; i < list.length; i += maxBatch) {
-      last = await this._write(`/v1/collections/${enc(name)}/positions`, {
+      last = await this._write(path, {
         method: 'POST',
         body: list.slice(i, i + maxBatch),
       });
@@ -402,6 +426,7 @@ export class NetClusterClient {
       stale += last?.stale ?? 0;
       patched += last?.patched ?? 0;
       if (Array.isArray(last?.unknown)) unknown.push(...last.unknown);
+      collectRejected(rejected, last, i);
     }
     const ack = { accepted, stale, devices: last?.devices };
     // Only when the batch actually carried some: an ordinary report should not
@@ -410,6 +435,7 @@ export class NetClusterClient {
       ack.patched = patched;
       ack.unknown = unknown;
     }
+    if (partial) ack.rejected = rejected;
     return ack;
   }
 
@@ -430,10 +456,11 @@ export class NetClusterClient {
    * already expired comes back in `unknown` rather than being resurrected.
    *
    * @returns `{ patched, stale, unknown }` -- `unknown` lists the ids that named
-   *        no live device.
+   *        no live device. With `partial: true`, also `rejected`, as on `report`.
    */
-  async patch(name, updates, { maxBatch = DEFAULT_MAX_BATCH } = {}) {
+  async patch(name, updates, { maxBatch = DEFAULT_MAX_BATCH, partial = false } = {}) {
     checkBatchSize(maxBatch);
+    checkPartial(partial);
     const version = localVersion();
     const seen = new Set();
     const list = (Array.isArray(updates) ? updates : [updates]).map(u => {
@@ -449,12 +476,19 @@ export class NetClusterClient {
       seen.add(u.id);
       return wirePoint(u, fallback);
     });
-    if (list.length === 0) return { patched: 0, stale: 0, unknown: [] };
     let patched = 0;
     let stale = 0;
     const unknown = [];
+    const rejected = [];
+    const done = () => {
+      const out = { patched, stale, unknown };
+      if (partial) out.rejected = rejected;
+      return out;
+    };
+    if (list.length === 0) return done();
+    const path = `/v1/collections/${enc(name)}/positions${partial ? '?partial=true' : ''}`;
     for (let i = 0; i < list.length; i += maxBatch) {
-      const ack = await this._write(`/v1/collections/${enc(name)}/positions`, {
+      const ack = await this._write(path, {
         method: 'POST',
         body: list.slice(i, i + maxBatch),
       });
@@ -462,8 +496,9 @@ export class NetClusterClient {
       patched += ack?.patched ?? 0;
       stale += ack?.stale ?? 0;
       if (Array.isArray(ack?.unknown)) unknown.push(...ack.unknown);
+      collectRejected(rejected, ack, i);
     }
-    return { patched, stale, unknown };
+    return done();
   }
 
   /**
@@ -481,9 +516,14 @@ export class NetClusterClient {
    *        is rejected rather than falling back to `feature.id`.
    * @param opts.catProperty which property holds the category. Defaults to `cat`,
    *        then `category`.
+   * @param opts.partial return refused Features in `rejected` and keep the rest,
+   *        as on `report`.
    */
-  async reportGeoJSON(name, geojson, { maxBatch = DEFAULT_MAX_BATCH, idProperty, catProperty } = {}) {
+  async reportGeoJSON(name, geojson, {
+    maxBatch = DEFAULT_MAX_BATCH, idProperty, catProperty, partial = false,
+  } = {}) {
     checkBatchSize(maxBatch);
+    checkPartial(partial);
     const input = Array.isArray(geojson)
       ? geojson
       : geojson && geojson.type === 'Feature'
@@ -496,16 +536,18 @@ export class NetClusterClient {
     }
     const version = localVersion();
     const features = input.map(f => wirePoint(f, version));
-    if (features.length === 0) return { accepted: 0 };
+    if (features.length === 0) return partial ? { accepted: 0, rejected: [] } : { accepted: 0 };
 
     const q = new URLSearchParams();
     if (idProperty !== undefined) q.set('id_property', idProperty);
     if (catProperty !== undefined) q.set('cat_property', catProperty);
+    if (partial) q.set('partial', 'true');
     const qs = q.toString();
     const path = `/v1/collections/${enc(name)}/positions${qs ? `?${qs}` : ''}`;
 
     let accepted = 0;
     let stale = 0;
+    const rejected = [];
     let last = null;
     for (let i = 0; i < features.length; i += maxBatch) {
       last = await this._write(path, {
@@ -515,8 +557,11 @@ export class NetClusterClient {
       checkAck(last, Math.min(maxBatch, features.length - i));
       accepted += last.accepted;
       stale += last?.stale ?? 0;
+      collectRejected(rejected, last, i);
     }
-    return { accepted, stale, devices: last?.devices };
+    const ack = { accepted, stale, devices: last?.devices };
+    if (partial) ack.rejected = rejected;
+    return ack;
   }
 
   remove(name, id) {
@@ -717,10 +762,12 @@ export class Reporter {
     this.flushMs = options.flushMs ?? 500;
     this.maxBatch = options.maxBatch ?? DEFAULT_MAX_BATCH;
     checkBatchSize(this.maxBatch);
+    this.partial = options.partial ?? false;
+    checkPartial(this.partial);
     this.onError = options.onError;
     /** @type {Map<string, object>} */
     this.pending = new Map();
-    this.stats = { queued: 0, coalesced: 0, sent: 0, stale: 0, requests: 0, errors: 0 };
+    this.stats = { queued: 0, coalesced: 0, sent: 0, stale: 0, rejected: 0, requests: 0, errors: 0 };
     this._closed = false;
     this._inflight = null;
     this._timer = setInterval(() => {
@@ -771,14 +818,15 @@ export class Reporter {
     const batch = [...this.pending.values()];
     this.pending.clear();
     this._inflight = (async () => {
+      let r;
       try {
-        const r = await this.client.report(this.collection, batch, {
+        r = await this.client.report(this.collection, batch, {
           maxBatch: this.maxBatch,
+          partial: this.partial,
         });
         this.stats.sent += r.accepted;
         this.stats.stale += r.stale ?? 0;
         this.stats.requests += Math.ceil(batch.length / this.maxBatch);
-        return r;
       } catch (e) {
         this.stats.errors++;
         // Put them back, unless a newer report has already superseded them --
@@ -793,6 +841,20 @@ export class Reporter {
       } finally {
         this._inflight = null;
       }
+      // Dropped, not put back: the server refused these on their own merits and
+      // would refuse them again, so requeueing one would fail every flush after
+      // this. The rest of the batch landed, so this is not thrown either -- it is
+      // in the result, and reported to onError when there is one.
+      if (r.rejected?.length) {
+        this.stats.rejected += r.rejected.length;
+        if (this.onError) {
+          this.onError(new NetClusterError(
+            `netcluster: the server rejected ${r.rejected.length} of ${batch.length} reports`,
+            { body: { code: 'rejected', rejected: r.rejected } },
+          ));
+        }
+      }
+      return r;
     })();
     return this._inflight;
   }
